@@ -1,0 +1,18 @@
+start:
+  do: agent
+  with: |
+    Analyze the following error:
+    {{state.error}}
+  next: fix
+
+fix:
+  do: agent
+  with: |
+    Propose a fix for:
+    {{state.error}}
+  next: done
+
+done:
+  do: agent
+  with: |
+    Summarize the resolution.
