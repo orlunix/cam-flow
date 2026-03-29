@@ -1,0 +1,18 @@
+start:
+  task: Analyze error {{state.error}}
+  next: fix
+
+fix:
+  task: Propose fix
+  next: test
+
+test:
+  task: Validate fix
+  transitions:
+    - if: success
+      goto: done
+    - if: fail
+      goto: fix
+
+done:
+  task: Summarize solution
