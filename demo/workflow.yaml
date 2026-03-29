@@ -1,0 +1,51 @@
+name: fix_bug_demo
+
+input:
+  task: "fix alu reset test failure"
+  file: "alu.sv"
+
+memory:
+  retry: 0
+  last_error: ""
+  root_cause: ""
+  approved: false
+
+nodes:
+
+  start:
+    set:
+      memory.status: "running"
+    else: test
+
+  test:
+    do: cmd "pytest tests/unit"
+    if fail: analyze
+    else: done
+
+  analyze:
+    do: agent analyzer
+    with: "Analyze error: {{memory.last_error}}"
+    set:
+      memory.retry: +1
+      memory.root_cause: "{{output.root_cause}}"
+    if output.need_human: approve
+    else: handoff
+
+  handoff:
+    do: skill handoff
+    with: "Summarize current state"
+    else: fix
+
+  approve:
+    do: agent wait_gate
+    with: "Waiting for human approval"
+    else: fix
+
+  fix:
+    do: skill fix_code
+    with: "Fix based on {{memory.root_cause}}"
+    else: test
+
+  done:
+    set:
+      memory.status: "done"
