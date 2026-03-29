@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "agent",
+            "prompt": "Check .claude/state/workflow.json. If status != done, return {\"ok\": false}. Otherwise return {\"ok\": true}."
+          }
+        ]
+      }
+    ]
+  }
+}
