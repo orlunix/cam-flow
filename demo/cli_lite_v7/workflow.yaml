@@ -1,0 +1,28 @@
+start:
+  do: skill analyze
+  with: |
+    Analyze error:
+    {{state.error}}
+  next: fix
+
+fix:
+  do: skill fix
+  with: |
+    Propose a fix for:
+    {{state.error}}
+  next: test
+
+test:
+  do: skill test
+  with: |
+    Validate the fix
+  transitions:
+    - if: success
+      goto: done
+    - if: fail
+      goto: fix
+
+done:
+  do: skill summarize
+  with: |
+    Summarize the final solution
