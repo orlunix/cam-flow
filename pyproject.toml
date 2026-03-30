@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cam-flow"
+version = "0.1.0"
+description = "Lightweight stateful workflow engine for agent execution"
+requires-python = ">=3.10"
+dependencies = ["pyyaml>=6.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+camflow = "camflow.cli_entry.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
