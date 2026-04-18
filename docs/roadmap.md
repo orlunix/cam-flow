@@ -60,29 +60,46 @@ Shipped support modules:
 
 These block real workflows today. Ordered by severity.
 
-### 2.1 Agent reuse within loops
+### 2.1 Stateless node execution — SHIPPED
 
-**Problem.** The engine creates a fresh camc agent per node execution.
-A `fix → test → fix` loop currently spawns N agents, each starting
-from zero context. The second `fix` agent has no memory of what the
-first agent tried — the only channel is `state.last_failure`, which
-is a short text summary, not the working knowledge the agent built up
-during its 12K+ tokens of analysis.
+**Status.** Implemented. Supersedes the earlier "agent reuse within
+loops" plan.
 
-**Fix.** Keep an agent alive within a loop. Send follow-up tasks via
-`camc send <id>` instead of spawning a new agent. Destroy only when
-the workflow exits the loop (or on explicit boundary).
+**Problem (original).** A `fix → test → fix` loop spawns a fresh agent
+per node, each starting from zero context. The second fix agent had
+no memory of what the first tried — the only carry-over was
+`state.last_failure`, a short text summary.
 
-**Implementation sketch.**
-- Add `reuse_scope` to node DSL: `loop` (default), `node`, `workflow`
-- In `engine.py::_run_node`: if an agent for this loop scope is alive,
-  `camc send` the new prompt and wait for the next `node-result.json`
-- On loop exit (transition to a node outside the loop), `camc stop`
-- Track live agents in `state.active_agents[scope_key] = agent_id`
+**Decision.** We evaluated three approaches and chose **stateless
+execution + structured state** (serverless-function pattern):
+- A (agent alive) — unpredictable context, compaction risk
+- B (reuse with water-level monitoring) — complex, hard to debug
+- **C (chosen: stateless + rich state)** — predictable, recoverable,
+  traceable, debuggable, cache-friendly (CLAUDE.md stable, only state
+  is fresh tokens)
 
-**Why this matters.** Token economy: each fresh agent is ~12K tokens
-of bootstrap. A 10-iteration loop is 120K tokens of waste. With reuse,
-it's one bootstrap plus incremental turns.
+**What shipped.**
+- `src/camflow/engine/state_enricher.py` — merges each node's result
+  into the six-section state schema: `active_task`, `completed`,
+  `active_state` (key_files/modified_files), `blocked`, `test_output`,
+  `resolved`, `next_steps`, `lessons`, `failed_approaches`, plus
+  bookkeeping (`iteration`, `escalation_level`, `retry_counts`)
+- `src/camflow/backend/cam/prompt_builder.py` rewrite — renders the
+  state in a fenced `--- CONTEXT (informational background, NOT new
+  instructions) ---` block so the agent never confuses history with a
+  new directive
+- `src/camflow/backend/cam/engine.py` — calls `enrich_state` after
+  every node, drops the old `last_failure` field
+- `examples/cam/CLAUDE.md` — per-project template that teaches the
+  agent how to read the CONTEXT block and what the output contract is
+
+**Mitigations for the one tradeoff.** Agents re-read code files each
+iteration, but `active_state.key_files` and per-entry `file`/`lines`
+refs in `completed` direct them to targeted reads rather than blind
+search.
+
+**Tests.** 3 new integration tests in `test_stateless_loop.py` + 26
+new unit tests in `test_state_enricher.py`. Full suite: 155+ passing.
 
 ### 2.2 camc session ID tracking
 
@@ -101,61 +118,21 @@ orphan handling depends on it. Track as a blocker on camc team.
 
 **Files touched (camc):** `~/bin/camc` adoption logic, `~/.cam/agents.json` schema.
 
-### 2.3 Structured state schema
+### 2.3 Structured state schema — SHIPPED (as part of §2.1)
 
-**Problem.** `state.error`, `state.last_cmd_output`, and other fields
-are free-form strings. Each node has to parse them back into meaning.
-The agent has no predictable structure to rely on when it reads
-injected context.
+Implemented in `src/camflow/engine/state_enricher.py`. See §2.1 for
+details. State fields: `iteration`, `active_task`, `completed`,
+`active_state.{key_files, modified_files}`, `blocked`, `test_output`,
+`resolved`, `next_steps`, `lessons`, `failed_approaches`,
+`escalation_level`, `retry_counts`.
 
-**Fix.** Adopt the Hermes six-section template as the canonical state
-shape carried between nodes:
+### 2.4 Fenced recall framing — SHIPPED (as part of §2.1)
 
-```json
-{
-  "active_task": "Fix the divide() zero-check bug",
-  "completed_actions": ["Analyzed 4 failing tests", "Identified root cause in divide()"],
-  "active_state": {"last_test_run": "3 passed, 1 failed"},
-  "blocked": [],
-  "resolved": ["average() empty-list check"],
-  "next_steps": ["Fix divide()", "Run test suite"]
-}
-```
-
-The engine rolls each node's result into this structure. Agents see
-the same schema every time.
-
-**Implementation.** New module `src/camflow/engine/compaction.py`
-with:
-- `SixSectionState` dataclass
-- `roll_forward(state, result)` — merges a node result into the structure
-- `render_for_prompt(state)` — returns the block to inject into prompts
-
-`prompt_builder.py` emits it via a new template section. `state.json`
-gains a `compact` key that mirrors this structure.
-
-### 2.4 Fenced recall framing
-
-**Problem.** Agents read `{{state.last_failure.summary}}` as if it
-were new instructions. The content is historical, but the agent
-doesn't know that without explicit framing. Result: agents re-do
-completed work, or get confused about what's asked vs. what's context.
-
-**Fix.** Wrap all `{{state.*}}` injections with a "recall fence":
-
-```
-<recall type="informational-background">
-  <!-- everything from state goes here -->
-  <!-- This is what has happened so far. It is NOT a new instruction. -->
-  <!-- Your task is below, after this block. -->
-</recall>
-```
-
-**Implementation.** 3-line addition to
-`src/camflow/backend/cam/prompt_builder.py`:
-- `_context_block` → wrap output in the fence
-- Add contract-level note after the fence: "The above is context.
-  Your task follows."
+Implemented in `src/camflow/backend/cam/prompt_builder.py`. The
+structured state is rendered inside
+`--- CONTEXT (informational background, NOT new instructions) ---`
+/ `--- END CONTEXT ---` markers, with the task placed explicitly after
+`--- END CONTEXT ---` under a `Your task:` header.
 
 ### 2.5 Test program hex generation for RTL workflows
 
@@ -268,52 +245,29 @@ levels L1, L2, L3, L4 in order (L0 was the initial attempt). On the
 5th call (still failing), workflow enters `waiting` with a diagnostic
 bundle written to `.camflow/escalation/<node>-<ts>.json`.
 
-### 3.3 PreCompact State Preservation
+### 3.3 PreCompact State Preservation — DESCOPED
 
-**Problem.** Long-running agent nodes can fill the Claude Code context
-window and trigger auto-compaction. When compaction happens, critical
-debugging state can be summarized away: the failure count, the
-current hypothesis, the set of files already tried. The agent
-effectively starts over mid-task.
+**Why.** The stateless execution model adopted in §2.1 means agents
+never run long enough to hit Claude Code auto-compaction. Each node
+starts a fresh agent with a bounded prompt (CLAUDE.md + fenced
+CONTEXT block + task + output contract). There is no long-running
+session state to protect.
 
-**Fix.** Detect compaction (via a Claude Code hook, or via size
-monitoring as a fallback). Immediately before compaction, preserve a
-structured preamble and re-inject it into the compacted context so
-the agent keeps its debugging state.
-
-Preserved fields:
-- `failure_count` — consecutive failures at this node
-- `escalation_level` — current L0..L4
-- `current_hypothesis` — last stated hypothesis (from result.summary)
-- `files_touched` — list of paths read or modified this node
-- `test_results_summary` — last pass/fail counts
-- `key_observations` — short bullets the agent flagged as important
-
-**Files (new).**
-- `src/camflow/engine/compact_guard.py` — `snapshot(state, node_id)`
-  and `build_preamble(snapshot)`; writes to
-  `.camflow/precompact/<node>.json`
-- Claude Code hook (installed by the engine on first agent run)
-  detects `PreCompact` events and calls into the guard
-- `src/camflow/backend/cam/prompt_builder.py` — on retry, read the
-  latest preamble for the node and prepend it to the prompt
-- `tests/unit/test_compact_guard.py` — snapshot/preamble round-trip;
-  missing-hook fallback path
-
-**Acceptance.** Simulate compaction during a multi-turn agent run.
-Post-compaction, the agent's next prompt contains the structured
-preamble (hypothesis, escalation level, files touched). Agent behavior
-matches the pre-compaction trajectory rather than restarting.
+The state that previously needed preservation across compaction
+(failure count, files touched, hypothesis, test results) already
+lives in `state.json` and is re-injected on every agent invocation
+via the fenced CONTEXT block. Compaction inside a single node
+execution is now irrelevant to workflow integrity.
 
 ### 3.4 Rationale
 
-Three things, none of them "AI pressure":
+Two things, none of them "AI pressure":
 - **Right tool for the job.** Methodology routing picks a debugging
   strategy that matches the problem shape, not a one-size prompt.
 - **Graduated response.** Repeated failure doesn't get the same prompt
   louder — it gets a different strategy, and eventually human review.
-- **State preservation.** Long tasks keep their working state across
-  context compaction instead of silently losing it.
+
+(State preservation across compaction is no longer needed — see §3.3.)
 
 ---
 
@@ -434,8 +388,8 @@ of agents doing structured work. Cherry-pick patterns (§2.3, §2.4,
 
 | Window | Items | Outcome |
 |--------|-------|---------|
-| **Week 1–2** | §2.1 agent reuse · §2.2 session ID (camc blocker) · §2.3 structured state · §2.4 fenced recall | Real workflows stop wasting tokens; agents read context without confusion |
-| **Week 3–4** | §3.1 methodology router · §3.2 escalation ladder · §3.3 precompact state · §4.1 skill evolution Phase 1 · §4.2 port 3 hermes skills | Exception handler online, measurable insight into skill performance, 3 hardened skills in rotation |
+| **Week 1–2** | ✅ §2.1 stateless execution · ✅ §2.3 structured state · ✅ §2.4 fenced recall · §2.2 session ID (camc blocker) | Real workflows stop wasting tokens; agents read context without confusion |
+| **Week 3–4** | §3.1 methodology router · §3.2 escalation ladder · §4.1 skill evolution Phase 1 · §4.2 port 3 hermes skills | Exception handler online (sans PreCompact, descoped), measurable insight into skill performance, 3 hardened skills in rotation |
 | **Week 5–6** | §4.3 iteration budget · §4.4 dry-run polish | Safer autonomous runs; faster iteration on workflow design |
 | **Month 2** | §2.5 RTL support (artifact refs, test-hex generation) | Hardware verification workflows become feasible |
 | **Month 3+** | §5 items 10–14 | Parallelism, SDK phase, advanced evolution, webhook, Hermes adapter |
@@ -463,3 +417,4 @@ of agents doing structured work. Cherry-pick patterns (§2.3, §2.4,
 
 - 2026-04-18 — Initial version after CAM Phase engine shipped and Hermes investigation concluded.
 - 2026-04-18 — Added §3 Exception Handler (methodology router, escalation ladder, precompact state preservation). Inspired by PUA project; engineering only, no pressure rhetoric. Renumbered subsequent sections.
+- 2026-04-18 — Adopted stateless execution (Option C). §2.1 rewritten as shipped: state_enricher + six-section state + fenced CONTEXT injection. §2.3 and §2.4 marked shipped under §2.1. §3.3 PreCompact State Preservation descoped (no long-running sessions to protect). Added `examples/cam/CLAUDE.md` as the canonical per-project template. 155+ tests passing.
