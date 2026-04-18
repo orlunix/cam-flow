@@ -1,4 +1,4 @@
-"""Integration test: retry flow with context injection.
+"""Integration test: retry flow with context injection (stateless model).
 
 Mocks agent_runner so we can script the sequence of results:
   attempt 1 → fail (node_fail)
@@ -6,9 +6,11 @@ Mocks agent_runner so we can script the sequence of results:
   attempt 3 → success
 
 Verifies that:
-  - last_failure is populated on each failure
-  - retry counts are tracked
-  - on final success, last_failure is cleared and retry counts reset
+  - state.blocked is populated on failure, cleared on success
+  - state.failed_approaches accumulates, then drained for the node on success
+  - retry counts are tracked and reset on success
+  - prior failure stdout flows into state.test_output, appears in next prompt's
+    fenced CONTEXT block
   - trace records attempt/is_retry/retry_mode correctly
 """
 
@@ -102,12 +104,18 @@ def test_retry_with_task_mode_injects_context(tmp_path, monkeypatch):
     assert "ATTEMPT 3" in prompts_seen[2]
     assert "ATTEMPT2_OUTPUT" in prompts_seen[2]
 
-    # After final success, retry counter is reset and last_failure cleared
+    # After final success, retry counter is reset and blocked is cleared
     assert final["retry_counts"].get("start", 0) == 0
-    assert final["last_failure"] is None
+    assert final["blocked"] is None
+
+    # failed_approaches for 'start' node drained on success
+    assert not any(fa["node"] == "start" for fa in final["failed_approaches"])
 
     # Lesson captured
     assert "always check edge cases" in final["lessons"]
+
+    # Completed entry recorded for the successful attempt
+    assert any(c["node"] == "start" for c in final["completed"])
 
     # Trace has attempts 1, 2, 3 for node 'start'
     trace = tmp_path / ".camflow" / "trace.log"

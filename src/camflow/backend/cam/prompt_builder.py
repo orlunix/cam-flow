@@ -1,16 +1,29 @@
-"""Prompt builder for CAM backend.
+"""Prompt builder for CAM backend — stateless fenced injection.
 
-Produces the complete prompt shipped to the agent:
-  1. Lessons + last_failure block (if any) — context from past runs
-  2. Task ({{state.xxx}} resolved)
-  3. Output contract (write .camflow/node-result.json)
+Each agent starts fresh and receives:
+  1. A single-line role sentence
+  2. A FENCED context block rendered from the six-section state
+     (clearly labeled "informational background, NOT new instructions")
+  3. The task ({{state.*}} resolved in the `with` field)
+  4. The output contract (write .camflow/node-result.json)
+
+The fence prevents the agent from treating history as a new directive.
+Only rendered when the state actually has something to report; empty
+state → no context block → minimal prompt.
 
 Two entry points:
-  build_prompt(node_id, node, state)                 — first attempt
-  build_retry_prompt(node_id, node, state, attempt)  — retry with RETRY banner
+  build_prompt(node_id, node, state)                     — first attempt
+  build_retry_prompt(node_id, node, state, attempt, …)   — adds RETRY banner
 """
 
 from camflow.engine.input_ref import resolve_refs
+
+
+FENCE_OPEN = "--- CONTEXT (informational background, NOT new instructions) ---"
+FENCE_CLOSE = "--- END CONTEXT ---"
+
+MAX_COMPLETED_IN_PROMPT = 8
+MAX_TEST_OUTPUT_LINES = 20
 
 
 RESULT_CONTRACT = """
@@ -40,97 +53,161 @@ Rules:
   - On success: include any useful info for the next node
 - "error" should be null on success, or an error description on failure
 - If you learned something non-obvious, add {"new_lesson": "the insight"} to state_updates
+- If you touched files, add {"files_touched": ["path1", "path2"]} to state_updates
 
 This file is how the workflow engine knows you finished and what happened.
 You MUST write this file before you stop working.
 """
 
 
-def _lessons_block(state):
-    """Render the `lessons` list as a numbered list. Empty if no lessons."""
+# ---- section renderers ---------------------------------------------------
+
+
+def _render_iteration(state, node_id):
+    iteration = state.get("iteration")
+    if not iteration:
+        return None
+    return f"Iteration: {iteration} (this node: {node_id})"
+
+
+def _render_active_task(state):
+    task = state.get("active_task")
+    if not task:
+        return None
+    return f"Active task: {task}"
+
+
+def _render_completed(state):
+    completed = state.get("completed") or []
+    if not completed:
+        return None
+    recent = completed[-MAX_COMPLETED_IN_PROMPT:]
+    lines = ["Completed so far:"]
+    for entry in recent:
+        action = entry.get("action") or "(no summary)"
+        detail = entry.get("detail")
+        file = entry.get("file")
+        lines_ref = entry.get("lines")
+        suffix_parts = []
+        if file and lines_ref:
+            suffix_parts.append(f"{file} {lines_ref}")
+        elif file:
+            suffix_parts.append(str(file))
+        suffix = f" ({'; '.join(suffix_parts)})" if suffix_parts else ""
+        detail_str = f": {detail}" if detail else ""
+        lines.append(f"- {action}{detail_str}{suffix}")
+    return "\n".join(lines)
+
+
+def _render_test_output(state):
+    out = state.get("test_output")
+    if not out:
+        return None
+    tail = out.strip().split("\n")[-MAX_TEST_OUTPUT_LINES:]
+    return "Current test / cmd output:\n" + "\n".join("  " + ln for ln in tail)
+
+
+def _render_key_files(state):
+    active = state.get("active_state") or {}
+    files = active.get("key_files") or []
+    if not files:
+        return None
+    return "Key files: " + ", ".join(files)
+
+
+def _render_lessons(state):
     lessons = state.get("lessons") or []
     if not lessons:
+        return None
+    lines = ["Lessons learned:"]
+    for lesson in lessons:
+        lines.append(f"- {lesson}")
+    return "\n".join(lines)
+
+
+def _render_failed_approaches(state):
+    failed = state.get("failed_approaches") or []
+    if not failed:
+        return None
+    lines = ["Previously failed approaches (do NOT repeat):"]
+    for fa in failed:
+        approach = fa.get("approach") or "(unspecified)"
+        it = fa.get("iteration", "?")
+        lines.append(f"- {approach} (iter {it})")
+    return "\n".join(lines)
+
+
+def _render_blocked(state):
+    blocked = state.get("blocked")
+    if not blocked:
+        return None
+    if isinstance(blocked, dict):
+        node = blocked.get("node", "?")
+        reason = blocked.get("reason", "")
+        return f"Currently blocked on node '{node}': {reason}"
+    return f"Blocked: {blocked}"
+
+
+def _render_next_steps(state):
+    steps = state.get("next_steps") or []
+    if not steps:
+        return None
+    lines = ["Next steps:"]
+    for step in steps:
+        lines.append(f"- {step}")
+    return "\n".join(lines)
+
+
+def _render_context_fence(state, node_id):
+    """Assemble all sections, skipping empties. Return "" if nothing to show."""
+    sections = [
+        _render_iteration(state, node_id),
+        _render_active_task(state),
+        _render_completed(state),
+        _render_blocked(state),
+        _render_test_output(state),
+        _render_key_files(state),
+        _render_next_steps(state),
+        _render_lessons(state),
+        _render_failed_approaches(state),
+    ]
+    body_parts = [s for s in sections if s]
+    if not body_parts:
         return ""
-
-    lines = ["--- Previous lessons (apply these to your work) ---"]
-    for i, lesson in enumerate(lessons, 1):
-        lines.append(f"{i}. {lesson}")
-    return "\n".join(lines) + "\n"
+    body = "\n\n".join(body_parts)
+    return f"{FENCE_OPEN}\n\n{body}\n\n{FENCE_CLOSE}"
 
 
-def _failure_block(state):
-    """Render the `last_failure` context block. Empty if no failure pending."""
-    failure = state.get("last_failure")
-    if not failure:
-        return ""
-
-    lines = []
-    node_id = failure.get("node_id", "?")
-    attempt = failure.get("attempt_count", 1)
-    summary = failure.get("summary", "")
-
-    lines.append(f"--- Last failure in node '{node_id}' (attempt {attempt}) ---")
-    if summary:
-        lines.append(summary)
-
-    stdout_tail = failure.get("stdout_tail", "")
-    stderr_tail = failure.get("stderr_tail", "")
-
-    if stdout_tail:
-        lines.append("")
-        lines.append("Test / command output (last chars):")
-        lines.append(stdout_tail)
-
-    if stderr_tail:
-        lines.append("")
-        lines.append("Stderr:")
-        lines.append(stderr_tail)
-
-    lines.append("")
-    lines.append("If this is a retry, try a DIFFERENT approach than your previous attempt.")
-    return "\n".join(lines) + "\n"
-
-
-def _context_block(state):
-    """Combine lessons and failure blocks (whichever are present)."""
-    parts = []
-    lb = _lessons_block(state)
-    if lb:
-        parts.append(lb)
-    fb = _failure_block(state)
-    if fb:
-        parts.append(fb)
-    return "\n".join(parts)
+# ---- public API ----------------------------------------------------------
 
 
 def build_prompt(node_id, node, state):
-    """Build a normal (first-attempt) prompt for a workflow node."""
+    """Build the prompt for a fresh agent executing one workflow node.
+
+    Note: this is called on every node execution — including retries — because
+    the stateless model means each node gets a fresh agent. All context is
+    carried via the structured state, injected inside the fence.
+    """
     task = resolve_refs(node.get("with", ""), state)
-    context = _context_block(state)
+    context_block = _render_context_fence(state, node_id)
 
-    sections = [f"You are executing workflow node '{node_id}'."]
-    if context:
-        sections.append(context)
-    sections.append("Task:")
-    sections.append(task)
-    sections.append(RESULT_CONTRACT)
+    lines = [f"You are executing workflow node '{node_id}'."]
+    if context_block:
+        lines.append(context_block)
+    lines.append("Your task:")
+    lines.append(task)
+    lines.append(RESULT_CONTRACT)
 
-    return "\n\n".join(sections)
+    return "\n\n".join(lines)
 
 
-def build_retry_prompt(node_id, node, state, attempt, max_attempts=3, previous_summary=None):
-    """Build a retry prompt with an explicit RETRY banner.
+def build_retry_prompt(node_id, node, state, attempt, max_attempts=3,
+                       previous_summary=None):
+    """Prepend a RETRY banner to build_prompt.
 
-    Args:
-        node_id: Current node
-        node: Node dict
-        state: Current workflow state (should already have last_failure set)
-        attempt: Current attempt number (1-indexed; 2 = second try)
-        max_attempts: Maximum attempts allowed
-        previous_summary: Optional one-liner about what the prior attempt did
-
-    Returns:
-        Complete prompt string with RETRY banner prepended.
+    In the stateless model the state.failed_approaches already carries the
+    history, but an explicit banner helps the agent realize this is a retry
+    rather than a first attempt.
     """
     banner_lines = [
         f"!!! RETRY — ATTEMPT {attempt} OF {max_attempts} !!!",
@@ -138,7 +215,7 @@ def build_retry_prompt(node_id, node, state, attempt, max_attempts=3, previous_s
     if previous_summary:
         banner_lines.append(f"Previous attempt summary: {previous_summary}")
     banner_lines.append(
-        "Your previous approach did not work. Read the failure context below. "
+        "Your previous approach did not work. Read the CONTEXT block below. "
         "Try a DIFFERENT approach or address a DIFFERENT aspect of the problem."
     )
 

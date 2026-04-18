@@ -39,8 +39,8 @@ from camflow.backend.persistence import (
 )
 from camflow.engine.dsl import load_workflow, validate_workflow
 from camflow.engine.error_classifier import classify_error, retry_mode
-from camflow.engine.memory import add_lesson_deduped
 from camflow.engine.state import apply_updates, init_state
+from camflow.engine.state_enricher import enrich_state, init_structured_fields
 from camflow.engine.transition import resolve_next
 
 
@@ -65,28 +65,16 @@ class EngineConfig:
 # ---- Helpers --------------------------------------------------------------
 
 
-def _build_failure_context(node_id, result, attempt_count):
-    """Pack the info agents need on retry into a last_failure dict."""
-    output = result.get("output") or {}
-    stdout_tail = output.get("stdout_tail") or ""
-    stderr_tail = output.get("stderr_tail") or ""
-    # also accept agent-style fail with no output.stdout_tail
-    return {
-        "node_id": node_id,
-        "summary": result.get("summary") or "",
-        "stdout_tail": stdout_tail,
-        "stderr_tail": stderr_tail,
-        "attempt_count": attempt_count,
-    }
-
-
 def _init_runtime_state(state):
-    """Ensure retry_counts and node_execution_count exist in state."""
-    state.setdefault("retry_counts", {})
+    """Ensure runtime bookkeeping fields exist in state.
+
+    Also initializes the six-section structured fields via
+    init_structured_fields so enrich_state can work against a consistent
+    shape from step one.
+    """
     state.setdefault("node_execution_count", {})
-    state.setdefault("lessons", [])
-    state.setdefault("last_failure", None)
     state.setdefault("current_agent_id", None)
+    init_structured_fields(state)
     return state
 
 
@@ -422,30 +410,54 @@ class Engine:
 
     def _apply_result_and_transition(self, node_id, node, result, ts_start, ts_end,
                                      agent_id, exec_mode, completion_signal, event, attempt):
-        """Apply lessons, retry logic, transitions. Returns False to break loop."""
+        """Enrich state, apply retry logic, resolve transition.
+
+        Stateless model: state is the source of truth between nodes. After a
+        node returns, enrich_state() merges the result into the six-section
+        structured state so the NEXT prompt (always a fresh agent) sees it.
+        """
         input_state = copy.deepcopy(self.state)
 
-        lesson_added = self._maybe_capture_lesson(result)
-
-        # Decide retry vs transition
         status = result.get("status")
         error = self._classify_error(node, result)
         mode = retry_mode(error)
 
-        # Apply state_updates (but remove the new_lesson key since we already handled it)
-        state_updates = dict(result.get("state_updates") or {})
-        state_updates.pop("new_lesson", None)
-        apply_updates(self.state, state_updates)
+        # Pre-enrichment lesson capture (for trace visibility). enrich_state
+        # will do the real merge, but we want to know whether a lesson was
+        # added for the trace entry.
+        pre_lessons = list(self.state.get("lessons", []))
+
+        # Capture cmd stdout/stderr as test_output for cmd nodes that failed.
+        do = node.get("do", "")
+        cmd_output = None
+        if do.startswith("cmd ") and status == "fail":
+            cmd_output = (result.get("output") or {}).get("stdout_tail")
+
+        # MERGE the node result into structured state
+        enrich_state(self.state, node_id, result, cmd_output=cmd_output)
+
+        # Determine whether a lesson was added (for trace)
+        lesson_added = None
+        if len(self.state.get("lessons", [])) > len(pre_lessons):
+            lesson_added = self.state["lessons"][-1]
+
+        # Also apply any ad-hoc state_updates keys that enrich_state doesn't
+        # manage (new_lesson, files_touched, resolved, next_steps, active_task
+        # are all handled there — apply the remainder for backward compat).
+        extra_updates = dict(result.get("state_updates") or {})
+        for managed in ("new_lesson", "files_touched", "modified_files",
+                        "key_files", "resolved", "next_steps", "active_task",
+                        "detail", "lines"):
+            extra_updates.pop(managed, None)
+        apply_updates(self.state, extra_updates)
 
         if status == "fail":
             retry_count = self.state["retry_counts"].get(node_id, 0)
             if retry_count + 1 < self.config.max_retries:
-                # Budget not exhausted — set up retry
+                # Budget not exhausted — retry same node next iter.
+                # enrich_state has already recorded the attempt in
+                # state.failed_approaches and state.blocked.
                 self.state["retry_counts"][node_id] = retry_count + 1
-                self.state["last_failure"] = _build_failure_context(
-                    node_id, result, attempt_count=attempt,
-                )
-                # pc stays the same — we'll re-enter this node next iter
                 transition = {
                     "workflow_status": "running",
                     "next_pc": node_id,
@@ -460,18 +472,14 @@ class Engine:
                     attempt=attempt, retry_mode_val=mode,
                 )
                 return True  # continue
-            # budget exhausted — record last_failure and fall through to transition resolution
-            self.state["last_failure"] = _build_failure_context(
-                node_id, result, attempt_count=attempt,
-            )
+            # budget exhausted — fall through to DSL transition
 
         # Resolve the DSL transition for success or exhausted-retry fail
         transition = resolve_next(node_id, node, result, self.state)
 
-        # On success: reset retry counter and clear last_failure
+        # On success: reset retry counter for this node
         if status == "success":
             self.state["retry_counts"][node_id] = 0
-            self.state["last_failure"] = None
 
         next_pc = transition["next_pc"]
         workflow_status = transition["workflow_status"]
@@ -522,20 +530,6 @@ class Engine:
         print(f"  → {status_str}: {summary}")
         if reason:
             print(f"  transition: {node_id} → {transition.get('next_pc')!r} ({reason})")
-
-    def _maybe_capture_lesson(self, result):
-        """Extract new_lesson from state_updates, add to lessons list with dedup+prune."""
-        updates = result.get("state_updates") or {}
-        lesson = updates.get("new_lesson")
-        if not lesson:
-            return None
-        lessons = self.state.setdefault("lessons", [])
-        before = len(lessons)
-        add_lesson_deduped(lessons, lesson)
-        if len(lessons) > before or (lesson in lessons and before == 0):
-            return lesson
-        # already present → not added, but return the attempted string for trace
-        return None
 
     def _classify_error(self, node, result):
         if result.get("status") != "fail":

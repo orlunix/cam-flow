@@ -38,5 +38,7 @@ def test_missing_result_file_classified_correctly(tmp_path, monkeypatch):
     final = eng.run()
 
     assert final["status"] == "failed"
-    # last_failure should have been populated with PARSE_ERROR context
-    assert final["last_failure"] is not None
+    # blocked and failed_approaches should have been populated
+    assert final["blocked"] is not None
+    assert final["blocked"]["node"] == "start"
+    assert any(fa["node"] == "start" for fa in final["failed_approaches"])
