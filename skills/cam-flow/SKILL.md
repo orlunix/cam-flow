@@ -1,15 +1,16 @@
 ---
 name: cam-flow
 description: >
-  Set up and launch a cam-flow workflow project. Supports two execution
-  modes: CLI (agent drives nodes itself via /loop) and CAM (engine
-  process runs nodes by spawning sub-agents). Interactively gathers
-  requirements, generates a plan via the camflow planner, gets explicit
-  user approval, writes project files, and launches execution. Then
-  EXITS — does not babysit the engine. Post-execution reporting is a
-  separate invocation. Trigger on "create a workflow", "set up a flow",
-  "automate this", "run a pipeline", "cam-flow", "/flow", or any
-  multi-step task description.
+  DEPRECATED — split into camflow-creator (setup, Steps 0–6) and
+  camflow-runner (CLI per-tick execution, the workflow-run
+  replacement). Use camflow-creator for new projects; it handles both
+  CLI and CAM modes. This skill is retained for reference and backward
+  compatibility; new sessions should prefer the two-skill split.
+  Original scope: set up and launch a cam-flow workflow project
+  supporting CLI (agent drives /loop) and CAM (engine spawns
+  sub-agents) modes. Gathered requirements, generated a plan via the
+  camflow planner, reviewed with the user, wrote project files, and
+  launched execution — then exited.
 version: 1.0.0
 author: cam-flow
 license: MIT

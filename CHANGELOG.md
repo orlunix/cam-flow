@@ -6,6 +6,38 @@ dates are ISO-8601.
 
 ## [Unreleased]
 
+### Added (2026-04-19, split lifecycle skills)
+- **`camflow-creator` skill** (`skills/camflow-creator/SKILL.md` +
+  `~/.claude/skills/camflow-creator/SKILL.md`) — SETUP skill for
+  both CLI and CAM modes. Steps 0–6: mode select, requirements
+  interview, env investigation, `camflow plan` call, mandatory plan
+  review with user, write project files (CLAUDE.md + workflow.yaml +
+  `.camflow/`), launch. CAM mode launches engine via `nohup` then
+  EXITS. CLI mode writes initial `.claude/state/workflow.json` and
+  tells the user to run `camflow-runner` via `/loop`. Same 10 hard
+  interaction rules as the deprecated `cam-flow` skill.
+- **`camflow-runner` skill** (`skills/camflow-runner/SKILL.md` +
+  `~/.claude/skills/camflow-runner/SKILL.md`) — CLI-mode per-tick
+  executor. Supersedes the older `workflow-run` skill. Same file
+  layout and contract (`.claude/state/workflow.json`,
+  `.claude/state/trace.log`, single-node execution per invocation)
+  but upgraded to:
+    * honor `verify` fields (post-agent gate, same contract as CAM)
+    * consume `methodology` hints
+    * cap retries at node-level `max_retries`
+    * maintain the six-section state shape (`completed`, `blocked`,
+      `test_output`, `lessons`, `failed_approaches`, etc.) for
+      migration parity between CLI and CAM modes
+  Designed to be called by `/loop camflow-runner` — runs one node
+  then exits; `/loop` calls again for the next tick.
+
+### Deprecated (2026-04-19)
+- **`cam-flow` skill** — description now marks it DEPRECATED and
+  points users to `camflow-creator` (setup) + `camflow-runner`
+  (CLI execution). The skill file is retained for reference and
+  backward compatibility; it will stop being advertised to the
+  harness in a future release.
+
 ### Added (2026-04-19, lifecycle skills)
 - **`cam-flow` skill** (`skills/cam-flow/SKILL.md`, also installed to
   `~/.claude/skills/cam-flow/SKILL.md`) — the definitive user
