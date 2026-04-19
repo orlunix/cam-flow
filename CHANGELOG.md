@@ -6,7 +6,28 @@ dates are ISO-8601.
 
 ## [Unreleased]
 
-### Added (2026-04-19)
+### Added (2026-04-19, lifecycle skills)
+- **`cam-flow` skill** (`skills/cam-flow/SKILL.md`, also installed to
+  `~/.claude/skills/cam-flow/SKILL.md`) — the definitive user
+  interface for setting up and launching cam-flow workflows. Seven
+  steps: mode select → requirements interview → env investigation →
+  `camflow plan` → mandatory user review → write project files →
+  launch engine and EXIT. Post-execution reporting (Step 7) is a
+  separate skill invocation. The SETUP agent does not stay alive
+  while the engine grinds — no Claude-session cost during a 90-min
+  formal-verify run. Triggers on "create a workflow", "set up a
+  flow", "automate this", "run a pipeline", "cam-flow", "/flow".
+- **`camflow` skill** (`skills/camflow/SKILL.md`) — alternative
+  babysit-style lifecycle: a single agent stays alive across plan +
+  execute + report, monitoring `state.json` every 30 s, pausing on
+  L3+ escalation, verify mismatch, or engine silence. Heavier than
+  `cam-flow` but right for workflows where every node needs human
+  eyes.
+- **`docs/architecture.md` — new "User-facing lifecycle" section**
+  with an ASCII diagram showing the three-phase separation
+  (setup agent → engine process → report agent).
+
+### Added (2026-04-19, planner)
 - **`camflow plan "<request>"` CLI.** Natural-language request →
   validated workflow.yaml in one strong-model call. New
   `src/camflow/planner/` package:

@@ -656,6 +656,78 @@ Shared across backends; fsync'd writes; JSONL append-only trace.
 
 ---
 
+## User-facing lifecycle (cam-flow skill)
+
+The `cam-flow` skill at `skills/cam-flow/SKILL.md` is the definitive
+user interface. It separates SETUP (an interactive Claude Code agent
+session) from EXECUTION (a separate Python engine process that
+spawns sub-agents on its own) from REPORT (a later, separate
+invocation):
+
+```
+ ┌─────────────────────────────────────┐
+ │ SETUP AGENT (cam-flow skill)        │
+ │                                     │
+ │  0. mode select: CLI vs CAM         │
+ │  1. requirements interview          │
+ │  2. env investigation               │
+ │  3. camflow plan → workflow.yaml    │
+ │  4. review with user (mandatory)    │
+ │  5. write CLAUDE.md + workflow.yaml │
+ │  6. launch engine → EXIT            │
+ └──────────────┬──────────────────────┘
+                │  nohup python3 -m camflow.cli_entry.main
+                │        workflow.yaml &
+                ▼
+ ┌─────────────────────────────────────┐
+ │ ENGINE PROCESS (no Claude session)  │
+ │                                     │
+ │  per node:                          │
+ │    cmd → subprocess.run             │
+ │    agent → camc run → sub-agent     │
+ │      writes node-result.json        │
+ │      engine.stop+rm                 │
+ │    verify → run verify cmd          │
+ │    enrich_state → update state.json │
+ │    append trace.log                 │
+ │  exit: done / failed / interrupted  │
+ └──────────────┬──────────────────────┘
+                │  user comes back later
+                ▼
+ ┌─────────────────────────────────────┐
+ │ REPORT AGENT (cam-flow skill,       │
+ │               new invocation)       │
+ │                                     │
+ │  7. read state.json + trace.log     │
+ │     camflow evolve report           │
+ │     show REPORT.md                  │
+ │     summarize findings              │
+ └─────────────────────────────────────┘
+```
+
+The SETUP agent does not stay alive. It sets up and launches, then
+exits. This is what makes long-running workflows tractable — no
+Claude session is consuming tokens while the engine grinds through
+90 minutes of tree setup and formal verification.
+
+The ENGINE owns the full execution. It spawns its own sub-agents via
+`camc run`, reads their `node-result.json`, and cleans them up. See
+the Plan vs Runtime boundary section for which fields the plan
+specifies and which the runtime defaults.
+
+The REPORT phase is a NEW invocation of the skill. There's no
+persistent agent waiting. The user (or a future agent session) asks
+"how did it go?" and the skill runs its Step 7 procedure against the
+persisted `.camflow/state.json` and `.camflow/trace.log`.
+
+The alternative, babysit-style skill (`camflow` — no hyphen) stays
+running across all three phases. It's heavier and pays a Claude
+session cost for the whole workflow duration. Use `cam-flow` when
+the engine can run unattended; `camflow` when every node needs
+human eyes.
+
+---
+
 ## Plan vs Runtime boundary
 
 cam-flow splits decisions across two sources:
