@@ -31,14 +31,17 @@ from camflow.backend.cam.orphan_handler import (
 )
 from camflow.backend.cam.progress import format_progress_line, write_progress
 from camflow.backend.cam.prompt_builder import build_prompt, build_retry_prompt
-from camflow.backend.cam.tracer import build_trace_entry
+from camflow.backend.cam.tracer import approx_token_count, build_trace_entry
 from camflow.backend.persistence import (
     append_trace_atomic,
     load_state,
     save_state_atomic,
 )
+from camflow.engine.checkpoint import checkpoint_after_success
 from camflow.engine.dsl import load_workflow, validate_workflow
 from camflow.engine.error_classifier import classify_error, retry_mode
+from camflow.engine.escalation import get_escalation_level
+from camflow.engine.methodology_router import select_methodology_label
 from camflow.engine.state import apply_updates, init_state
 from camflow.engine.state_enricher import enrich_state, init_structured_fields
 from camflow.engine.transition import resolve_next
@@ -116,6 +119,7 @@ class Engine:
         self.step = 0
         self.workflow_started_at = None
         self._interrupted = False
+        self._last_prompt = None  # last prompt sent to an agent, for token-counting
 
     # ---- setup -----------------------------------------------------------
 
@@ -354,6 +358,7 @@ class Engine:
             from camflow.engine.input_ref import resolve_refs
             command = resolve_refs(do[4:], self.state)
             print(f"  cmd: {command}")
+            self._last_prompt = None
             result = run_cmd(command, self.project_dir, timeout=per_node_timeout)
             return (result, None, None)
 
@@ -368,6 +373,8 @@ class Engine:
             )
         else:
             prompt = build_prompt(node_id, node, self.state)
+        # Stash prompt so _finish_step can compute prompt_tokens for trace
+        self._last_prompt = prompt
 
         # Save current_agent_id BEFORE starting so we can detect orphans
         # (agent starts inside run_agent; we update state after start_agent returns)
@@ -502,6 +509,15 @@ class Engine:
                      ts_start, ts_end, agent_id, exec_mode, completion_signal,
                      lesson_added, event, attempt, retry_mode_val):
         """Write trace and save state once per step."""
+        # Evaluation fields (see docs/evaluation.md §2)
+        allowed_tools = node.get("allowed_tools") if isinstance(node, dict) else None
+        prompt_tokens = (
+            approx_token_count(self._last_prompt) if self._last_prompt else None
+        )
+        methodology_label = select_methodology_label(node_id, node)
+        escalation_level = get_escalation_level(input_state, node_id)
+        tools_available = len(allowed_tools) if allowed_tools else None
+
         entry = build_trace_entry(
             step=self.step,
             node_id=node_id,
@@ -520,9 +536,29 @@ class Engine:
             completion_signal=completion_signal,
             lesson_added=lesson_added,
             event=event,
+            prompt_tokens=prompt_tokens,
+            tools_available=tools_available,
+            context_position="first",  # HQ.1 shipped — CONTEXT is at prompt start
+            enricher_enabled=True,
+            fenced=True,
+            methodology=methodology_label,
+            escalation_level=escalation_level,
         )
         self._append_trace(entry)
         self._save_state()
+
+        # §6.1 Checkpoint: auto-commit after successful agent nodes
+        if (
+            result.get("status") == "success"
+            and exec_mode == "camc"
+            and event != "retry"
+        ):
+            checkpoint_after_success(
+                self.project_dir,
+                node_id,
+                self.step,
+                result.get("summary") or "",
+            )
 
         status_str = result.get("status", "?")
         summary = result.get("summary") or ""

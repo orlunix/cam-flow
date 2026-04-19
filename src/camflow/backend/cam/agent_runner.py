@@ -193,7 +193,7 @@ def _wait_for_result(agent_id, result_path, timeout, poll_interval):
 # ---- public API ----------------------------------------------------------
 
 
-def start_agent(node_id, prompt, project_dir):
+def start_agent(node_id, prompt, project_dir, allowed_tools=None):
     """Start a camc agent for a node.
 
     Writes the prompt to `.camflow/node-prompt.txt` (because tmux paste
@@ -202,6 +202,15 @@ def start_agent(node_id, prompt, project_dir):
 
     Notably: NO --auto-exit flag. The engine owns shutdown via
     cleanup_agent once the result file appears.
+
+    `allowed_tools`: list of Claude Code tool names to restrict the
+    agent to (§5.3 HQ.3). Current camc releases do NOT expose
+    `--allowed-tools` on the `run` subcommand, so this parameter is
+    accepted for API compatibility and enforced as a SOFT constraint
+    at the prompt level (prompt_builder renders a "Tools you may use"
+    line when the node's workflow.yaml sets `allowed_tools`). When
+    camc gains `--allowed-tools` we'll switch to hard enforcement
+    here without an API change.
 
     Returns:
         agent_id (str). Raises RuntimeError on launch failure.

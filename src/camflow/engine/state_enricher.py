@@ -26,6 +26,7 @@ MAX_COMPLETED = 20
 MAX_FAILED_APPROACHES = 5
 MAX_RESOLVED = 20
 MAX_NEXT_STEPS = 10
+MAX_TEST_HISTORY = 10
 TEST_OUTPUT_MAX_CHARS = 3000
 
 
@@ -40,6 +41,7 @@ def init_structured_fields(state):
     state.setdefault("active_state", {})
     state.setdefault("blocked", None)
     state.setdefault("test_output", None)
+    state.setdefault("test_history", [])
     state.setdefault("resolved", [])
     state.setdefault("next_steps", [])
     state.setdefault("lessons", [])
@@ -49,6 +51,29 @@ def init_structured_fields(state):
     state["active_state"].setdefault("key_files", [])
     state["active_state"].setdefault("modified_files", [])
     return state
+
+
+def _summarize_test_output(text, iteration):
+    """Produce a one-line summary of a pytest/cmd output block.
+
+    Prefers the pytest summary line (e.g. "2 failed, 9 passed in 0.05s");
+    falls back to the first non-empty line truncated to 80 chars.
+    """
+    if not text:
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    # Look for pytest-style summary on any line, preferring the last match
+    for line in reversed(stripped.split("\n")):
+        lower = line.lower()
+        if " passed" in lower or " failed" in lower or " error" in lower:
+            return f"iter {iteration}: {line.strip()[:120]}"
+    # Fallback: first meaningful line
+    for line in stripped.split("\n"):
+        if line.strip():
+            return f"iter {iteration}: {line.strip()[:80]}"
+    return None
 
 
 # ---- pruning -------------------------------------------------------------
@@ -104,19 +129,39 @@ def _capture_files(state, state_updates):
 def _capture_test_output(state, node_result, cmd_output):
     """Decide whether to store stdout/stderr as test_output.
 
-    Priority:
-      1. explicit cmd_output argument (engine may pass it for cmd nodes)
+    Priority for the new content:
+      1. explicit cmd_output argument (engine passes it for cmd nodes)
       2. node_result.output.stdout_tail on cmd failure (pytest, build)
       3. otherwise leave test_output untouched
+
+    Observation-masking (§5.2): when we are about to overwrite
+    test_output, archive the OLD value as a one-line entry in
+    test_history first. Keeps long fix→test loops from bloating the
+    prompt while preserving a trajectory summary the agent can see.
     """
+    new_output = None
     if cmd_output is not None:
-        state["test_output"] = cmd_output[-TEST_OUTPUT_MAX_CHARS:]
+        new_output = cmd_output[-TEST_OUTPUT_MAX_CHARS:]
+    else:
+        output = node_result.get("output") or {}
+        stdout_tail = output.get("stdout_tail")
+        if stdout_tail and node_result.get("status") != "success":
+            new_output = stdout_tail[-TEST_OUTPUT_MAX_CHARS:]
+
+    if new_output is None:
         return
 
-    output = node_result.get("output") or {}
-    stdout_tail = output.get("stdout_tail")
-    if stdout_tail and node_result.get("status") != "success":
-        state["test_output"] = stdout_tail[-TEST_OUTPUT_MAX_CHARS:]
+    prev = state.get("test_output")
+    if prev:
+        # Iteration was already incremented at the top of enrich_state;
+        # attribute the summary to the current iteration step.
+        summary = _summarize_test_output(prev, state.get("iteration", 0))
+        if summary:
+            history = state.setdefault("test_history", [])
+            history.append(summary)
+            _prune_list(history, MAX_TEST_HISTORY)
+
+    state["test_output"] = new_output
 
 
 def _record_success(state, node_id, node_result, touched_files):
