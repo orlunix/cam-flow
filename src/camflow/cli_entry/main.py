@@ -3,6 +3,7 @@
 Usage modes (the first positional argument decides the mode):
 
     camflow <workflow.yaml> [flags]        # run a workflow (default)
+    camflow plan "<request>" [flags]       # generate workflow.yaml from NL
     camflow evolve report <dir> [--json]   # trace-based eval reports
 
 Keeping the workflow path as the default first positional argument
@@ -16,6 +17,7 @@ import sys
 
 from camflow.backend.cam.engine import Engine, EngineConfig
 from camflow.cli_entry.evolve import build_parser as build_evolve_parser
+from camflow.cli_entry.plan import build_parser as build_plan_parser
 from camflow.engine.dsl import load_workflow, validate_workflow
 
 
@@ -92,9 +94,18 @@ def _run_evolve(argv):
     return args.func(args)
 
 
+def _run_plan(argv):
+    parser = build_plan_parser(None)
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
 def _print_top_help():
     print(__doc__.strip())
-    print("\nSee `camflow <workflow.yaml> --help` or `camflow evolve --help`.")
+    print(
+        "\nSee `camflow <workflow.yaml> --help`, `camflow plan --help`, "
+        "or `camflow evolve --help`."
+    )
 
 
 def main():
@@ -106,6 +117,8 @@ def main():
     # Dispatch: first positional argument decides the mode
     if argv[0] == "evolve":
         rc = _run_evolve(argv[1:])
+    elif argv[0] == "plan":
+        rc = _run_plan(argv[1:])
     else:
         rc = _run_workflow(argv)
     sys.exit(rc)
