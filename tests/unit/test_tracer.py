@@ -1,8 +1,8 @@
-"""Unit tests for backend.cam.tracer.build_trace_entry."""
+"""Unit tests for backend.cam.tracer."""
 
 import time
 
-from camflow.backend.cam.tracer import build_trace_entry
+from camflow.backend.cam.tracer import approx_token_count, build_trace_entry
 
 
 def test_all_fields_present():
@@ -24,6 +24,10 @@ def test_all_fields_present():
         "input_state", "node_result", "output_state", "transition",
         "agent_id", "exec_mode", "completion_signal",
         "lesson_added", "event",
+        # evaluation fields
+        "prompt_tokens", "context_tokens", "task_tokens",
+        "tools_available", "tools_used", "context_position",
+        "enricher_enabled", "fenced", "methodology", "escalation_level",
     }
     assert set(e.keys()) >= expected_fields
 
@@ -60,3 +64,57 @@ def test_iso_timestamps():
     assert e["ts_start"].startswith("1970-01-01T00:00:00")
     assert e["ts_start"].endswith("Z")
     assert "." in e["ts_start"]
+
+
+def test_evaluation_field_defaults():
+    """Evaluation fields default to values that describe current behavior."""
+    e = build_trace_entry(1, "n", {}, {}, {}, {}, {}, 0.0, 0.1)
+    assert e["prompt_tokens"] is None
+    assert e["context_tokens"] is None
+    assert e["task_tokens"] is None
+    assert e["tools_available"] is None
+    assert e["tools_used"] is None
+    assert e["context_position"] == "middle"
+    assert e["enricher_enabled"] is True
+    assert e["fenced"] is True
+    assert e["methodology"] == "none"
+    assert e["escalation_level"] == 0
+
+
+def test_evaluation_field_override():
+    """All evaluation fields are settable via keyword args."""
+    e = build_trace_entry(
+        1, "fix", {"do": "agent claude"}, {}, {}, {}, {}, 0.0, 0.1,
+        prompt_tokens=4500, context_tokens=2100, task_tokens=800,
+        tools_available=4, tools_used=2, context_position="first",
+        enricher_enabled=False, fenced=False, methodology="rca",
+        escalation_level=2,
+    )
+    assert e["prompt_tokens"] == 4500
+    assert e["context_tokens"] == 2100
+    assert e["task_tokens"] == 800
+    assert e["tools_available"] == 4
+    assert e["tools_used"] == 2
+    assert e["context_position"] == "first"
+    assert e["enricher_enabled"] is False
+    assert e["fenced"] is False
+    assert e["methodology"] == "rca"
+    assert e["escalation_level"] == 2
+
+
+class TestApproxTokenCount:
+    def test_empty_text_is_zero(self):
+        assert approx_token_count("") == 0
+        assert approx_token_count(None) == 0
+
+    def test_minimum_one_token_for_any_content(self):
+        assert approx_token_count("a") == 1
+        assert approx_token_count("abc") == 1
+
+    def test_ratio_is_4_chars_per_token(self):
+        assert approx_token_count("a" * 8) == 2
+        assert approx_token_count("a" * 400) == 100
+
+    def test_deterministic(self):
+        text = "hello world, this is a test string"
+        assert approx_token_count(text) == approx_token_count(text)
