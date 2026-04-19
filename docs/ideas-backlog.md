@@ -400,6 +400,35 @@ idea only / REJECTED).
 - **Source.** Developer annoyance.
 - **Status.** Idea — user handles the VDI side.
 
+### 32. Plan vs Runtime boundary (plan-priority + verify cmd)
+
+- **What.** Node-level fields in `workflow.yaml` (`methodology`,
+  `escalation_max`, `max_retries`, `verify`, `allowed_tools`,
+  `timeout`) take priority over runtime heuristics. Keyword-based
+  methodology routing and default retry budgets become fallbacks
+  that kick in only when the plan is silent. Plus: a new `verify`
+  field runs a cmd after an agent's claimed success and downgrades
+  the result to fail on non-zero exit, giving workflow authors a
+  programmatic gate on agent claims.
+- **Why.** Workflow authors often know better than the runtime
+  which methodology a node needs, how many retries to allow, what
+  the pass criterion actually is. Runtime heuristics (keyword
+  router, default retry=3, agent self-report = source of truth)
+  are good first-order defaults but shouldn't override an explicit
+  plan. And agent self-reports of success are not proof —
+  `verify: "pytest -k foo"` is proof.
+- **Source.** RV32 ECC verification run revealed the gap: the
+  plan wanted specific methodology + success criteria, but runtime
+  had the last word. Pattern is standard in CI systems (Jenkins
+  `post { success { sh './verify.sh' } }`, GitHub Actions
+  `verify-signed-commits`).
+- **Status.** SHIPPED 2026-04-18. See
+  `src/camflow/engine/dsl.py` for the new `NODE_FIELDS`,
+  `prompt_builder.build_prompt` for plan-first methodology/
+  escalation injection, `backend/cam/engine.py::_apply_verify_cmd`
+  for the verify gate, `tests/unit/test_plan_priority.py` for the
+  14 new tests.
+
 ---
 
 ## How to use this document

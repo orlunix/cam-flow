@@ -123,6 +123,27 @@ dates are ISO-8601.
   → `camflow evolve …` subcommand; otherwise treated as the
   workflow path (preserves backward compatibility with existing
   scripts).
+- **Engine entry node.** `engine.state.init_state(first_node="start")`
+  now accepts the entry node name; `Engine._load_or_init_state()`
+  uses the first YAML-declared node as `pc`. `validate_workflow` no
+  longer hard-requires a literal `start` node (caught the RV32 ECC
+  production workflow where `setup-tree` is first).
+- **Plan vs Runtime boundary.** Node-level config now wins over
+  keyword-based runtime routing:
+  - `methodology: "<label>"` — picks `rca` / `simplify-first` /
+    `search-first` / `working-backwards` / `systematic-coverage`
+    explicitly; overrides the keyword router.
+  - `escalation_max: N` — caps the escalation ladder at Ln so
+    non-critical nodes never get promoted past a polite "rethink."
+  - `max_retries: N` — per-node retry budget; overrides
+    `EngineConfig.max_retries`.
+  - `verify: "<shell cmd>"` — after an agent reports success, the
+    engine runs this cmd; non-zero exit downgrades the result to
+    `status=fail` with `error.code=VERIFY_FAIL` so the transition
+    machinery sees a failure.
+  `NODE_FIELDS` in `engine/dsl.py` now accepts `methodology`,
+  `verify`, `escalation_max`, `max_retries`, `allowed_tools`,
+  `timeout`. Full suite: 232 passing (was 218).
 
 ### Planned (see `docs/roadmap.md` for the full timeline)
 - §5.4 HQ.4 — Multi-layer verification template: fix → lint →

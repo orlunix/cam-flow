@@ -656,6 +656,37 @@ Shared across backends; fsync'd writes; JSONL append-only trace.
 
 ---
 
+## Plan vs Runtime boundary
+
+cam-flow splits decisions across two sources:
+
+- **Plan** (`workflow.yaml`): what the workflow author declared. The
+  plan is authoritative when it speaks.
+- **Runtime** (engine + prompt_builder): heuristics and defaults that
+  apply only when the plan is silent.
+
+Concretely, per-node fields recognized by the engine:
+
+| Field | Plan wins over | Default when absent |
+|-------|----------------|---------------------|
+| `methodology: "rca"` | keyword routing in `select_methodology` | keyword match on `do` + `with` |
+| `escalation_max: 2` | uncapped L0..L4 ladder | `max_level=4` (ladder reaches L4 on enough retries) |
+| `max_retries: 5` | `EngineConfig.max_retries` | 3 (engine config default) |
+| `allowed_tools: [...]` | (no runtime heuristic) | full default tool set |
+| `verify: "cmd"` | agent's self-reported status | no verification — agent's word is final |
+| `timeout: 120` | `EngineConfig.node_timeout` | 600 s |
+
+A good mnemonic: the keyword methodology router is a "second opinion"
+the runtime offers; the plan's explicit `methodology:` is a
+"first-party instruction." Similarly, an agent's `status: "success"`
+is a self-report; `verify:` is an external proof. Plan-level fields
+let the author demand the proof when the stakes warrant it.
+
+See `tests/unit/test_plan_priority.py` for the 14 tests that pin
+these semantics.
+
+---
+
 ## What isn't here
 
 - `backend/cam_lite/`, `backend/sdk/` — placeholders, no runtime yet.

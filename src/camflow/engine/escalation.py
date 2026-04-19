@@ -36,29 +36,36 @@ ESCALATION_PROMPTS = {
 }
 
 
-def get_escalation_level(state, node_id):
-    """Map retry_counts[node_id] to L0..L4.
+def get_escalation_level(state, node_id, max_level=4):
+    """Map retry_counts[node_id] to L0..L4, capped at `max_level`.
 
     n = 0  → L0  (first attempt, no warning)
     n = 1  → L1  (first retry, "try different")
     n = 2  → L2  (second retry, "deep dive")
     n = 3–4 → L3 (third/fourth retry, "diagnostic")
     n >= 5 → L4  (escalation)
+
+    `max_level` lets the workflow author cap escalation at a specific
+    level via the node's `escalation_max` field — e.g. a non-critical
+    node may prefer to stay at L1 (polite rethink) and never promote to
+    the heavy diagnostic / human-escalate levels.
     """
     counts = state.get("retry_counts", {}) if isinstance(state, dict) else {}
     n = counts.get(node_id, 0) if isinstance(counts, dict) else 0
     if n <= 0:
-        return 0
-    if n == 1:
-        return 1
-    if n == 2:
-        return 2
-    if n <= 4:
-        return 3
-    return 4
+        level = 0
+    elif n == 1:
+        level = 1
+    elif n == 2:
+        level = 2
+    elif n <= 4:
+        level = 3
+    else:
+        level = 4
+    return min(level, max_level)
 
 
-def get_escalation_prompt(state, node_id):
+def get_escalation_prompt(state, node_id, max_level=4):
     """Return the intervention text for the current escalation level, or ""."""
-    level = get_escalation_level(state, node_id)
+    level = get_escalation_level(state, node_id, max_level=max_level)
     return ESCALATION_PROMPTS.get(level, "")

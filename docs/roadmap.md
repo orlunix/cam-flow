@@ -426,6 +426,40 @@ test:
 Ship as `examples/cam-verified/` reference workflow, document the
 pattern in `docs/patterns/multi-layer-verification.md`.
 
+### 5.5 Plan vs Runtime boundary — SHIPPED (2026-04-18)
+
+**Principle.** The plan (workflow.yaml) is authoritative. Runtime
+heuristics (keyword-based methodology routing, default retry budgets,
+agent self-reports) are good first-order defaults but must not
+override explicit plan directives.
+
+**Shipped.** New optional fields on any node:
+
+- `methodology: "<label>"` — explicit methodology hint; overrides
+  the keyword router in `engine/methodology_router.py`.
+- `escalation_max: N` — caps the escalation ladder at Ln
+  (0..4). Non-critical nodes stay at a polite "rethink" instead of
+  promoting to human-escalate.
+- `max_retries: N` — per-node override of
+  `EngineConfig.max_retries`.
+- `verify: "<shell cmd>"` — after an agent reports success, engine
+  runs this cmd; non-zero exit downgrades the result to
+  `status=fail` with `error.code=VERIFY_FAIL`. Short 30 s timeout
+  (verify is a proof, not real work).
+- `allowed_tools: [...]` — per-node tool scoping (was §5.3 HQ.3,
+  now formally part of the plan boundary).
+- `timeout: N` — per-node wall-clock timeout override.
+
+**Files touched.**
+- `src/camflow/engine/dsl.py` — `NODE_FIELDS` extended.
+- `src/camflow/backend/cam/prompt_builder.py` — plan-first
+  methodology + `escalation_max` forwarded to `get_escalation_prompt`.
+- `src/camflow/engine/escalation.py` — `max_level` parameter.
+- `src/camflow/backend/cam/engine.py` — `_apply_verify_cmd` hook
+  after `finalize_agent`; `max_retries` node override.
+- `tests/unit/test_plan_priority.py` — 14 new cases. Full suite:
+  232 passing (was 218).
+
 ---
 
 ## 6. Checkpoint System

@@ -17,6 +17,7 @@ Responsibilities (from docs/cam-phase-plan.md):
 import copy
 import os
 import signal
+import subprocess
 import sys
 import time
 import traceback
@@ -463,11 +464,59 @@ class Engine:
         )
         result = finalize_agent(agent_id, completion_signal, self.project_dir)
 
+        # Plan-level verify: if the node declares a verify cmd and the
+        # agent reported success, run the cmd and downgrade the result to
+        # fail on non-zero exit. Lets workflow authors mandate a
+        # programmatic proof that the agent's claimed success actually
+        # holds (e.g. run pytest, lint, a schema check) without a
+        # separate cmd node.
+        self._apply_verify_cmd(node, result)
+
         self.state["current_agent_id"] = None
         self.state["current_node_started_at"] = None
         self._save_state()
 
         return (result, agent_id, completion_signal)
+
+    def _apply_verify_cmd(self, node, result):
+        """Run the node's `verify` cmd if present; override status on failure.
+
+        Only runs when the agent declared success — a verify pass on an
+        already-failing agent result would be meaningless. Template
+        substitution ({{state.x}}) is applied to the cmd string. Verify
+        runs with a short 30 s timeout since it should be a quick proof,
+        not real work.
+        """
+        if not isinstance(node, dict):
+            return
+        verify_cmd = node.get("verify")
+        if not verify_cmd or result.get("status") != "success":
+            return
+
+        from camflow.engine.input_ref import resolve_refs
+        resolved = resolve_refs(verify_cmd, self.state)
+        try:
+            proc = subprocess.run(
+                resolved, shell=True, cwd=self.project_dir,
+                capture_output=True, text=True, timeout=30,
+            )
+            if proc.returncode != 0:
+                result["status"] = "fail"
+                result["summary"] = f"verify failed: {resolved}"
+                result["error"] = {
+                    "code": "VERIFY_FAIL",
+                    "exit_code": proc.returncode,
+                    "stdout": (proc.stdout or "")[-500:],
+                    "stderr": (proc.stderr or "")[-200:],
+                }
+        except subprocess.TimeoutExpired:
+            result["status"] = "fail"
+            result["summary"] = f"verify timed out: {resolved}"
+            result["error"] = {"code": "VERIFY_TIMEOUT"}
+        except Exception as exc:
+            result["status"] = "fail"
+            result["summary"] = f"verify error: {exc}"
+            result["error"] = {"code": "VERIFY_ERROR", "message": str(exc)}
 
     def _apply_result_and_transition(self, node_id, node, result, ts_start, ts_end,
                                      agent_id, exec_mode, completion_signal, event, attempt):
@@ -513,8 +562,12 @@ class Engine:
         apply_updates(self.state, extra_updates)
 
         if status == "fail":
+            # Plan-level override wins over engine default, per
+            # architecture Plan/Runtime boundary.
+            node_max_retries = node.get("max_retries") if isinstance(node, dict) else None
+            max_retries = node_max_retries if isinstance(node_max_retries, int) else self.config.max_retries
             retry_count = self.state["retry_counts"].get(node_id, 0)
-            if retry_count + 1 < self.config.max_retries:
+            if retry_count + 1 < max_retries:
                 # Budget not exhausted — retry same node next iter.
                 # enrich_state has already recorded the attempt in
                 # state.failed_approaches and state.blocked.
@@ -523,7 +576,7 @@ class Engine:
                     "workflow_status": "running",
                     "next_pc": node_id,
                     "resume_pc": None,
-                    "reason": f"retry {retry_count + 1}/{self.config.max_retries} ({mode})",
+                    "reason": f"retry {retry_count + 1}/{max_retries} ({mode})",
                 }
                 self._finish_step(
                     node_id, node, result, input_state, transition,

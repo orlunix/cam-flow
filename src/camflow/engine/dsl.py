@@ -5,7 +5,16 @@ Implements: spec/dsl.md
 
 import yaml
 
-NODE_FIELDS = {"do", "with", "next", "transitions", "set"}
+NODE_FIELDS = {
+    "do", "with", "next", "transitions", "set",
+    # Plan-level overrides — see docs/architecture.md (Plan vs Runtime boundary)
+    "methodology",     # explicit methodology label; overrides keyword router
+    "verify",          # cmd run after agent success; fails the node if exit != 0
+    "escalation_max",  # cap the escalation level at this node (0..4)
+    "max_retries",     # per-node retry budget override
+    "allowed_tools",   # per-node tool scoping (§5.3 HQ.3)
+    "timeout",         # per-node timeout in seconds
+}
 EXECUTOR_TYPES = {"skill", "cmd", "agent"}
 
 
