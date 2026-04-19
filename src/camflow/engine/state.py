@@ -4,9 +4,16 @@ Implements: spec/state.md
 """
 
 
-def init_state():
+def init_state(first_node="start"):
+    """Initialize a fresh workflow state.
+
+    `first_node` is the node id that pc should start at. Defaults to
+    "start" for back-compat, but the engine passes the first node it
+    finds in the loaded workflow so users aren't required to name the
+    entry node "start".
+    """
     return {
-        "pc": "start",
+        "pc": first_node,
         "status": "running"
     }
 

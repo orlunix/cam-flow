@@ -3,9 +3,14 @@
 from camflow.engine.state import apply_updates, init_state
 
 
-def test_init_state():
+def test_init_state_default():
     s = init_state()
     assert s == {"pc": "start", "status": "running"}
+
+
+def test_init_state_custom_first_node():
+    s = init_state("setup-tree")
+    assert s == {"pc": "setup-tree", "status": "running"}
 
 
 def test_apply_updates_empty_noop():

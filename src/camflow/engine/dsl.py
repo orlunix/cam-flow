@@ -50,8 +50,14 @@ def validate_workflow(workflow):
     if not isinstance(workflow, dict):
         return False, ["workflow is not a dict"]
 
-    if "start" not in workflow:
-        errors.append("workflow must have a 'start' node")
+    if not workflow:
+        errors.append("workflow has no nodes")
+
+    # Historical constraint: if there's no node named 'start', the engine
+    # falls back to the FIRST node in declaration order (Python dicts
+    # preserve insertion order since 3.7). We no longer hard-require a
+    # node literally named 'start' — real workflows often start with
+    # something like `setup-tree` or `analyze`.
 
     for node_id, node in workflow.items():
         valid, node_errors = validate_node(node_id, node)

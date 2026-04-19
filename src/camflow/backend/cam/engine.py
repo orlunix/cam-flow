@@ -157,7 +157,15 @@ class Engine:
     def _load_or_init_state(self):
         state = load_state(self.state_path)
         if state is None:
-            state = init_state()
+            # Use whichever node is declared FIRST in the workflow; fall
+            # back to "start" only if the workflow is somehow empty (the
+            # DSL validator will already have caught that).
+            first_node = (
+                next(iter(self.workflow))
+                if self.workflow
+                else "start"
+            )
+            state = init_state(first_node)
         self.state = _init_runtime_state(state)
 
     def _save_state(self):

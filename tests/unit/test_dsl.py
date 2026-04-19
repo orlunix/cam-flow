@@ -47,10 +47,17 @@ def test_validate_node_transitions_must_have_if_goto():
     assert any("transition" in e for e in errs)
 
 
-def test_validate_workflow_requires_start():
+def test_validate_workflow_accepts_any_first_node():
+    """Workflows no longer need a literal 'start' node — the engine
+    uses whichever node is declared first in YAML order."""
     ok, errs = validate_workflow({"foo": {"do": "cmd x"}})
+    assert ok, errs
+
+
+def test_validate_workflow_rejects_empty():
+    ok, errs = validate_workflow({})
     assert not ok
-    assert any("start" in e for e in errs)
+    assert any("no nodes" in e for e in errs)
 
 
 def test_validate_workflow_dangling_goto():
