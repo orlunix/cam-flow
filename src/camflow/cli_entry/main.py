@@ -1,53 +1,70 @@
+"""camflow CLI entry point.
+
+Usage modes (the first positional argument decides the mode):
+
+    camflow <workflow.yaml> [flags]        # run a workflow (default)
+    camflow evolve report <dir> [--json]   # trace-based eval reports
+
+Keeping the workflow path as the default first positional argument
+preserves backward compatibility with existing scripts like
+`camflow examples/cam/workflow.yaml`.
+"""
+
 import argparse
 import os
 import sys
 
 from camflow.backend.cam.engine import Engine, EngineConfig
+from camflow.cli_entry.evolve import build_parser as build_evolve_parser
 from camflow.engine.dsl import load_workflow, validate_workflow
 
 
-def main():
+RUN_FLAGS = {  # subset so we can help-dispatch cleanly
+    "--project-dir", "-p", "--validate", "--dry-run",
+    "--force-restart", "--poll-interval", "--node-timeout",
+    "--workflow-timeout", "--max-retries", "--max-node-executions",
+}
+
+
+def _build_run_parser():
     parser = argparse.ArgumentParser(
         prog="camflow",
         description="cam-flow: lightweight stateful workflow engine for agent execution",
     )
     parser.add_argument("workflow", help="Path to workflow YAML file")
     parser.add_argument(
-        "--project-dir", "-p",
-        default=None,
+        "--project-dir", "-p", default=None,
         help="Project directory (default: directory of the workflow file)",
     )
-    parser.add_argument("--validate", action="store_true", help="Validate workflow and exit")
-    parser.add_argument("--dry-run", action="store_true", help="Static walk without executing nodes")
-    parser.add_argument(
-        "--force-restart", action="store_true",
-        help="Discard any current_agent_id on resume instead of adopting the orphan",
-    )
-    parser.add_argument("--poll-interval", type=int, default=5, help="camc status poll interval (seconds)")
-    parser.add_argument("--node-timeout", type=int, default=600, help="per-node timeout (seconds)")
-    parser.add_argument("--workflow-timeout", type=int, default=3600, help="overall timeout (seconds)")
-    parser.add_argument("--max-retries", type=int, default=3, help="per-node retry budget")
-    parser.add_argument(
-        "--max-node-executions", type=int, default=10,
-        help="loop-detection cap: max times any single node can execute in one run",
-    )
-    args = parser.parse_args()
+    parser.add_argument("--validate", action="store_true",
+                        help="Validate workflow and exit")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Static walk without executing nodes")
+    parser.add_argument("--force-restart", action="store_true",
+                        help="Discard any current_agent_id on resume")
+    parser.add_argument("--poll-interval", type=int, default=5)
+    parser.add_argument("--node-timeout", type=int, default=600)
+    parser.add_argument("--workflow-timeout", type=int, default=3600)
+    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--max-node-executions", type=int, default=10)
+    return parser
 
-    # Load + validate
+
+def _run_workflow(argv):
+    parser = _build_run_parser()
+    args = parser.parse_args(argv)
+
     workflow = load_workflow(args.workflow)
     valid, errors = validate_workflow(workflow)
     if not valid:
         for err in errors:
             print(f"ERROR: {err}", file=sys.stderr)
-        sys.exit(1)
-
+        return 1
     if args.validate:
         print("Workflow is valid.")
-        sys.exit(0)
+        return 0
 
-    # Resolve project dir (defaults to the workflow's directory)
     project_dir = args.project_dir or os.path.dirname(os.path.abspath(args.workflow)) or "."
-
     cfg = EngineConfig(
         poll_interval=args.poll_interval,
         node_timeout=args.node_timeout,
@@ -57,17 +74,41 @@ def main():
         dry_run=args.dry_run,
         force_restart=args.force_restart,
     )
-
     engine = Engine(args.workflow, project_dir, cfg)
     result = engine.run()
 
     if args.dry_run:
-        # engine.run returns an int (exit code) in dry-run mode
-        sys.exit(result if isinstance(result, int) else 0)
+        return result if isinstance(result, int) else 0
 
     status = result.get("status") if isinstance(result, dict) else None
-    print(f"Workflow finished: status={status}, pc={result.get('pc') if isinstance(result, dict) else None}")
-    sys.exit(0 if status == "done" else 1)
+    pc = result.get("pc") if isinstance(result, dict) else None
+    print(f"Workflow finished: status={status}, pc={pc}")
+    return 0 if status == "done" else 1
+
+
+def _run_evolve(argv):
+    parser = build_evolve_parser(None)
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+def _print_top_help():
+    print(__doc__.strip())
+    print("\nSee `camflow <workflow.yaml> --help` or `camflow evolve --help`.")
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help"):
+        _print_top_help()
+        sys.exit(0)
+
+    # Dispatch: first positional argument decides the mode
+    if argv[0] == "evolve":
+        rc = _run_evolve(argv[1:])
+    else:
+        rc = _run_workflow(argv)
+    sys.exit(rc)
 
 
 if __name__ == "__main__":
