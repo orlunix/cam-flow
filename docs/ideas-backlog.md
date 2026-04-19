@@ -336,14 +336,50 @@ idea only / REJECTED).
 - **Status.** SHIPPED in camc (Layer 1 of a 4-layer fallback). Not
   a cam-flow change, but cam-flow's orphan handling depends on it.
 
-### 29. Workdir Uniqueness Enforcement
+### 29. tmux Lifecycle on rm — `camc rm` must kill tmux + socket
 
-- **What.** Don't allow multiple agents to share
-  `/home/hren` as workdir — enforce unique working directories.
-- **Why.** Prevents session-ID collision on reboot (root cause of
-  agents `l1tcm`, `eab4f56e`, `camflow` mix-ups).
-- **Source.** Bug #10 repro work.
-- **Status.** Idea — should be a camc lint or warning, not cam-flow.
+- **What.** When `camc rm <id>` removes an agent from the registry,
+  it must ALSO terminate the tmux session and unlink the tmux
+  socket. Otherwise camc's heal/adoption logic will resurrect the
+  "deleted" agent on the next monitor cycle, and `camc list` will
+  re-show it with a fresh internal record.
+- **Why.** This is the actual root cause of the "leftover agents"
+  problem we previously misdiagnosed as a workdir-uniqueness issue.
+  Even the cleanup hardening shipped in cam-flow (PATH resolution,
+  try/finally, sweep, kill-before-start) is defeated if
+  `camc rm` itself returns 0 but leaves the tmux session alive —
+  heal then re-adopts it as if it were a new agent and the next
+  `cleanup_all_camflow_agents()` finds it again. A leak we cannot
+  close from the cam-flow side.
+- **Symptoms observed.**
+  - 6 dead `camflow-fix` tmux sessions surviving after a
+    calculator-demo run, even though the engine's per-node
+    cleanup ran. They came BACK after every sweep.
+  - On reboot, agents like `l1tcm`, `eab4f56e`, `camflow` got
+    re-adopted under each other's IDs (originally chalked up to
+    workdir collisions; the real issue is heal seeing zombie tmux
+    sessions and binding new IDs to them).
+- **Fix scope (camc-side).**
+  1. `camc rm <id>` must always run `tmux kill-session -t <session>`
+     before deleting the registry entry, even if `--kill` was not
+     passed (or make `--kill` the default).
+  2. After `kill-session`, the `/tmp/cam-sockets/cam-<id>.sock` file
+     must be unlinked. Stale sockets on disk also confuse heal.
+  3. heal's adoption pass should reject any tmux session whose
+     registry entry was removed — currently it adopts orphan tmux
+     sessions blindly, which is what re-creates the deleted agents.
+- **Workdir uniqueness — superseded.** The earlier theory (multiple
+  agents sharing `/home/hren` as workdir cause session-ID
+  collisions) was a symptom, not a cause. The collision is between
+  zombie tmux sessions and the registry, not between workdirs.
+  Workdir uniqueness might still be a useful camc lint / warning
+  for other reasons, but it would not have prevented bug #10.
+- **Source.** Diagnosis from `camflow-cleanup-fix.md` task +
+  observation that agents reappear after `cleanup_all_camflow_agents`
+  sweeps. Updated 2026-04-18.
+- **Status.** Idea — camc-side fix. cam-flow's belt-and-suspenders
+  cleanup is necessary but insufficient; we also need camc to honor
+  the contract that `rm` means dead.
 
 ### 30. TeaSpirit Integration for Notifications
 

@@ -6,33 +6,134 @@ dates are ISO-8601.
 
 ## [Unreleased]
 
-### Added
-- `docs/architecture.md` — complete module + public function
+### Added (2026-04-18, post-0.2.0 batch)
+- **§5.1 Context positioning (HQ.1).** `prompt_builder.build_prompt`
+  reordered so the fenced CONTEXT block precedes the role line and
+  task body. Stanford "Lost in the Middle" fix — LLMs attend least to
+  mid-window content; CONTEXT now sits where attention is highest.
+- **§5.2 Observation masking (HQ.2).** `state_enricher` archives the
+  previous `test_output` to a bounded `test_history` list (cap 10,
+  FIFO) before overwriting with the latest round. Prevents long
+  fix→test loops from bloating the prompt while preserving a
+  trajectory summary the agent sees in CONTEXT.
+- **§5.3 Per-node tool scoping (HQ.3).** Optional `allowed_tools`
+  field in the node DSL renders a soft prompt-level constraint
+  ("Tools you may use: ..."). `start_agent` accepts the parameter
+  for API readiness; hard enforcement (`camc run --allowed-tools`)
+  pending camc CLI support.
+- **§4.1 Methodology router.** New `engine/methodology_router.py`.
+  Keyword-based routing from a node's `do`/`with` text to one of 5
+  methodologies: rca / simplify-first / search-first /
+  working-backwards / systematic-coverage. Hint injected into the
+  prompt; label logged to trace.
+- **§4.2 Failure escalation ladder.** New `engine/escalation.py`.
+  Maps `state.retry_counts[node_id]` to L0..L4 with distinct
+  intervention prompts (Normal / Rethink / Deep Dive / Diagnostic /
+  Escalate). Resets on success or node change.
+- **§6.1 Git checkpoint (local mode).** New `engine/checkpoint.py`.
+  After each successful agent node, engine auto-commits via
+  `git init` + `git add -A` + `git commit --allow-empty` with a
+  `camflow: <node> iter <N> — <summary>` message. Best-effort;
+  workflow proceeds if git is unavailable.
+- **Trace evaluation fields wired through engine.** `_finish_step`
+  now passes `prompt_tokens`, `tools_available`,
+  `context_position="first"`, `methodology`, `escalation_level` to
+  every trace entry. `approx_token_count(text)` helper added to
+  `tracer.py` for dependency-free token estimation.
+- **3 hermes-CCC skill ports** (rough first drafts under `skills/`):
+  `systematic-debugging` (10-phase RCA loop), `task-router` (triage
+  for start/analyze nodes), `task-decomposition` (break complex node
+  into disjoint slices). Attribution to NousResearch Hermes Agent
+  preserved in metadata.
+- **Trace rollup + `camflow evolve report` CLI.** New
+  `src/camflow/evolution/rollup.py` (`rollup_trace`, `rollup_all`,
+  `print_report`) and `src/camflow/cli_entry/evolve.py`. Emits
+  per-node and per-methodology statistics from one or many trace.log
+  files. `cli_entry/main.py` reworked to dispatch:
+  `camflow <workflow>` (default) | `camflow evolve report <dir>`.
+- **`docs/architecture.md`** — complete module + public function
   reference with per-component evaluation metrics.
-- `docs/evaluation.md` — metrics table, trace-field additions,
+- **`docs/evaluation.md`** — metrics table, trace-field additions,
   A/B experiment harness design, measurement plan.
-- `CHANGELOG.md` — this file.
-- Token-counting and evaluation fields in `tracer.build_trace_entry`:
+- **`docs/ideas-backlog.md`** — long-memory record of all 31 ideas
+  across 7 categories. Each: what / why / source / status.
+- **`docs/roadmap.md`** — major rewrite: added §1 Design Principles
+  (7 from Pachaar's "Anatomy of an Agent Harness"), §5 Harness
+  Quality Improvements, §6 Checkpoint System, §3.2 Agent lifecycle
+  + submission (SHIPPED hotfix). Week-by-week timeline.
+- **`CHANGELOG.md`** — this file.
+- Token-counting + evaluation fields in `tracer.build_trace_entry`:
   `prompt_tokens`, `context_tokens`, `task_tokens`,
   `tools_available`, `tools_used`, `context_position`,
   `enricher_enabled`, `fenced`, `methodology`, `escalation_level`.
-  All default to None / 0 / "middle" / True / "none" / 0 so existing
-  tests and callers are unaffected.
+  All default to values preserving current behavior.
+
+### Fixed (2026-04-18 — bugs found and squashed today)
+- **Agent prompts never submitted** — `camc run "<prompt>"` pastes the
+  prompt into the Claude Code TUI input box but does NOT submit it.
+  Every fix agent previously sat at `❯ <prompt>` for the full
+  node_timeout, then got killed; calculator.py was never modified.
+  Fix: new `_kick_prompt(agent_id)` polls the screen for the TUI
+  prompt char (`❯`/`›`/`>`) and sends Enter once visible. Fallback
+  Enter after 30 s. Idempotent.
+- **`--auto-exit` unreliable (camc bug #10).** Idle detection is
+  flaky — agents complete the task and write `node-result.json` but
+  never voluntarily exit, leaving the engine waiting on a signal
+  that never fires. Fix: removed `--auto-exit` from `camc run`. The
+  engine now OWNS the agent lifecycle — file-appeared is the
+  primary (and only trusted) completion signal; explicit `camc stop`
+  + `camc rm --kill` on every termination path.
+- **`camc rm --force` no longer recognized.** camc CLI renamed the
+  flag to `--kill`. `agent_runner._rm_agent` updated.
+- **`cli_entry/main.py` import error.** Was importing the deleted
+  `camflow.backend.cam.daemon` module (removed when CAM engine was
+  refactored to the `Engine` class). Rewritten to use `Engine` +
+  `EngineConfig` with proper CLI flags (`--poll-interval`,
+  `--node-timeout`, `--workflow-timeout`, `--max-retries`,
+  `--max-node-executions`, `--dry-run`, `--force-restart`,
+  `--project-dir`).
+- **Agent cleanup leaks (6 dead `camflow-fix` agents observed after
+  the calculator demo).** Hardened with four defenses:
+  1. **PATH resolution.** `agent_runner.CAMC_BIN` resolved via
+     `shutil.which("camc")` at module import; warning to stderr if
+     absent. Catches PATH-stripped service-manager launches.
+  2. **try/finally in `Engine.run`.** Whatever happens — success,
+     failure, signal, uncaught exception — the finally block runs
+     `_cleanup_on_exit`.
+  3. **Belt-and-suspenders sweep.** New
+     `cleanup_all_camflow_agents()` lists the camc registry, finds
+     every `camflow-*` name, and removes them. Called from
+     `_cleanup_on_exit` after the per-current-agent cleanup.
+  4. **Kill-before-start.** New
+     `kill_existing_camflow_agents(except_id=None)` invoked
+     immediately before each `start_agent` call, so even if a
+     previous engine instance leaked, accumulation is bounded at 0.
+  Verified live: `camc --json list | grep camflow` returns 0
+  leftover agents after a calculator-demo run.
+
+### Changed (2026-04-18)
+- Engine `_apply_result_and_transition` no longer maintains a
+  `state.last_failure` field; that role is now distributed across
+  `state.blocked` + `state.failed_approaches` + `state.test_output`
+  via `state_enricher`. `_maybe_capture_lesson` removed —
+  `state_enricher` handles lesson dedup + prune as part of the
+  result merge.
+- `cli_entry/main.py` CLI shape changed from a single positional
+  workflow argument to a positional dispatcher: first arg `evolve`
+  → `camflow evolve …` subcommand; otherwise treated as the
+  workflow path (preserves backward compatibility with existing
+  scripts).
 
 ### Planned (see `docs/roadmap.md` for the full timeline)
-- §5.1 HQ.1 — Context positioning: reorder prompt so CONTEXT leads,
-  task comes last (Stanford "Lost in the Middle" fix).
-- §5.2 HQ.2 — Observation masking: keep only the latest round's full
-  test output; summarize prior rounds in a bounded `test_history`.
-- §5.3 HQ.3 — Per-node tool scoping via `allowed_tools` in the node
-  DSL, passed through to `camc run --allowed-tools`.
 - §5.4 HQ.4 — Multi-layer verification template: fix → lint →
   typecheck → test, each gating the next.
-- §6 Checkpoint system — git commit after each successful agent
-  node; local / branch / remote modes; `camflow history` +
+- §6.2–6.4 Checkpoint branch / remote modes + `camflow history` +
   `camflow restore <sha>`.
-- §4 Exception Handler — methodology router + escalation ladder
-  (L0..L4).
+- §3.3 camc session-ID tracking (camc-side fix).
+- §4.3 PreCompact State Preservation — DESCOPED (stateless model
+  means no long-running sessions to protect).
+- §3.6 RTL test-hex artifact references.
+- §7 Skill evolution Phase 2+ (mutation, A/B testing).
 
 ## [0.2.0] — 2026-04-18
 
