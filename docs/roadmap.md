@@ -581,6 +581,30 @@ Enhance to:
 - Show max agent iterations estimate
 - Report unresolved `{{state.*}}` references
 
+### 7.5 Planner — `camflow plan` — SHIPPED (2026-04-19)
+
+**Motivation.** Writing workflow.yaml by hand is slow and drifts from
+the current best-practice conventions (methodology / escalation_max /
+allowed_tools / max_retries / verify). A one-shot generator takes a
+natural-language request and produces a valid plan with the right
+conventions baked in.
+
+**Shipped.** `src/camflow/planner/`:
+- `generate_workflow(request, claude_md_path, skills_dir, env_info,
+  llm_call)` → validated workflow dict.
+- Pluggable LLM backend (anthropic SDK → claude CLI fallback).
+- Three few-shot examples exercise the complexity range.
+- DSL validator + plan-quality validator (errors vs warnings).
+- `camflow plan "<request>"` CLI writes workflow.yaml, prints an
+  ASCII graph and any warnings.
+
+**Next.** Phase-2 planner improvements (not shipped yet):
+- "Replan on failure" — when a workflow fails at L4, feed the
+  diagnostic bundle back to the planner and produce a revised plan.
+- A/B test planner prompt variants against the trace rollup.
+- Swap the claude-CLI backend for direct anthropic SDK with prompt
+  caching once ANTHROPIC_API_KEY is wired up.
+
 ---
 
 ## 8. Nice-to-Have (future)

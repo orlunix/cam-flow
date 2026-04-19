@@ -440,8 +440,12 @@ class Engine:
         # crashed previous run so we never accumulate. Cheap idempotent op.
         kill_existing_camflow_agents()
 
+        allowed_tools = node.get("allowed_tools") if isinstance(node, dict) else None
         try:
-            agent_id = start_agent(node_id, prompt, self.project_dir)
+            agent_id = start_agent(
+                node_id, prompt, self.project_dir,
+                allowed_tools=allowed_tools,
+            )
         except RuntimeError as e:
             return (
                 {

@@ -41,7 +41,7 @@ def test_lessons_accumulate_and_inject(tmp_path, monkeypatch):
 
     from camflow.backend.cam import agent_runner
 
-    def fake_start(node_id, prompt, project_dir):
+    def fake_start(node_id, prompt, project_dir, **kwargs):
         prompts.append(prompt)
         return f"agent{idx[0]:08x}"
 

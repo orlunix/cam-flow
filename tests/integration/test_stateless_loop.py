@@ -173,7 +173,7 @@ def test_stateless_loop_accumulates_state(tmp_path, monkeypatch):
     # Side-effect: after 2nd `fix` we flip the counter so `test` passes next
     flip_after = {"fix": 2}  # after 2nd fix, make test pass
 
-    def fake_start(node_id, prompt, project_dir):
+    def fake_start(node_id, prompt, project_dir, **kwargs):
         agent_call_log.append({"node": node_id, "prompt": prompt})
         return f"agent{len(agent_call_log):08x}"
 
@@ -284,7 +284,7 @@ def test_stateless_every_agent_starts_fresh(tmp_path, monkeypatch):
 
     call_count = {"n": 0}
 
-    def fake_start(node_id, prompt, project_dir):
+    def fake_start(node_id, prompt, project_dir, **kwargs):
         call_count["n"] += 1
         return f"agent{call_count['n']:08x}"
 
@@ -332,7 +332,7 @@ def test_stateless_long_loop_prunes_lessons(tmp_path, monkeypatch):
     counter = [0]
     lessons_provided = []
 
-    def fake_start(node_id, prompt, project_dir):
+    def fake_start(node_id, prompt, project_dir, **kwargs):
         return f"agent{counter[0]:08x}"
 
     def fake_wait(*a, **k):

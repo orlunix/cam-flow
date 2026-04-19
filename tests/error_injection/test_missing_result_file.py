@@ -21,7 +21,7 @@ def test_missing_result_file_classified_correctly(tmp_path, monkeypatch):
 
     from camflow.backend.cam import agent_runner
 
-    def fake_start(node_id, prompt, project_dir):
+    def fake_start(node_id, prompt, project_dir, **kwargs):
         return "agent0001"
 
     def fake_wait(agent_id, result_path, timeout, poll_interval):

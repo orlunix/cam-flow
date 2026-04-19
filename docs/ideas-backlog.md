@@ -400,6 +400,50 @@ idea only / REJECTED).
 - **Source.** Developer annoyance.
 - **Status.** Idea — user handles the VDI side.
 
+### 33. `camflow plan` — NL → workflow.yaml generator
+
+- **What.** One-shot planner CLI that turns a natural-language
+  request into a validated `workflow.yaml`. Collects CLAUDE.md +
+  skills/ + environment context, builds a prompt with 3 few-shot
+  examples, calls a strong model once, validates both DSL
+  correctness and plan quality (orphans, loops without retry cap,
+  agents missing verify / methodology / allowed_tools, un-sourced
+  `{{state.x}}` refs), writes the YAML, prints an ASCII graph.
+- **Why.** Writing workflow.yaml by hand is slow and drifts from
+  best-practice conventions. The planner bakes those conventions
+  in. Pluggable LLM backend (anthropic SDK preferred, claude CLI
+  fallback) keeps it usable even without an API key.
+- **Source.** Task `camflow-planner-impl.md` (2026-04-19).
+- **Status.** SHIPPED 2026-04-19. See `src/camflow/planner/`,
+  `src/camflow/cli_entry/plan.py`, `tests/unit/test_planner.py`.
+
+### 34. Replan on failure (planner Phase 2)
+
+- **What.** When a workflow fails at L4 escalation (or hits a
+  workflow-level timeout), bundle the diagnostic state and feed it
+  back to `camflow plan` as input context. The planner produces a
+  revised workflow — maybe with different decomposition, stricter
+  verify conditions, or a fallback path.
+- **Why.** Today a failed workflow stops dead. The operator
+  re-plans manually. The infrastructure is already there (planner
+  accepts `claude_md_path` and `env_info` context) — we just need
+  to wire a "here's the failing trace + final state" section into
+  the prompt.
+- **Source.** Natural extension once planner shipped.
+- **Status.** Idea — planner Phase 2.
+
+### 35. Planner A/B testing via trace rollup
+
+- **What.** Measure whether different planner prompt variants
+  produce workflows that complete more reliably. Trace rollup
+  (`camflow evolve report`) as fitness signal: success rate, mean
+  iterations to done, verify-failure rate.
+- **Why.** The planner is high-leverage — small prompt
+  improvements compound across every future workflow. Current
+  baseline is "looks reasonable" which isn't a metric.
+- **Source.** `docs/evaluation.md` §3.2 A/B experiments.
+- **Status.** Idea — planner Phase 2.
+
 ### 32. Plan vs Runtime boundary (plan-priority + verify cmd)
 
 - **What.** Node-level fields in `workflow.yaml` (`methodology`,

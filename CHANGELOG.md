@@ -6,6 +6,33 @@ dates are ISO-8601.
 
 ## [Unreleased]
 
+### Added (2026-04-19)
+- **`camflow plan "<request>"` CLI.** Natural-language request →
+  validated workflow.yaml in one strong-model call. New
+  `src/camflow/planner/` package:
+  - `planner.py` — `generate_workflow()`, context collection,
+    YAML extraction, ASCII graph rendering.
+  - `prompt_template.py` — planner prompt with planning rules and
+    verify-condition cookbook.
+  - `examples.py` — 3 few-shot workflows (calculator, build+lint+
+    smoke, P4 investigation) showing the methodology / escalation /
+    allowed_tools / max_retries / verify conventions.
+  - `validator.py` — `validate_plan_quality()` returns (errors,
+    warnings): empty plan, dangling goto, orphans, cycles without
+    `max_retries`, agent nodes missing recommended fields, unknown
+    methodology labels, `{{state.x}}` refs without a producer.
+  - `llm.py` — pluggable LLM backend: tries anthropic SDK first
+    (ANTHROPIC_API_KEY + `anthropic` package), falls back to
+    `claude -p` via subprocess, raises `LLMUnavailable` if neither
+    works.
+  - `cli_entry/plan.py` — the subcommand with `--claude-md`,
+    `--skills-dir`, `--output`, `--force` flags.
+- **`allowed_tools` passthrough from node to `start_agent`.** Engine
+  now reads `node.allowed_tools` and passes it as a kwarg to
+  `start_agent`. camc hard-enforcement pending a `--allowed-tools`
+  flag on `camc run`; soft prompt-level constraint already rendered
+  by `prompt_builder._render_tool_scope`.
+
 ### Added (2026-04-18, post-0.2.0 batch)
 - **§5.1 Context positioning (HQ.1).** `prompt_builder.build_prompt`
   reordered so the fenced CONTEXT block precedes the role line and

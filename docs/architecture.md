@@ -665,6 +665,49 @@ cam-flow splits decisions across two sources:
 - **Runtime** (engine + prompt_builder): heuristics and defaults that
   apply only when the plan is silent.
 
+```
+  ┌─────────────────────────────┐
+  │  camflow plan "<request>"   │    (planner package — NEW)
+  │   ├─ collect CLAUDE.md      │
+  │   ├─ discover skills/       │
+  │   ├─ assemble env info      │
+  │   ├─ build prompt + few-    │
+  │   │   shot examples         │
+  │   ├─ LLM call (anthropic    │
+  │   │   SDK → claude CLI)     │
+  │   ├─ parse YAML             │
+  │   ├─ validate DSL           │
+  │   └─ validate plan quality  │
+  └────────────┬────────────────┘
+               │ writes
+               ▼
+     ┌──────────────────────┐
+     │   workflow.yaml      │  ← author-owned (plan)
+     │   methodology:       │
+     │   escalation_max:    │
+     │   max_retries:       │
+     │   allowed_tools:     │
+     │   verify:            │
+     │   timeout:           │
+     └──────────┬───────────┘
+                │ loaded by
+                ▼
+     ┌──────────────────────┐
+     │  Engine (runtime)    │
+     │                      │
+     │  Plan-silent defaults│ ←  engine/methodology_router.py
+     │  fill in when fields │    engine/escalation.py (max_level=4)
+     │  aren't declared     │    EngineConfig.max_retries=3
+     │                      │
+     │  Plan-specified      │ ←  node.methodology (label)
+     │  fields always win   │    node.escalation_max
+     │                      │    node.max_retries
+     │                      │    node.allowed_tools
+     │                      │    node.verify (runs cmd after success)
+     │                      │    node.timeout
+     └──────────────────────┘
+```
+
 Concretely, per-node fields recognized by the engine:
 
 | Field | Plan wins over | Default when absent |
