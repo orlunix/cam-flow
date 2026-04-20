@@ -173,6 +173,7 @@ def generate_workflow(
     llm_call=None,
     domain=None,
     agents_dir=None,
+    scout_reports=None,
 ):
     """Generate a workflow.yaml for `user_request`.
 
@@ -211,6 +212,7 @@ def generate_workflow(
         claude_md=claude_md,
         agents_list=agents_list,
         domain=domain,
+        scout_reports=scout_reports,
     )
 
     response = llm_call(prompt)

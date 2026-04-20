@@ -4,6 +4,7 @@ Usage modes (the first positional argument decides the mode):
 
     camflow <workflow.yaml> [flags]        # run a workflow (default)
     camflow plan "<request>" [flags]       # generate workflow.yaml from NL
+    camflow scout --type ... --query ...   # read-only scout for the planner
     camflow evolve report <dir> [--json]   # trace-based eval reports
 
 Keeping the workflow path as the default first positional argument
@@ -18,6 +19,7 @@ import sys
 from camflow.backend.cam.engine import Engine, EngineConfig
 from camflow.cli_entry.evolve import build_parser as build_evolve_parser
 from camflow.cli_entry.plan import build_parser as build_plan_parser
+from camflow.cli_entry.scout import build_parser as build_scout_parser
 from camflow.engine.dsl import load_workflow, validate_workflow
 
 
@@ -100,11 +102,17 @@ def _run_plan(argv):
     return args.func(args)
 
 
+def _run_scout(argv):
+    parser = build_scout_parser(None)
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
 def _print_top_help():
     print(__doc__.strip())
     print(
         "\nSee `camflow <workflow.yaml> --help`, `camflow plan --help`, "
-        "or `camflow evolve --help`."
+        "`camflow scout --help`, or `camflow evolve --help`."
     )
 
 
@@ -119,6 +127,8 @@ def main():
         rc = _run_evolve(argv[1:])
     elif argv[0] == "plan":
         rc = _run_plan(argv[1:])
+    elif argv[0] == "scout":
+        rc = _run_scout(argv[1:])
     else:
         rc = _run_workflow(argv)
     sys.exit(rc)

@@ -127,6 +127,60 @@ class TestBuildPlannerPrompt:
         # No pack injected, but also no crash.
         assert "hardware / RTL" not in p
 
+    def test_scout_reports_skill_rendered(self):
+        report = {
+            "query": "RTL trace",
+            "tool": "skillm",
+            "candidates": [
+                {"name": "rtl-trace", "description": "trace signals",
+                 "summary": "...", "path": "/x"},
+            ],
+            "warnings": [],
+        }
+        p = build_planner_prompt("x", scout_reports=[report])
+        assert "Scout reports" in p
+        assert "skill-scout" in p
+        assert "rtl-trace" in p
+        assert "trace signals" in p
+
+    def test_scout_reports_env_rendered(self):
+        report = {
+            "checks": ["vcs"],
+            "results": {
+                "vcs": {"kind": "tool", "available": True,
+                        "path": "/usr/bin/vcs", "version": "VCS 2024.03"},
+            },
+            "warnings": [],
+        }
+        p = build_planner_prompt("x", scout_reports=[report])
+        assert "env-scout" in p
+        assert "vcs" in p
+        assert "VCS 2024.03" in p
+
+    def test_scout_reports_capped_at_3(self):
+        reports = [
+            {"query": f"q{i}", "tool": "skillm", "candidates": [], "warnings": []}
+            for i in range(8)
+        ]
+        p = build_planner_prompt("x", scout_reports=reports)
+        # Only 3 sub-headers — Scout 1, Scout 2, Scout 3.
+        assert "### Scout 1:" in p
+        assert "### Scout 3:" in p
+        assert "### Scout 4:" not in p
+
+    def test_planner_prompt_describes_scouts(self):
+        """The planning rules block mentions skill-scout / env-scout."""
+        p = build_planner_prompt("x")
+        assert "skill-scout" in p
+        assert "env-scout" in p
+
+    def test_no_scout_reports_no_section(self):
+        p = build_planner_prompt("x")
+        # The PLANNING_RULES doc block mentions scouts, but the rendered
+        # data-bearing section uses a `## ` header that's only emitted
+        # when scout reports were actually passed in.
+        assert "## Scout reports (read-only" not in p
+
 
 class TestRenderExamples:
     def test_renders_each_example(self):

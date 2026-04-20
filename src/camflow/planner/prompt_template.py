@@ -2,11 +2,17 @@
 
 One prompt, one call, one generated workflow.yaml. Variable sections
 (skills list, agents catalog, env info, project CLAUDE.md, few-shot
-examples, optional domain rule pack) are composed here from
-caller-provided inputs.
+examples, optional domain rule pack, optional scout reports) are
+composed here from caller-provided inputs.
 """
 
+import json
+
 from camflow.planner.examples import render_examples
+
+
+# Hard cap so a misconfigured caller can't blow the prompt window.
+MAX_SCOUT_REPORTS = 3
 
 
 PLANNING_RULES = """\
@@ -99,6 +105,26 @@ PLANNING_RULES = """\
 - Memory width ok:    `preflight: test "$(wc -c < <hex>)" -gt 1024`
 - Staging green:      `preflight: ./scripts/smoke-staging.sh`
 
+## Scouts (read-only context probes)
+
+You may receive a "Scout reports" section below containing the output
+of two scout types the camflow-manager ran on your behalf BEFORE this
+prompt:
+
+- **skill-scout** — `skillm search <capability>` plus the first lines
+  of each matching SKILL.md. Use this to pick `skill <name>` nodes
+  instead of guessing. If a scout report contains no candidates for a
+  capability you need, do NOT invent a skill name — fall back to
+  `agent <name>` (from the Agent catalog) or an inline prompt.
+- **env-scout** — `which <tool>` + version probes. Use this to confirm
+  a `shell <tool>` node will actually run. If a tool is "available:
+  false" in the scout report, plan around it (use a different tool, or
+  add a `preflight:` to fail fast with a clear message).
+
+Scouts are READ-ONLY and already ran — you cannot request more from
+inside this prompt. If the scout reports are missing a capability /
+tool you need, plan defensively (preflight checks, fallback nodes).
+
 ## Output contract
 
 Generate ONLY a valid YAML workflow. No explanation before or after,
@@ -169,8 +195,83 @@ DOMAIN_PACKS = {
 }
 
 
+def _render_scout_reports(scout_reports):
+    """Render up to MAX_SCOUT_REPORTS scout dicts into a prompt section.
+
+    Two shapes are recognized — both produced by `planner.scouts`:
+
+      skill-scout:
+        {"query": str, "tool": str, "candidates": [{name, description,
+         summary, path}], "warnings": [str]}
+      env-scout:
+        {"checks": [str], "results": {tool: {available, path, version,
+         ...}}, "warnings": [str]}
+
+    Anything else falls through to a JSON dump of the report so the
+    Planner at least sees the raw data.
+    """
+    if not scout_reports:
+        return ""
+    capped = list(scout_reports)[:MAX_SCOUT_REPORTS]
+
+    out = ["## Scout reports (read-only, already ran)"]
+    for i, report in enumerate(capped, 1):
+        if not isinstance(report, dict):
+            out.append(f"### Scout {i}: (malformed)")
+            continue
+
+        if "candidates" in report:  # skill-scout shape
+            query = report.get("query", "?")
+            tool = report.get("tool", "unknown")
+            candidates = report.get("candidates") or []
+            out.append(f"### Scout {i}: skill-scout (tool={tool})")
+            out.append(f"Query: {query}")
+            if not candidates:
+                out.append("Candidates: (none matched)")
+            else:
+                out.append(f"Candidates ({len(candidates)}):")
+                for c in candidates:
+                    name = c.get("name", "?")
+                    desc = (c.get("description") or "").strip()
+                    if len(desc) > 200:
+                        desc = desc[:200] + "..."
+                    out.append(f"- `skill {name}` — {desc}")
+            for w in (report.get("warnings") or [])[:5]:
+                out.append(f"  warning: {w}")
+
+        elif "results" in report and isinstance(report["results"], dict):
+            # env-scout shape
+            results = report["results"]
+            out.append(f"### Scout {i}: env-scout")
+            for spec, info in results.items():
+                kind = info.get("kind") if isinstance(info, dict) else "?"
+                avail = info.get("available") if isinstance(info, dict) else False
+                if kind == "tool":
+                    path = info.get("path") or "—"
+                    version = info.get("version") or "—"
+                    line = (
+                        f"- `{spec}`: available={avail}  "
+                        f"path={path}  version={version}"
+                    )
+                elif kind == "path":
+                    line = (
+                        f"- `{spec}`: available={avail}  "
+                        f"type={info.get('type', '?')}"
+                    )
+                else:
+                    line = f"- `{spec}`: {json.dumps(info, sort_keys=True)}"
+                out.append(line)
+            for w in (report.get("warnings") or [])[:5]:
+                out.append(f"  warning: {w}")
+        else:
+            out.append(f"### Scout {i}: (raw)")
+            out.append(json.dumps(report, sort_keys=True)[:1500])
+    return "\n".join(out)
+
+
 def build_planner_prompt(user_request, skills_list=None, env_info=None,
-                         claude_md=None, agents_list=None, domain=None):
+                         claude_md=None, agents_list=None, domain=None,
+                         scout_reports=None):
     """Compose the full planner prompt from caller-provided context.
 
     Args:
@@ -183,6 +284,11 @@ def build_planner_prompt(user_request, skills_list=None, env_info=None,
         domain: optional domain rule-pack key — one of "hardware",
             "software", "deployment", "research". Unknown values are
             silently ignored.
+        scout_reports: optional list of dicts (from `planner.scouts.run_*_scout`
+            or `camflow scout` JSON output). Hard-capped at MAX_SCOUT_REPORTS
+            entries; rendered into the prompt as a "Scout reports" block so
+            the Planner LLM can choose skills/agents/preflights informed by
+            actual environment + skill catalog probes (Option B).
 
     Returns:
         A single prompt string ready to send to the LLM.
@@ -223,6 +329,11 @@ def build_planner_prompt(user_request, skills_list=None, env_info=None,
         sections.append("## Environment")
         for k, v in env_info.items():
             sections.append(f"- {k}: {v}")
+        sections.append("")
+
+    rendered_scout = _render_scout_reports(scout_reports)
+    if rendered_scout:
+        sections.append(rendered_scout)
         sections.append("")
 
     if claude_md:

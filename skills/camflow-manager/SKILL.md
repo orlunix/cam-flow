@@ -166,8 +166,58 @@ Inputs to prepare:
 - User request (refined through Phase 1)
 - CLAUDE.md path (existing or drafted)
 - skills/ directory
+- (Optional) scout reports — see Phase 3.0 below
 
-Run the Planner:
+### Phase 3.0: SCOUT (optional, but encouraged)
+
+Before calling the Planner, you can run **read-only scouts** to give
+it grounded data instead of guesses. Two scout types are available
+via the `camflow scout` CLI; both are safe to call freely (no file
+modifications, hard 30 s timeout, bounded result counts):
+
+- **skill-scout** — `camflow scout --type skill --query "<capability>"`
+  searches the skill catalog (`skillm search` if available, falls
+  back to `~/.claude/skills/` walk) and returns the top matches with
+  the first lines of each SKILL.md.
+- **env-scout** — `camflow scout --type env --query <tool> --query <tool> ...`
+  runs `which` + `--version` for each tool. Use it before assuming
+  `vcs`, `smake`, `jg`, `p4`, etc. exist on this host. `--query path:<abs>`
+  also probes a filesystem path.
+
+When to run scouts:
+
+- The user mentions a domain-specific tool you're not sure about.
+- The plan would benefit from a `skill <name>` node — verify the skill
+  actually exists with the right capability.
+- Any node will run a long shell command — confirm the binary exists
+  before the plan ships, not at runtime.
+
+Cap yourself at **3 scout calls per planning session** (the prompt
+window grows linearly per scout). Save each report's JSON, then pass
+them to the planner via `--scout-report`:
+
+```bash
+camflow scout --type env --query vcs --query smake --query jg \
+  > /tmp/env-scout.json
+camflow scout --type skill --query "RTL signal trace analysis" \
+  > /tmp/skill-scout.json
+```
+
+Then run the Planner:
+
+```bash
+cd <project-dir>
+PYTHONPATH=/home/scratch.hren_gpu_1/test/workflow/cam-flow/src \
+  python3 -m camflow.cli_entry.main plan \
+  "<user's refined request>" \
+  --claude-md <project-dir>/CLAUDE.md \
+  --skills-dir ~/.claude/skills/ \
+  --scout-report /tmp/env-scout.json \
+  --scout-report /tmp/skill-scout.json \
+  --output <project-dir>/workflow.yaml
+```
+
+Without scouts, the same command works (omit `--scout-report`):
 
 ```bash
 cd <project-dir>

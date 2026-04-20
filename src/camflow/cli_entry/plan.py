@@ -7,6 +7,7 @@ to disk. Prints an ASCII graph and any quality warnings.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -29,6 +30,34 @@ def _resolve_skills_dir(arg):
     return None
 
 
+def _load_scout_reports(paths):
+    """Load each scout report from disk (or stdin for "-"). Skips broken files
+    with a stderr warning rather than failing the whole plan.
+    """
+    if not paths:
+        return None
+    reports = []
+    for p in paths:
+        try:
+            if p == "-":
+                text = sys.stdin.read()
+            else:
+                with open(p, encoding="utf-8") as f:
+                    text = f.read()
+            data = json.loads(text)
+        except (OSError, ValueError) as e:
+            print(f"[plan] warning: skipping scout report {p}: {e}", file=sys.stderr)
+            continue
+        # Accept either a single report dict or a list of reports.
+        if isinstance(data, list):
+            reports.extend(d for d in data if isinstance(d, dict))
+        elif isinstance(data, dict):
+            reports.append(data)
+        else:
+            print(f"[plan] warning: scout report {p} is not a dict/list", file=sys.stderr)
+    return reports or None
+
+
 def _resolve_claude_md(arg):
     if arg and os.path.isfile(arg):
         return arg
@@ -46,6 +75,13 @@ def plan_command(args):
         print(f"[plan] using CLAUDE.md: {claude_md}", file=sys.stderr)
     if skills_dir:
         print(f"[plan] using skills dir: {skills_dir}", file=sys.stderr)
+
+    scout_reports = _load_scout_reports(args.scout_report)
+    if scout_reports:
+        print(
+            f"[plan] loaded {len(scout_reports)} scout report(s)",
+            file=sys.stderr,
+        )
     print(f"[plan] generating workflow...", file=sys.stderr)
 
     try:
@@ -55,6 +91,7 @@ def plan_command(args):
             skills_dir=skills_dir,
             domain=args.domain,
             agents_dir=args.agents_dir,
+            scout_reports=scout_reports,
         )
     except Exception as exc:
         print(f"ERROR: planner failed: {exc}", file=sys.stderr)
@@ -117,6 +154,12 @@ def build_parser(subparsers=None):
     plan.add_argument("--agents-dir", default=None,
                        help="Path to agent definitions directory "
                             "(default: ~/.claude/agents/)")
+    plan.add_argument(
+        "--scout-report", action="append", default=[],
+        help="Path to a scout report JSON file produced by `camflow scout`. "
+             "Pass `-` to read one report from stdin. May be repeated; "
+             "capped at MAX_SCOUT_REPORTS (3) entries.",
+    )
     plan.set_defaults(func=plan_command)
 
     if subparsers is None:
