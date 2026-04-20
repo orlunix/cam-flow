@@ -10,7 +10,7 @@ def test_all_fields_present():
     e = build_trace_entry(
         step=1,
         node_id="fix",
-        node={"do": "agent claude"},
+        node={"do": "agent placeholder"},
         input_state={"pc": "fix"},
         node_result={"status": "success"},
         output_state={"pc": "test"},
@@ -84,7 +84,7 @@ def test_evaluation_field_defaults():
 def test_evaluation_field_override():
     """All evaluation fields are settable via keyword args."""
     e = build_trace_entry(
-        1, "fix", {"do": "agent claude"}, {}, {}, {}, {}, 0.0, 0.1,
+        1, "fix", {"do": "agent placeholder"}, {}, {}, {}, {}, 0.0, 0.1,
         prompt_tokens=4500, context_tokens=2100, task_tokens=800,
         tools_available=4, tools_used=2, context_position="first",
         enricher_enabled=False, fenced=False, methodology="rca",

@@ -105,9 +105,14 @@ def test_classify_shell_and_cmd_alias():
     assert classify_do("cmd pytest -v") == ("shell", "pytest -v")
 
 
-def test_classify_agent_named_and_legacy():
+def test_classify_agent_named_any_name():
+    """classify_do treats every `agent <name>` the same — parser doesn't
+    care whether the name resolves to a real ~/.claude/agents/<name>.md
+    file. The loader enforces file existence at run time; `classify_do`
+    just splits the token.
+    """
     assert classify_do("agent rtl-debugger") == ("agent", "rtl-debugger")
-    assert classify_do("agent claude") == ("agent", "claude")
+    assert classify_do("agent placeholder") == ("agent", "placeholder")
     assert classify_do("subagent rtl-debugger") == ("agent", "rtl-debugger")
 
 
@@ -132,16 +137,16 @@ def test_classify_invalid():
 # ---------- DSL v2: node field validation ----------
 
 def test_validate_node_model_field():
-    ok, errs = validate_node("n", {"do": "agent claude", "model": "claude"})
+    ok, errs = validate_node("n", {"do": "agent placeholder", "model": "claude"})
     assert ok, errs
-    ok, errs = validate_node("n", {"do": "agent claude", "model": 3})
+    ok, errs = validate_node("n", {"do": "agent placeholder", "model": 3})
     assert not ok
 
 
 def test_validate_node_preflight_field():
     ok, errs = validate_node(
-        "n", {"do": "agent claude", "preflight": "test -f simv"}
+        "n", {"do": "agent placeholder", "preflight": "test -f simv"}
     )
     assert ok, errs
-    ok, errs = validate_node("n", {"do": "agent claude", "preflight": ""})
+    ok, errs = validate_node("n", {"do": "agent placeholder", "preflight": ""})
     assert not ok

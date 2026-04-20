@@ -245,15 +245,15 @@ def ascii_graph(workflow):
 
     Not a beautiful graphviz diagram — just enough to eyeball the shape:
 
-        start (cmd: pytest)
+        start (shell: pytest)
           │fail → fix
           │success → done
-        fix (agent claude, methodology=rca, verify=...)
+        fix (inline, methodology=rca, verify=...)
           → test
-        test (cmd: pytest)
+        test (shell: pytest)
           │fail → fix
           │success → done
-        done (cmd)
+        done (shell)
     """
     if not isinstance(workflow, dict) or not workflow:
         return "(empty workflow)"

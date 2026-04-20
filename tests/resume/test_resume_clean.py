@@ -131,7 +131,7 @@ def test_resume_orphan_adopt_result(tmp_path, monkeypatch):
     wf_path = tmp_path / "workflow.yaml"
     wf_path.write_text(textwrap.dedent("""
         start:
-          do: agent claude
+          do: agent placeholder
           with: hi
           next: b
 

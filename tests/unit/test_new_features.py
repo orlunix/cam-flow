@@ -37,37 +37,37 @@ from camflow.engine.state_enricher import (
 
 class TestMethodologyRouter:
     def test_fix_maps_to_rca(self):
-        node = {"do": "agent claude", "with": "Fix the bug in calculator.py"}
+        node = {"do": "Fix the bug in calculator.py"}
         assert select_methodology_label("fix", node) == "rca"
         assert "RCA" in select_methodology("fix", node)
 
     def test_debug_maps_to_rca(self):
-        node = {"do": "agent claude", "with": "Debug this error"}
+        node = {"do": "Debug this error"}
         assert select_methodology_label("debug-step", node) == "rca"
 
     def test_build_maps_to_simplify_first(self):
-        node = {"do": "agent claude", "with": "Build the release package"}
+        node = {"do": "Build the release package"}
         assert select_methodology_label("build", node) == "simplify-first"
         assert "Simplify-first" in select_methodology("build", node)
 
     def test_research_maps_to_search_first(self):
-        node = {"do": "agent claude", "with": "Research prior art for this algorithm"}
+        node = {"do": "Research prior art for this algorithm"}
         assert select_methodology_label("research", node) == "search-first"
 
     def test_analyze_maps_to_search_first(self):
-        node = {"do": "agent claude", "with": "Analyze the failure mode"}
+        node = {"do": "Analyze the failure mode"}
         assert select_methodology_label("analyze", node) == "search-first"
 
     def test_design_maps_to_working_backwards(self):
-        node = {"do": "agent claude", "with": "Design the new API surface"}
+        node = {"do": "Design the new API surface"}
         assert select_methodology_label("design", node) == "working-backwards"
 
     def test_test_maps_to_systematic_coverage(self):
-        node = {"do": "agent claude", "with": "Test the edge cases"}
+        node = {"do": "Test the edge cases"}
         assert select_methodology_label("verify", node) == "systematic-coverage"
 
     def test_unknown_node_returns_none(self):
-        node = {"do": "agent claude", "with": "Synthesize the report"}
+        node = {"do": "Synthesize the report"}
         assert select_methodology_label("summarize", node) == "none"
         assert select_methodology("summarize", node) == ""
 
@@ -141,7 +141,7 @@ class TestContextPositioning:
         state["iteration"] = 1
         state["lessons"] = ["L1"]
         p = build_prompt(
-            "fix", {"do": "agent claude", "with": "TASK_MARKER"}, state,
+            "fix", {"do": "agent placeholder", "with": "TASK_MARKER"}, state,
         )
         # CONTEXT block opens before "Your task:" header
         assert p.index(FENCE_OPEN) < p.index("Your task:")
@@ -210,7 +210,7 @@ class TestObservationMasking:
 class TestToolScoping:
     def test_tool_scope_rendered_when_set(self):
         state = init_structured_fields({"pc": "fix", "status": "running"})
-        node = {"do": "agent claude", "with": "fix it",
+        node = {"do": "agent placeholder", "with": "fix it",
                 "allowed_tools": ["Read", "Edit", "Write", "Bash"]}
         p = build_prompt("fix", node, state)
         assert "Tools you may use" in p
@@ -218,7 +218,7 @@ class TestToolScoping:
 
     def test_no_tool_scope_line_when_unset(self):
         state = init_structured_fields({"pc": "fix", "status": "running"})
-        node = {"do": "agent claude", "with": "fix it"}
+        node = {"do": "agent placeholder", "with": "fix it"}
         p = build_prompt("fix", node, state)
         assert "Tools you may use" not in p
 
@@ -230,7 +230,7 @@ class TestMethodologyAndEscalationInjection:
     def test_methodology_hint_in_prompt_for_fix(self):
         state = init_structured_fields({"pc": "fix", "status": "running"})
         p = build_prompt(
-            "fix", {"do": "agent claude", "with": "Fix divide()"}, state,
+            "fix", {"do": "agent placeholder", "with": "Fix divide()"}, state,
         )
         assert "Methodology:" in p
         assert "RCA" in p
@@ -238,7 +238,7 @@ class TestMethodologyAndEscalationInjection:
     def test_no_methodology_for_unrecognized(self):
         state = init_structured_fields({"pc": "whatever", "status": "running"})
         p = build_prompt(
-            "summarize", {"do": "agent claude", "with": "Summarize everything"},
+            "summarize", {"do": "agent placeholder", "with": "Summarize everything"},
             state,
         )
         assert "Methodology:" not in p
@@ -246,7 +246,7 @@ class TestMethodologyAndEscalationInjection:
     def test_escalation_prompt_absent_at_level_zero(self):
         state = init_structured_fields({"pc": "fix", "status": "running"})
         p = build_prompt(
-            "fix", {"do": "agent claude", "with": "fix"}, state,
+            "fix", {"do": "agent placeholder", "with": "fix"}, state,
         )
         assert ESCALATION_PROMPTS[1] not in p
         assert ESCALATION_PROMPTS[2] not in p
@@ -255,7 +255,7 @@ class TestMethodologyAndEscalationInjection:
         state = init_structured_fields({"pc": "fix", "status": "running"})
         state["retry_counts"]["fix"] = 2
         p = build_prompt(
-            "fix", {"do": "agent claude", "with": "fix"}, state,
+            "fix", {"do": "agent placeholder", "with": "fix"}, state,
         )
         assert "DEEP DIVE" in p
 

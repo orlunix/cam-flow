@@ -42,8 +42,16 @@ def test_dispatch_cmd_alias(tmp_path):
     assert run_cmd.call_args[0][0] == "echo legacy"
 
 
-def test_dispatch_agent_legacy_claude(tmp_path):
-    """`agent claude` → run_agent with no agent_def persona."""
+def test_dispatch_agent_claude_tries_loader(tmp_path, monkeypatch):
+    """`agent claude` is NOT special-cased any more. The DSL treats
+    the name "claude" like any other: the loader looks for
+    ~/.claude/agents/claude.md and, if absent, returns None so the
+    node runs anonymously. New workflows should use inline prompts
+    (`do: "<task>"`) instead of `agent claude`.
+    """
+    # Pin CAMFLOW_AGENTS_DIR to an empty tmp dir so the test doesn't
+    # accidentally pick up a real `claude.md` on the host.
+    monkeypatch.setenv(AGENTS_DIR_ENV, str(tmp_path))
     node = {"do": "agent claude", "with": "do stuff"}
     with patch(
         "camflow.backend.cam.node_runner.run_agent",
@@ -54,9 +62,32 @@ def test_dispatch_agent_legacy_claude(tmp_path):
     ) as build_prompt:
         run_node("n", node, {}, str(tmp_path))
     build_prompt.assert_called_once()
-    # agent_def kwarg should be None for legacy 'claude'
+    # No ~/.claude/agents/claude.md in the pinned dir → agent_def None.
     assert build_prompt.call_args.kwargs.get("agent_def") is None
     run_agent.assert_called_once()
+
+
+def test_dispatch_agent_claude_resolves_when_file_exists(tmp_path, monkeypatch):
+    """If someone DID write ~/.claude/agents/claude.md, it's treated
+    like any other agent — nothing about the name "claude" is magic.
+    """
+    monkeypatch.setenv(AGENTS_DIR_ENV, str(tmp_path))
+    (tmp_path / "claude.md").write_text(
+        "---\nname: claude\ndescription: custom generic agent\n---\n"
+        "You are a specialized variant of the default agent.\n"
+    )
+    node = {"do": "agent claude", "with": "do stuff"}
+    with patch(
+        "camflow.backend.cam.node_runner.run_agent",
+        return_value=_fake_agent_result(),
+    ), patch(
+        "camflow.backend.cam.node_runner.build_prompt",
+        return_value="<prompt>",
+    ) as build_prompt:
+        run_node("n", node, {}, str(tmp_path))
+    agent_def = build_prompt.call_args.kwargs["agent_def"]
+    assert agent_def is not None
+    assert agent_def["name"] == "claude"
 
 
 def test_dispatch_agent_named_loads_definition(tmp_path, monkeypatch):

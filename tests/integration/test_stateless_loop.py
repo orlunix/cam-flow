@@ -25,12 +25,12 @@ from camflow.backend.cam.engine import Engine, EngineConfig
 
 WORKFLOW = """
 start:
-  do: agent claude
+  do: agent placeholder
   with: Analyze the bugs.
   next: fix
 
 fix:
-  do: agent claude
+  do: agent placeholder
   with: Fix one bug.
   next: test
 
@@ -43,7 +43,7 @@ test:
       goto: done
 
 done:
-  do: agent claude
+  do: agent placeholder
   with: Summarize.
 """
 
@@ -72,12 +72,12 @@ def test_stateless_loop_accumulates_state(tmp_path, monkeypatch):
     # Replace the `cmd` for test to one that references the counter
     wf.write_text(textwrap.dedent(f"""
         start:
-          do: agent claude
+          do: agent placeholder
           with: Analyze the bugs.
           next: fix
 
         fix:
-          do: agent claude
+          do: agent placeholder
           with: Fix one bug.
           next: test
 
@@ -90,19 +90,19 @@ def test_stateless_loop_accumulates_state(tmp_path, monkeypatch):
               goto: done
 
         done:
-          do: agent claude
+          do: agent placeholder
           with: Summarize.
     """))
 
     # Simpler: just run a cmd that passes when the counter file contains "1"
     wf.write_text(textwrap.dedent(f"""
         start:
-          do: agent claude
+          do: agent placeholder
           with: Analyze the bugs.
           next: fix
 
         fix:
-          do: agent claude
+          do: agent placeholder
           with: Fix one bug.
           next: test
 
@@ -115,7 +115,7 @@ def test_stateless_loop_accumulates_state(tmp_path, monkeypatch):
               goto: done
 
         done:
-          do: agent claude
+          do: agent placeholder
           with: Summarize.
     """))
 
@@ -268,17 +268,17 @@ def test_stateless_every_agent_starts_fresh(tmp_path, monkeypatch):
     wf = tmp_path / "workflow.yaml"
     wf.write_text(textwrap.dedent("""
         start:
-          do: agent claude
+          do: agent placeholder
           with: a
           next: mid
 
         mid:
-          do: agent claude
+          do: agent placeholder
           with: b
           next: done
 
         done:
-          do: agent claude
+          do: agent placeholder
           with: c
     """))
 
@@ -313,12 +313,12 @@ def test_stateless_long_loop_prunes_lessons(tmp_path, monkeypatch):
     wf = tmp_path / "workflow.yaml"
     wf.write_text(textwrap.dedent("""
         start:
-          do: agent claude
+          do: agent placeholder
           with: go
           next: fix
 
         fix:
-          do: agent claude
+          do: agent placeholder
           with: keep fixing
           transitions:
             - if: output.more

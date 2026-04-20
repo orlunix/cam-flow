@@ -231,7 +231,7 @@ class TestValidatePlanQuality:
 
     def test_two_node_cycle_without_retries_is_error(self):
         wf = {
-            "fix": {"do": "agent claude", "next": "test"},
+            "fix": {"do": "agent placeholder", "next": "test"},
             "test": {"do": "cmd false",
                       "transitions": [{"if": "fail", "goto": "fix"}]},
         }
@@ -240,7 +240,7 @@ class TestValidatePlanQuality:
 
     def test_two_node_cycle_with_retries_ok(self):
         wf = {
-            "fix": {"do": "agent claude", "methodology": "rca",
+            "fix": {"do": "agent placeholder", "methodology": "rca",
                      "escalation_max": 3, "allowed_tools": ["Read", "Edit"],
                      "max_retries": 3, "verify": "true",
                      "with": "Fix it", "next": "test"},
@@ -253,7 +253,7 @@ class TestValidatePlanQuality:
 
     def test_agent_missing_fields_is_warning_not_error(self):
         wf = {
-            "fix": {"do": "agent claude", "with": "Fix", "next": "done"},
+            "fix": {"do": "agent placeholder", "with": "Fix", "next": "done"},
             "done": {"do": "cmd echo ok"},
         }
         errors, warnings = validate_plan_quality(wf)
@@ -265,7 +265,7 @@ class TestValidatePlanQuality:
         assert any("fix" in w and "escalation_max" in w for w in warnings)
 
     def test_invalid_methodology_is_warning(self):
-        wf = {"n": {"do": "agent claude",
+        wf = {"n": {"do": "agent placeholder",
                       "methodology": "made-up",
                       "with": "x"}}
         _, warnings = validate_plan_quality(wf)
@@ -273,7 +273,7 @@ class TestValidatePlanQuality:
 
     def test_unproduced_state_ref_is_warning(self):
         wf = {
-            "a": {"do": "agent claude", "with": "use {{state.magic}}",
+            "a": {"do": "agent placeholder", "with": "use {{state.magic}}",
                     "next": "b"},
             "b": {"do": "cmd echo {{state.magic}}"},
         }
@@ -282,10 +282,10 @@ class TestValidatePlanQuality:
 
     def test_state_ref_with_producer_ok(self):
         wf = {
-            "a": {"do": "agent claude",
+            "a": {"do": "agent placeholder",
                     "with": "write state_updates.magic = 'value'",
                     "next": "b"},
-            "b": {"do": "agent claude",
+            "b": {"do": "agent placeholder",
                     "with": "use {{state.magic}}"},
         }
         _, warnings = validate_plan_quality(wf)
@@ -372,7 +372,7 @@ class TestAsciiGraph:
                            {"if": "fail", "goto": "fix"},
                            {"if": "success", "goto": "done"},
                        ]},
-            "fix": {"do": "agent claude", "methodology": "rca",
+            "fix": {"do": "agent placeholder", "methodology": "rca",
                       "verify": "pytest",
                       "next": "start"},
             "done": {"do": "cmd echo done"},

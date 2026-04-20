@@ -10,17 +10,17 @@ def _write_workflow(project_dir):
     # 3 nodes: each adds a lesson
     path.write_text(textwrap.dedent("""
         start:
-          do: agent claude
+          do: agent placeholder
           with: first
           next: b
 
         b:
-          do: agent claude
+          do: agent placeholder
           with: second
           next: c
 
         c:
-          do: agent claude
+          do: agent placeholder
           with: third
     """))
     return str(path)

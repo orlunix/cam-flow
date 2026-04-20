@@ -577,10 +577,15 @@ class Engine:
         return None
 
     def _resolve_agent_def(self, name):
-        """Resolve an agent name to a loaded definition, tolerating the
-        legacy 'claude' anonymous sentinel and missing files.
+        """Resolve an agent name to a loaded definition.
+
+        Every `agent <name>` form (including `agent claude`) goes
+        through `load_agent_definition`. If the file doesn't exist,
+        `load_agent_definition` returns None — the node runs
+        anonymously. For new workflows that want an anonymous default,
+        use inline prompts (`do: "<task>"`) instead of `agent claude`.
         """
-        if not name or name == "claude":
+        if not name:
             return None
         # Lazy import so test fixtures can monkey-patch agent_loader.
         from camflow.backend.cam.agent_loader import load_agent_definition

@@ -27,7 +27,7 @@ class TestPlanMethodology:
         plan explicitly asks for 'search-first', plan wins."""
         state = init_structured_fields({"pc": "n", "status": "running"})
         node = {
-            "do": "agent claude",
+            "do": "agent placeholder",
             "with": "fix the bug in parser.py",  # keyword → rca
             "methodology": "search-first",       # plan override
         }
@@ -39,7 +39,7 @@ class TestPlanMethodology:
         """A plan that writes a bogus label renders nothing (no crash)."""
         state = init_structured_fields({"pc": "n", "status": "running"})
         node = {
-            "do": "agent claude",
+            "do": "agent placeholder",
             "with": "analyze the code",
             "methodology": "made-up-name",
         }
@@ -51,7 +51,7 @@ class TestPlanMethodology:
 
     def test_no_plan_methodology_uses_keyword(self):
         state = init_structured_fields({"pc": "n", "status": "running"})
-        node = {"do": "agent claude", "with": "Fix the bug."}
+        node = {"do": "agent placeholder", "with": "Fix the bug."}
         p = build_prompt("fix", node, state)
         assert "RCA" in p
 
@@ -82,7 +82,7 @@ class TestEscalationMax:
         state = init_structured_fields({"pc": "fix", "status": "running"})
         state["retry_counts"]["fix"] = 5
         node = {
-            "do": "agent claude",
+            "do": "agent placeholder",
             "with": "Fix the bug.",
             "escalation_max": 1,
         }
@@ -148,7 +148,7 @@ class TestVerifyCmd:
 
     def test_verify_success_leaves_result_alone(self, tmp_path):
         eng = self._engine_with_node(tmp_path, {
-            "do": "agent claude", "verify": "true",
+            "do": "agent placeholder", "verify": "true",
         })
         result = {"status": "success", "summary": "did it",
                   "state_updates": {}, "error": None}
@@ -158,7 +158,7 @@ class TestVerifyCmd:
 
     def test_verify_failure_downgrades_to_fail(self, tmp_path):
         eng = self._engine_with_node(tmp_path, {
-            "do": "agent claude", "verify": "false",
+            "do": "agent placeholder", "verify": "false",
         })
         result = {"status": "success", "summary": "agent said done",
                   "state_updates": {}, "error": None}
@@ -172,7 +172,7 @@ class TestVerifyCmd:
         """If the agent said fail, verify must not run (pointless + could
         mask the real error)."""
         eng = self._engine_with_node(tmp_path, {
-            "do": "agent claude", "verify": "false",
+            "do": "agent placeholder", "verify": "false",
         })
         result = {"status": "fail", "summary": "agent crashed",
                   "state_updates": {},
@@ -186,7 +186,7 @@ class TestVerifyCmd:
     def test_verify_template_substitution(self, tmp_path):
         """Verify cmd should honor {{state.x}} substitution."""
         eng = self._engine_with_node(tmp_path, {
-            "do": "agent claude",
+            "do": "agent placeholder",
             "verify": "test {{state.flag}} = yes",
         })
         eng.state["flag"] = "yes"  # will render `test yes = yes`
@@ -199,10 +199,10 @@ class TestVerifyCmd:
         assert result["status"] == "success"
 
     def test_verify_missing_is_noop(self, tmp_path):
-        eng = self._engine_with_node(tmp_path, {"do": "agent claude"})
+        eng = self._engine_with_node(tmp_path, {"do": "agent placeholder"})
         result = {"status": "success", "summary": "ok",
                   "state_updates": {}, "error": None}
-        eng._apply_verify_cmd({"do": "agent claude"}, result)
+        eng._apply_verify_cmd({"do": "agent placeholder"}, result)
         assert result["status"] == "success"
 
 
@@ -214,7 +214,7 @@ class TestDslAcceptsNewFields:
         from camflow.engine.dsl import validate_node
 
         node = {
-            "do": "agent claude",
+            "do": "agent placeholder",
             "with": "go",
             "methodology": "rca",
             "verify": "true",
@@ -229,7 +229,7 @@ class TestDslAcceptsNewFields:
     def test_still_rejects_truly_unknown_field(self):
         from camflow.engine.dsl import validate_node
 
-        node = {"do": "agent claude", "madeup_field": 123}
+        node = {"do": "agent placeholder", "madeup_field": 123}
         ok, errors = validate_node("n", node)
         assert not ok
         assert any("unknown" in e.lower() for e in errors)

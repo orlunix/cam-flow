@@ -78,14 +78,16 @@ def run_node(node_id, node, state, project_dir, timeout=600, poll_interval=5):
 
 
 def _resolve_agent_def(name):
-    """Look up an agent definition, tolerating the legacy 'claude' sentinel.
+    """Look up an agent definition by name.
 
-    Old workflows used `do: agent claude` as an anonymous marker. That's
-    not a real agent file, so return None (anonymous default) instead
-    of erroring.
+    Every `agent <name>` form must resolve to a real agent file at
+    `~/.claude/agents/<name>.md`. The legacy `agent claude` sentinel
+    was removed — if someone writes `agent claude`, the loader will
+    look for `~/.claude/agents/claude.md` like any other name, and
+    fall through to anonymous (returning None) only if that file
+    doesn't exist. For new workflows, use inline prompts
+    (`do: "<task>"`) when you don't have a named agent.
     """
-    if name == "claude":
-        return None
     try:
         return load_agent_definition(name)
     except ValueError:

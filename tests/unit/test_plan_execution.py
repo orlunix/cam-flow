@@ -27,7 +27,7 @@ class TestAllowedToolsPassedToStartAgent:
         wf_path = tmp_path / "workflow.yaml"
         wf_path.write_text(textwrap.dedent("""
             start:
-              do: agent claude
+              do: agent placeholder
               with: "do it"
               methodology: rca
               escalation_max: 2
@@ -78,7 +78,7 @@ class TestAllowedToolsPassedToStartAgent:
         wf_path = tmp_path / "workflow.yaml"
         wf_path.write_text(textwrap.dedent("""
             start:
-              do: agent claude
+              do: agent placeholder
               with: "do it"
               methodology: rca
               escalation_max: 2
@@ -121,7 +121,7 @@ class TestPlanMethodologyInjected:
     def test_plan_label_shows_in_prompt(self):
         state = init_structured_fields({"pc": "n", "status": "running"})
         node = {
-            "do": "agent claude",
+            "do": "agent placeholder",
             "with": "analyze the bug",  # keyword → rca
             "methodology": "working-backwards",  # plan override
         }
@@ -155,7 +155,7 @@ class TestVerifyTemplateSubstitution:
         eng.state = init_structured_fields({"pc": "n", "status": "running"})
         eng.project_dir = str(tmp_path)
         eng.state_path = str(tmp_path / ".camflow" / "state.json")
-        eng.workflow = {"n": {"do": "agent claude", "verify": "test {{state.expected}} = ok"}}
+        eng.workflow = {"n": {"do": "agent placeholder", "verify": "test {{state.expected}} = ok"}}
 
         # With state.expected == "ok", `test ok = ok` exits 0 → verify passes
         eng.state["expected"] = "ok"

@@ -23,16 +23,17 @@ PLANNING_RULES = """\
   runs it as a subprocess, no LLM tokens spent. `cmd` is still accepted
   as a legacy alias for `shell` but new plans should use `shell`.
 - `agent <name>` — named sub-agent from `~/.claude/agents/<name>.md`.
-  Use this whenever a matching agent exists in the Agent catalog
-  below; the agent carries its own persona, allowed tools, and
-  pre-loaded skills. Prefer a named agent over `agent claude` whenever
-  one matches the job.
-- `agent claude` — legacy anonymous agent. Accepted for back-compat.
+  Use ONLY when a matching agent exists in the Agent catalog below;
+  the agent carries its own persona, allowed tools, and pre-loaded
+  skills. Do NOT invent agent names — if no agent in the catalog
+  fits, use an inline prompt instead.
 - `skill <name>` — invoke an installed skill by name; runs inside an
   agent session.
 - Inline prompt — any `do` value that doesn't start with a keyword
-  above is treated as a free-text prompt to the default agent. Use
-  for tiny, one-off tasks that don't merit a named agent.
+  above is treated as a free-text prompt to an anonymous default
+  agent. This is the correct form when no named agent fits the job.
+  Do NOT emit `agent claude` — that was a legacy anonymous sentinel
+  and is no longer accepted; use an inline prompt instead.
 
 ## Planning rules
 

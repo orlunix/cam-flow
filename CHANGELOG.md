@@ -6,6 +6,39 @@ dates are ISO-8601.
 
 ## [Unreleased]
 
+### Removed (2026-04-19, `agent claude` sentinel)
+
+- **`agent claude` no longer a special anonymous sentinel.** DSL v2
+  treats the name `claude` identically to every other agent name:
+  `load_agent_definition("claude")` looks for
+  `~/.claude/agents/claude.md` and returns None if absent (so the
+  node runs anonymously with the default agent). The behavior of
+  existing `do: agent claude` nodes is preserved whenever that file
+  doesn't exist — they still run anonymously — but the special-case
+  hard-coded `if name == "claude": return None` branches in
+  `node_runner.py::_resolve_agent_def` and
+  `engine.py::_resolve_agent_def` are gone.
+- **Planner prompt now emits inline prompts instead of `agent claude`.**
+  `PLANNING_RULES` in `prompt_template.py` explicitly instructs the
+  LLM: *"Do NOT emit `agent claude` — that was a legacy anonymous
+  sentinel and is no longer accepted; use an inline prompt instead."*
+  All three few-shot examples in `planner/examples.py` rewritten to
+  use inline prompts (`do: |` block scalars) and `shell` for
+  deterministic commands.
+- **Test-fixture migration.** Every `{"do": "agent claude"}` dict
+  fixture in unit / integration / resume / error_injection tests
+  migrated to either an inline prompt (where it models the
+  "anonymous task" case) or `agent placeholder` (where it models
+  a generic agent-node-with-persona that's not under test). 14
+  test files touched; behavior preserved.
+- **New test: `test_dispatch_agent_claude_resolves_when_file_exists`**
+  demonstrates that if someone DID write `~/.claude/agents/claude.md`,
+  the DSL treats it like any other agent — nothing about the name is
+  magic. Sister test
+  `test_dispatch_agent_claude_tries_loader` pins
+  `CAMFLOW_AGENTS_DIR` to an empty dir and confirms the anonymous
+  fall-through still works. 344 unit tests passing (+1 net).
+
 ### Added (2026-04-19, resume + CLI wrapper)
 
 - **`camflow resume <workflow.yaml>` subcommand**

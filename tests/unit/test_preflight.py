@@ -87,7 +87,7 @@ class TestPreflightInDispatch:
         run_cmd.assert_not_called()
 
     def test_preflight_fail_skips_agent_body(self, tmp_path):
-        node = {"do": "agent claude", "preflight": "false"}
+        node = {"do": "agent placeholder", "preflight": "false"}
         eng = _engine(tmp_path, node)
         eng.config = MagicMock(node_timeout=60, max_retries=3, poll_interval=5)
         with patch(

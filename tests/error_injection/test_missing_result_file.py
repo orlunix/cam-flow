@@ -15,7 +15,7 @@ def test_missing_result_file_classified_correctly(tmp_path, monkeypatch):
     wf = tmp_path / "workflow.yaml"
     wf.write_text(textwrap.dedent("""
         start:
-          do: agent claude
+          do: agent placeholder
           with: hi
     """))
 
