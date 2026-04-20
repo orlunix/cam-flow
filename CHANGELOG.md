@@ -6,6 +6,36 @@ dates are ISO-8601.
 
 ## [Unreleased]
 
+### Added (2026-04-19, strategy doc + docs cleanup)
+
+- **`docs/strategy.md`** — NEW, the single source of truth for how
+  cam-flow works. Eight sections: agent management strategy (every
+  node spawns a new camc agent, engine owns the lifecycle), context
+  management strategy (stateless execution, state.json is the only
+  bridge), node execution strategy (preflight → execute → verify),
+  DSL reference (every `do:` form + every node field), plan/execute
+  boundary (plan decides, engine executes, engine never modifies
+  the plan), preflight principle (cheap check before expensive op —
+  universal, not hardware-specific), inline → agent → skill
+  promotion (when to extract), and CLI reference (every shipped +
+  planned subcommand).
+- **`docs/architecture.md`** trimmed to a code-level companion.
+  Strategy-duplicating sections replaced by pointers to strategy.md:
+    * "DSL v2: inline → agent → skill promotion" (full block
+      moved to strategy § 7)
+    * "User-facing lifecycle" (conceptual overview moved; code
+      diagrams + module-ownership table retained)
+    * "Plan vs Runtime boundary" (conceptual split moved; per-module
+      ownership table + test pointer retained)
+  Top of architecture.md now opens with a banner pointing readers
+  at strategy.md first.
+- **`docs/cam-phase-plan.md`** — banner added marking it HISTORICAL.
+  Superseded by strategy.md; retained only for the reasoning chain
+  (why file-first completion detection, why dual-signal polling,
+  etc.) that isn't captured elsewhere.
+- **`docs/roadmap.md`** — new SHIPPED row for the strategy doc +
+  docs cleanup.
+
 ### Removed (2026-04-19, `agent claude` sentinel)
 
 - **`agent claude` no longer a special anonymous sentinel.** DSL v2

@@ -1,5 +1,14 @@
 # CAM Phase Implementation Plan (v2 — revised after review)
 
+> **HISTORICAL — superseded by [`strategy.md`](strategy.md).**
+> This was the working design document during the CAM-phase build-out
+> (pre-DSL v2). Specific details may have drifted as the codebase
+> landed: retry modes, error classification, orphan handling, lessons
+> flow. Where this document and `strategy.md` disagree,
+> `strategy.md` is authoritative. Kept here for the reasoning chain
+> it captures (why file-first completion detection, why dual-signal
+> polling, why two retry modes) rather than as a current spec.
+
 ## 0. Context and Current State
 
 **What exists** (`src/camflow/backend/cam/`):

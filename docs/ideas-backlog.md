@@ -736,6 +736,26 @@ idea only / REJECTED).
 - **Source.** `camflow-wrapper.md`.
 - **Status.** SHIPPED 2026-04-19. See `bin/camflow`.
 
+### 50. Definitive strategy document (`docs/strategy.md`)
+
+- **What.** A single strategy document covering the 8 architectural
+  strategies that answer "how does cam-flow work?": agent management,
+  context management, node execution, DSL reference, plan/execute
+  boundary, preflight principle, inline→agent→skill promotion, and
+  CLI reference. Other `docs/` files now defer to it as the source
+  of truth; `architecture.md` becomes the code-level companion.
+- **Why.** Before this doc, strategy was scattered across
+  architecture.md (plan vs runtime, user-facing lifecycle, DSL
+  promotion), roadmap.md (shipped features), cam-phase-plan.md (old
+  design), and various CHANGELOG entries. New contributors had no
+  canonical place to read "how does it work?" — and some docs had
+  drifted out of sync with code (e.g. cam-phase-plan.md pre-dated
+  DSL v2 entirely).
+- **Source.** `camflow-strategy-docs.md` (2026-04-19).
+- **Status.** SHIPPED 2026-04-19. See `docs/strategy.md`;
+  `docs/architecture.md` trimmed to point at it;
+  `docs/cam-phase-plan.md` marked HISTORICAL.
+
 ### 47. Planner scouts as Anthropic SDK tools (Option A)
 
 - **What.** Re-host `run_skill_scout` and `run_env_scout` as
