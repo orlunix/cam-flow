@@ -6,6 +6,62 @@ dates are ISO-8601.
 
 ## [Unreleased]
 
+### Added (2026-04-19, planner scouts + promotion guideline)
+
+- **`src/camflow/planner/scouts.py`** — read-only environment + skill
+  discovery for the Planner. Two scout types:
+    * `run_skill_scout(query)` — `skillm search` first; falls back to
+      walking `~/.claude/skills/` and `skills/`. Returns at most 5
+      candidates with the first 50 lines (1500 chars) of each
+      SKILL.md. Bounded JSON / plain-text output parsing.
+    * `run_env_scout(checks)` — `which <tool>` + best-effort
+      `--version` per tool; `path:<abs>` probes with `os.path.is*`.
+  Hard guarantees: READ-ONLY, BOUNDED, 30 s per-subprocess timeout,
+  GRACEFUL (missing skillm / missing tools never raise — always
+  return a structured warning entry). `default_scout_fn(type, query)`
+  dispatcher for callers that want a single callable.
+- **`camflow scout` CLI subcommand** (`src/camflow/cli_entry/scout.py`)
+  — thin wrapper over scouts.py for Option B. Emits JSON to stdout:
+    ```
+    camflow scout --type skill --query "RTL trace analysis"
+    camflow scout --type env --query vcs --query smake --query p4
+    camflow scout --type env --query path:/home/x/rtl
+    ```
+  `--pretty` toggles indented output. Wired into `cli_entry/main.py`.
+- **`camflow plan --scout-report <file>`** flag — accepts a JSON
+  report file (or `-` for stdin) produced by `camflow scout`. Repeat
+  the flag for multiple reports. The reports flow into
+  `build_planner_prompt(scout_reports=...)` and are rendered as a
+  `## Scout reports (read-only, already ran)` section in the planner
+  prompt. Hard cap at `MAX_SCOUT_REPORTS = 3` entries.
+- **Planner prompt scout doc block** — new "Scouts (read-only context
+  probes)" section in `PLANNING_RULES` tells the Planner LLM how to
+  interpret the scout reports section, and what to do when scouts
+  return no candidates (fall back to agents → inline; add
+  `preflight:` for missing tools).
+- **camflow-manager Phase 3.0 SCOUT** — the manager skill now
+  documents the scout-then-plan pattern: spawn scouts via Bash
+  before calling the Planner, save JSON reports, pipe them in via
+  `--scout-report`. Capped at 3 scout calls per planning session.
+- **Inline → agent → skill promotion guideline** — new section in
+  `docs/architecture.md` ("DSL v2: inline → agent → skill promotion")
+  with an explicit decision table and ordered promotion rules:
+  inline if one-off, promote to agent for reused personas,
+  promote to skill for reused procedures. The Planner uses the same
+  rule (skill-first when a scout-confirmed skill matches).
+- **Tests (28 new, 320 total passing)**:
+    * `tests/unit/test_scouts.py` (17 tests) — skillm JSON / plain
+      text / nonzero exit / timeout / missing skillm / fallback
+      walk / candidate cap / env tool present / missing / path
+      probe / unknown spec / cap / version probe failure /
+      dispatcher.
+    * `tests/unit/test_scout_cli.py` (6 tests) — JSON output, pretty
+      indent, multi-query env, missing-query error, unknown type
+      rejected.
+    * `tests/unit/test_planner.py` (5 new) — scout reports rendered
+      for skill + env shapes, capped at 3, planning rules describe
+      scouts, no section without reports.
+
 ### Added (2026-04-19, DSL v2)
 
 - **`shell <command>` node type.** Preferred spelling for shell

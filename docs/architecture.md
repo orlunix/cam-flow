@@ -781,6 +781,54 @@ reference but should not be triggered for new work.
 
 ---
 
+## DSL v2: inline → agent → skill promotion
+
+DSL v2 (Apr 2026) gave the workflow author three ways to specify the
+"AI does this" half of a node:
+
+| Form                           | Use when                                            | Lives in           |
+|--------------------------------|-----------------------------------------------------|--------------------|
+| `do: <free text>` (inline)     | One-off task, no reuse, < 3 lines, no special tools | workflow.yaml only |
+| `do: agent <name>`             | Reused persona; specific tool scope; preloaded skills | `~/.claude/agents/<name>.md` |
+| `do: skill <name>`             | Reusable *procedure* — multi-step, opinionated, may evolve | `~/.claude/skills/<name>/SKILL.md` |
+
+Promotion rules (apply in order — first match wins):
+
+1. **Inline → agent definition** if ANY of:
+   - The same prompt text appears in 2+ workflows.
+   - The prompt encodes a persona ("You are an RTL debug engineer
+     who…") rather than just a task.
+   - The prompt restricts tools (e.g. "use only Read/Edit/Bash") or
+     pre-loads skills — those belong in the agent's frontmatter.
+   - The prompt exceeds ~10 lines and would be hard to keep in sync.
+2. **Agent → skill** if ANY of:
+   - The behavior is a *procedure*, not a persona — the agent always
+     does the same multi-step dance (read foo, then check bar, then
+     do baz).
+   - The procedure has its own state machine, error handling, or
+     subroutines that benefit from skill-style structure (numbered
+     steps, decision tables, escalation paths).
+   - It's worth measuring on its own — skill-evolution Phase 1 (trace
+     rollup → per-skill metrics) only applies to skills, not to bare
+     prompts.
+3. **Stay inline** otherwise. Don't pre-emptively promote — promotion
+   has a real cost (a new file to maintain, an indirection to follow).
+   "We might reuse this someday" is not a reason; "we reused it twice
+   already" is.
+
+The Planner uses the same rule when generating workflows: prefer
+`skill <name>` if a scout-confirmed skill matches; else
+`agent <name>` if a scout-confirmed agent matches; else inline. The
+camflow-manager's PHASE 3 SCOUT step ensures the Planner has the data
+to make this choice grounded rather than guessed.
+
+This isn't just a style guideline — it shapes where measurement and
+evolution happen. Skills get evaluated by `camflow evolve report` per
+skill name; agents get evaluated by trace rollups per agent name;
+inline prompts are anonymous and effectively un-measurable.
+
+---
+
 ## Plan vs Runtime boundary
 
 cam-flow splits decisions across two sources:

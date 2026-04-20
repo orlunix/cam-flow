@@ -639,6 +639,91 @@ idea only / REJECTED).
   a persistent "planner rulebook" file. Groundwork exists in
   `src/camflow/engine/memory.py` (trace rollup).
 
+### 44. Planner skill-scout (read-only skill discovery)
+
+- **What.** A read-only scout the Planner can call (Option B today,
+  Option A later) to ground its choice of `skill <name>` nodes:
+  `camflow scout --type skill --query "<capability>"` runs
+  `skillm search` (falls back to walking `~/.claude/skills/`) and
+  returns the top 5 matches with each SKILL.md's first lines. The
+  Planner sees the JSON reports as a "Scout reports" section in its
+  prompt and picks skills informed by the actual catalog instead of
+  guessing.
+- **Why.** Production discovery: planner-generated workflows
+  hallucinated skills that didn't exist on the host. Hand-curated
+  skill lists in CLAUDE.md drift fast and don't tell the planner
+  which SKILL.md actually does what. Letting the planner ground its
+  pick on a live `skillm search` (no LLM tokens spent on the search,
+  just the structured report) makes plans match reality.
+- **Source.** `camflow-planner-scout.md`.
+- **Status.** SHIPPED 2026-04-19 (Option B: scout runs OUTSIDE the
+  LLM call, results flow in via `--scout-report`). See
+  `src/camflow/planner/scouts.py::run_skill_scout`,
+  `src/camflow/cli_entry/scout.py`, and the planner-prompt "Scout
+  reports" renderer. Option A (scouts as Anthropic SDK
+  `tools=[...]` definitions, called mid-generation) remains future
+  work — the scout function signature is already SDK-compatible.
+
+### 45. Planner env-scout (read-only environment probe)
+
+- **What.** A read-only scout for tool / path availability:
+  `camflow scout --type env --query vcs --query smake --query p4`
+  runs `which` + `--version` for each tool. `path:<abs>` probes
+  filesystem existence. Returns a structured JSON report the
+  Planner reads as additional context.
+- **Why.** Production discovery: planner generated a `shell vcs ...`
+  node on a host without VCS. Engine couldn't tell why preflight was
+  even needed. A second-long `which` probe at plan time prevents
+  hour-long sim runs that were never going to start. Also lets the
+  planner choose between alternative tools (e.g. JasperGold vs
+  formality) based on what's actually installed.
+- **Source.** `camflow-planner-scout.md`.
+- **Status.** SHIPPED 2026-04-19 alongside #44. See
+  `src/camflow/planner/scouts.py::run_env_scout`.
+
+### 46. Inline → agent → skill promotion guideline
+
+- **What.** Documented decision rules for when an inline prompt
+  should be promoted to a named agent definition (`~/.claude/agents/
+  <name>.md`) and when an agent should be further promoted to a
+  skill (`~/.claude/skills/<name>/SKILL.md`). Three-row decision
+  table + ordered promotion rules in
+  `docs/architecture.md` ("DSL v2: inline → agent → skill
+  promotion"). The Planner uses the same rule when generating
+  workflows.
+- **Why.** DSL v2 gave authors three ways to express "AI does this"
+  but no guidance on which to use. Ad-hoc choice → inline prompts
+  proliferate (un-measurable, un-reusable) OR every prompt gets
+  promoted to a skill prematurely (overhead, indirection). A
+  written rule turns this into a checklist.
+- **Source.** Author + `camflow-planner-scout.md` follow-up
+  ("record the inline-to-skill promotion guideline to docs").
+- **Status.** SHIPPED 2026-04-19. The architecture doc section is
+  the source of truth; the Planner prompt's node-types catalog
+  references it implicitly via the "prefer scout-confirmed skill,
+  else agent, else inline" preference order.
+
+### 47. Planner scouts as Anthropic SDK tools (Option A)
+
+- **What.** Re-host `run_skill_scout` and `run_env_scout` as
+  `tools=[...]` definitions on the Anthropic SDK call so the Planner
+  LLM can request scouts mid-generation rather than relying on the
+  caller to pre-populate them. The scout function signatures are
+  already compatible — only the LLM-call wiring changes.
+- **Why.** Today (Option B) the camflow-manager has to guess WHICH
+  scouts the Planner will need before it knows what plan the Planner
+  will produce. Sometimes that means running scouts the Planner
+  ignores; sometimes it means the Planner wants info nobody scouted
+  for. Letting the Planner request scouts mid-generation eliminates
+  both failure modes — at the cost of a tool-use loop in the SDK
+  call.
+- **Source.** `camflow-planner-scout.md` Option A. Listed there as
+  "migrate to Option A later (SDK phase)."
+- **Status.** Idea — SDK phase. Blocked on the SDK-mode work
+  (#22 in this backlog). Once SDK mode lands, the conversion is
+  ~50 lines: define the two tools, dispatch tool_use blocks to
+  `default_scout_fn`, loop until `stop_reason != "tool_use"`.
+
 ---
 
 ## How to use this document
