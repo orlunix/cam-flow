@@ -473,6 +473,83 @@ idea only / REJECTED).
   for the verify gate, `tests/unit/test_plan_priority.py` for the
   14 new tests.
 
+### 36. Preflight field — fail fast before expensive nodes
+
+- **What.** New `preflight: <cmd>` field in the node DSL, peer to
+  `verify:`. Engine runs preflight (cheap, seconds) BEFORE the node
+  body; on non-zero exit, node immediately transitions as fail with
+  `error.code = PREFLIGHT_FAIL`, skipping the expensive body
+  entirely. Two-layer validation: preflight answers "can I even
+  start?"; verify answers "did I succeed?".
+- **Why.** Production discovery — CoreMark ran a 30-min simulation
+  before we found out the core never booted after reset. Expensive
+  nodes (simv runs, formal verification, tree builds) can take
+  tens of minutes; running them when a prerequisite is obviously
+  missing wastes a full retry budget and delays failure reporting.
+  Preflight turns those silent hour-long wastes into second-long
+  early fails with an explicit reason code.
+- **Source.** `docs/lessons-2026-04-19.md` §P2. Confirmed as a
+  standing architectural decision in §3.6 of that doc.
+- **Status.** Idea — immediate (next session). Engine changes:
+  `NODE_FIELDS` += `preflight`, `backend/cam/engine.py` adds a
+  `_run_preflight` call before `_run_node_body`, tests cover the
+  skip-body path. Planner rule: nodes with `timeout > 5min` SHOULD
+  have a preflight.
+
+### 37. Agent definition system (~/.claude/agents/ reuse)
+
+- **What.** Replace the ad-hoc `do: agent claude` form (anonymous
+  tool call, prompt written from scratch in every workflow.yaml)
+  with `do: agent <name>` referencing a predefined agent at
+  `~/.claude/agents/<name>.md`. Each agent definition carries:
+  name, description, model, allowed tools, preloaded skills, and
+  a system prompt. The workflow.yaml says WHICH agent + WHAT task;
+  the agent file owns identity, capabilities, and style.
+- **Why.** Right now every node writes its own prompt. No reuse,
+  no quality control, no skill-loading reuse. You can't say "use
+  the hardware-verification agent" and get a consistent setup
+  across workflows. Moving the agent identity out of workflow.yaml
+  into a reusable file also lets the Planner pick an agent from a
+  registry (Phase 2 COLLECT) instead of hand-crafting a prompt.
+  Claude Code already has an agent-definition convention at
+  `~/.claude/agents/`; cam-flow should consume it.
+- **Source.** `docs/lessons-2026-04-19.md` §P1 + §TODO "Agent
+  definition system." Pattern aligns with Claude Code's existing
+  agent system and with camflow-manager's COLLECT phase already
+  listing `~/.claude/agents/`.
+- **Status.** Idea — immediate (next session). DSL extension in
+  `engine/dsl.py` (agent name resolution); `backend/cam/agent_
+  runner.py` reads the named agent file for model/tools/skills;
+  planner consumes a catalog of available agents during PLAN;
+  camflow-manager already scans `~/.claude/agents/` in COLLECT.
+
+### 38. Domain-specific planner rule sets
+
+- **What.** Let the Planner load an additional rule pack based on
+  workflow domain — e.g. `--domain hardware`, `--domain software`,
+  `--domain deployment`, `--domain research`. Each rule pack
+  augments the planner prompt with domain-aware conventions:
+  analyze-DUT-before-build for hardware RTL, validate-service-alive
+  for deployment, test-first for software, etc. Deterministic
+  operations per domain (smake/VCS/JasperGold for hardware;
+  pytest/npm for software) get flagged as `cmd` not `agent`.
+- **Why.** The current planner prompt is generic. Plans frequently
+  miss critical domain steps: hardware plans forget to analyze the
+  DUT interface before writing TB, benchmark plans skip
+  validate-DUT-alive before running tests, memory-bound software
+  plans miss prereq install. The agent then has to discover what
+  the planner should have planned — usually after burning time.
+  Packaging domain knowledge as a rule pack (pluggable, composable)
+  is cheaper than retraining the planner and cleaner than bloating
+  the generic prompt with every domain's conventions.
+- **Source.** `docs/lessons-2026-04-19.md` §P4 + §TODO
+  "Domain-specific planner rules."
+- **Status.** Idea — immediate (next session). Add
+  `src/camflow/planner/rulepacks/<domain>.md`, `--domain` flag on
+  `camflow plan` (passed through from camflow-manager PLAN phase),
+  prompt_template concatenates the selected pack after the
+  universal rules. Start with `hardware/` and `software/`.
+
 ---
 
 ## How to use this document
