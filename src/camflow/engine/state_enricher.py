@@ -275,6 +275,15 @@ def enrich_state(state, node_id, node_result, cmd_output=None):
     status = node_result.get("status", "fail")
     state_updates = dict(node_result.get("state_updates") or {})
 
+    # Handoff: a detailed paragraph from the finishing agent to the next
+    # agent. Only the most recent handoff is retained — this is a
+    # high-signal, low-volume channel for "what I tried + exact file/line
+    # + what to try next", not a log. Missing field is fine (old agents
+    # without handoff still work).
+    handoff = (node_result.get("handoff") or "").strip()
+    if handoff:
+        state["last_handoff"] = handoff
+
     # Lessons (dedup + prune)
     new_lesson = state_updates.pop("new_lesson", None)
     if new_lesson:

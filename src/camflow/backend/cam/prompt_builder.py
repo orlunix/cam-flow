@@ -42,6 +42,7 @@ Then write the result file with this exact JSON structure:
 {
   "status": "success",
   "summary": "One sentence describing what you did",
+  "handoff": "Detailed paragraph for the NEXT agent — see below",
   "state_updates": {},
   "error": null
 }
@@ -49,7 +50,13 @@ Then write the result file with this exact JSON structure:
 
 Rules:
 - "status" must be "success" or "fail"
-- "summary" must be a brief one-sentence description
+- "summary" must be a brief one-sentence description (for humans scanning logs)
+- "handoff" is a detailed paragraph for the NEXT agent — what you tried, why
+  it worked or failed, exact file paths and line numbers, and what approach
+  to take next. This is the most important field for workflow quality. Be
+  specific: name functions, flags, signals, commit SHAs. The handoff shows
+  up at the top of the next agent's CONTEXT block, so treat it as the
+  briefing you wish you had received.
 - "state_updates" is a dict of key-value pairs to pass to downstream nodes
   - On failure: include {"error": "what went wrong"}
   - On success: include any useful info for the next node
@@ -70,6 +77,22 @@ def _render_iteration(state, node_id):
     if not iteration:
         return None
     return f"Iteration: {iteration} (this node: {node_id})"
+
+
+def _render_handoff(state):
+    """Detailed handoff paragraph from the previous node's agent.
+
+    This is the most important context channel for workflow quality —
+    a full paragraph of "what I tried, exact file paths and line
+    numbers, why it worked/failed, what approach to take next" that
+    the upstream agent wrote into node-result.json's `handoff` field.
+    We only retain the most recent one (overwritten per node), so it's
+    always about the immediately preceding hop.
+    """
+    ho = (state.get("last_handoff") or "").strip()
+    if not ho:
+        return None
+    return "Handoff from previous node:\n  " + ho
 
 
 def _render_active_task(state):
@@ -192,6 +215,7 @@ def _render_context_fence(state, node_id):
     sections = [
         _render_iteration(state, node_id),
         _render_new_strategy(state),    # brainstorm rescue — high visibility
+        _render_handoff(state),         # upstream agent's detailed briefing
         _render_active_task(state),
         _render_completed(state),
         _render_blocked(state),
