@@ -171,10 +171,27 @@ def _render_next_steps(state):
     return "\n".join(lines)
 
 
+def _render_new_strategy(state):
+    """Brainstorm rescue hint. Populated by Engine._trigger_brainstorm
+    after a node has hit max_node_executions; prepended near the top of
+    the context fence so the next attempt of the failed node is pushed
+    to try something different."""
+    ns = (state.get("new_strategy") or "").strip()
+    if not ns:
+        return None
+    return (
+        "NEW STRATEGY (from brainstorm rescue — the previous approach "
+        "hit max_node_executions):\n"
+        f"  {ns}\n"
+        "Apply this strategy on this attempt. Do NOT retry the prior approach."
+    )
+
+
 def _render_context_fence(state, node_id):
     """Assemble all sections, skipping empties. Return "" if nothing to show."""
     sections = [
         _render_iteration(state, node_id),
+        _render_new_strategy(state),    # brainstorm rescue — high visibility
         _render_active_task(state),
         _render_completed(state),
         _render_blocked(state),

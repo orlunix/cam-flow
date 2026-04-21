@@ -24,6 +24,10 @@ import traceback
 from dataclasses import dataclass, field
 
 from camflow.backend.cam.agent_runner import run_agent, RESULT_FILE
+from camflow.backend.cam.brainstorm import (
+    build_brainstorm_prompt,
+    collect_failure_summaries,
+)
 from camflow.backend.cam.cmd_runner import run_cmd
 from camflow.backend.cam.orphan_handler import (
     ACTION_NO_ORPHAN,
@@ -352,12 +356,39 @@ class Engine:
             self._save_state()
             return False
 
-        # Loop detection
+        # Loop detection. First offence → one rescue brainstorm. Second
+        # offence on the same node → give up. ``brainstorm_done_for`` is
+        # a list of node_ids that have already consumed their rescue.
         exec_count = self.state["node_execution_count"].get(node_id, 0) + 1
         if exec_count > self.config.max_node_executions:
-            print(f"ERROR: node '{node_id}' exceeded max_node_executions ({self.config.max_node_executions})")
+            done_list = self.state.get("brainstorm_done_for") or []
+            if node_id in done_list:
+                print(
+                    f"ERROR: node '{node_id}' exceeded max_node_executions "
+                    f"({self.config.max_node_executions}) after brainstorm rescue"
+                )
+                self.state["status"] = "failed"
+                self.state["error"] = {
+                    "code": "LOOP_DETECTED_POST_BRAINSTORM",
+                    "node": node_id,
+                    "count": exec_count,
+                }
+                self._save_state()
+                return False
+
+            if self._trigger_brainstorm(node_id, node, exec_count):
+                # exec_count reset inside _trigger_brainstorm; continue.
+                return True
+
+            print(
+                f"ERROR: brainstorm for '{node_id}' failed; workflow halting"
+            )
             self.state["status"] = "failed"
-            self.state["error"] = {"code": "LOOP_DETECTED", "node": node_id, "count": exec_count}
+            self.state["error"] = {
+                "code": "BRAINSTORM_FAILED",
+                "node": node_id,
+                "count": exec_count,
+            }
             self._save_state()
             return False
         self.state["node_execution_count"][node_id] = exec_count
@@ -634,6 +665,64 @@ class Engine:
             result["status"] = "fail"
             result["summary"] = f"verify error: {exc}"
             result["error"] = {"code": "VERIFY_ERROR", "message": str(exc)}
+
+    def _trigger_brainstorm(self, node_id, node, exec_count):
+        """One-shot rescue attempt for a node that hit max_node_executions.
+
+        Spawns a short brainstorm agent (outside the DSL transition
+        graph), parses its ``state_updates.new_strategy`` recommendation
+        back into state, resets the node's exec_count + retry_count, and
+        records the node in ``state.brainstorm_done_for`` so a second
+        offence escalates to a real ``failed`` instead of looping
+        brainstorms.
+
+        Returns True if the caller should continue the main loop
+        (rescue succeeded); False to halt the workflow.
+        """
+        print(
+            f"\n[brainstorm] node '{node_id}' exceeded max_node_executions "
+            f"({self.config.max_node_executions}) — spawning rescue agent"
+        )
+        failures = collect_failure_summaries(self.trace_path, node_id)
+        prompt = build_brainstorm_prompt(node_id, node, failures, exec_count)
+        brainstorm_id = f"brainstorm-{node_id}"
+
+        try:
+            result, _agent_id, _signal = run_agent(
+                brainstorm_id, prompt, self.project_dir,
+                timeout=self.config.node_timeout,
+                poll_interval=self.config.poll_interval,
+            )
+        except Exception as exc:
+            print(f"[brainstorm] spawn raised {type(exc).__name__}: {exc}")
+            return False
+
+        if result.get("status") != "success":
+            summary = result.get("summary") or "(no summary)"
+            print(f"[brainstorm] agent returned non-success: {summary}")
+            return False
+
+        updates = result.get("state_updates") or {}
+        new_strategy = (updates.get("new_strategy") or "").strip()
+        if not new_strategy:
+            print("[brainstorm] agent returned no new_strategy; halting")
+            return False
+
+        done = list(self.state.get("brainstorm_done_for") or [])
+        if node_id not in done:
+            done.append(node_id)
+        self.state["brainstorm_done_for"] = done
+        self.state["new_strategy"] = new_strategy
+        self.state["node_execution_count"][node_id] = 0
+        retry_counts = self.state.get("retry_counts")
+        if isinstance(retry_counts, dict) and node_id in retry_counts:
+            retry_counts[node_id] = 0
+        self._save_state()
+
+        preview = new_strategy if len(new_strategy) <= 200 else new_strategy[:200] + "…"
+        print(f"[brainstorm] recorded new_strategy: {preview}")
+        print("[brainstorm] exec_count reset to 0; resuming workflow")
+        return True
 
     def _apply_result_and_transition(self, node_id, node, result, ts_start, ts_end,
                                      agent_id, exec_mode, completion_signal, event, attempt):
