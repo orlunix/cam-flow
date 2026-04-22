@@ -47,6 +47,15 @@ from camflow.engine.dsl import classify_do, load_workflow, validate_workflow
 from camflow.engine.error_classifier import classify_error, retry_mode
 from camflow.engine.escalation import get_escalation_level
 from camflow.engine.methodology_router import select_methodology_label
+from camflow.engine.monitor import (
+    DEFAULT_HEARTBEAT_INTERVAL,
+    EngineLock,
+    HeartbeatThread,
+    heartbeat_path,
+    is_process_alive,
+    is_stale,
+    load_heartbeat,
+)
 from camflow.engine.state import apply_updates, init_state
 from camflow.engine.state_enricher import enrich_state, init_structured_fields
 from camflow.engine.transition import resolve_next
@@ -55,6 +64,10 @@ from camflow.engine.transition import resolve_next
 STATE_FILENAME = "state.json"
 TRACE_FILENAME = "trace.log"
 ENGINE_LOG_FILENAME = "engine.log"
+
+# Terminal-but-resumable statuses: a prior run left state in one of these
+# and the user re-invoked `camflow run` — treat that as an implicit resume.
+RESUMABLE_TERMINAL_STATUSES = ("failed", "interrupted", "engine_error", "aborted")
 
 
 @dataclass
@@ -68,6 +81,7 @@ class EngineConfig:
     force_restart: bool = False
     state_filename: str = STATE_FILENAME
     trace_filename: str = TRACE_FILENAME
+    heartbeat_interval: int = DEFAULT_HEARTBEAT_INTERVAL
 
 
 # ---- Helpers --------------------------------------------------------------
@@ -125,6 +139,8 @@ class Engine:
         self.workflow_started_at = None
         self._interrupted = False
         self._last_prompt = None  # last prompt sent to an agent, for token-counting
+        self._lock = None
+        self._heartbeat = None
 
     # ---- setup -----------------------------------------------------------
 
@@ -211,6 +227,66 @@ class Engine:
         print(f"Walked {len(visited)} node(s). Terminal pc = {pc!r}.")
         return 0
 
+    # ---- crash recovery --------------------------------------------------
+
+    def _check_and_recover(self):
+        """Make ``camflow run`` idempotent by detecting prior-run state.
+
+        Three paths matter for a re-invocation:
+
+          * status == "done" — workflow already completed, nothing to do.
+            Returns the string "already_done" so ``run()`` can short-circuit.
+          * status == "running" with a stale heartbeat + dead pid —
+            the previous engine crashed mid-node; stay at the current pc
+            and continue. The orphan handler (already called later in
+            ``run()``) will reap any dangling agent.
+          * status in RESUMABLE_TERMINAL_STATUSES — previous run failed;
+            flip back to "running" and reset budgets for the current pc
+            so the engine gets a fresh attempt. Matches the semantics of
+            ``camflow resume --retry`` but without the user having to ask.
+
+        Any other status (waiting, etc.) is left alone — the existing
+        "status is not running, nothing to do" guard handles it.
+        """
+        status = self.state.get("status")
+
+        if status == "done":
+            return "already_done"
+
+        if status == "running":
+            hb = load_heartbeat(heartbeat_path(self.project_dir))
+            if hb is None:
+                return None
+            if is_stale(hb) and not is_process_alive(hb.get("pid")):
+                pid = hb.get("pid")
+                print(
+                    f"[recover] previous engine (pid {pid}) died mid-run; "
+                    f"resuming from node {self.state.get('pc')!r}"
+                )
+                return "resumed_crash"
+            # Heartbeat fresh or pid alive — another engine is genuinely
+            # running. The lock acquisition step will reject us.
+            return None
+
+        if status in RESUMABLE_TERMINAL_STATUSES:
+            pc = self.state.get("pc")
+            print(
+                f"[recover] auto-resuming from {pc!r} "
+                f"(previous status: {status})"
+            )
+            self.state["status"] = "running"
+            self.state.pop("error", None)
+            rc = self.state.setdefault("retry_counts", {})
+            if pc in rc:
+                rc[pc] = 0
+            ne = self.state.setdefault("node_execution_count", {})
+            if pc in ne:
+                ne[pc] = 0
+            self._save_state()
+            return "resumed_failed"
+
+        return None
+
     # ---- main loop -------------------------------------------------------
 
     def run(self):
@@ -221,9 +297,35 @@ class Engine:
         if self.config.dry_run:
             return self.dry_run()
 
+        # Crash recovery BEFORE we check status — may flip terminal-but-
+        # resumable statuses back to "running" or short-circuit on "done".
+        recovery = self._check_and_recover()
+        if recovery == "already_done":
+            print(
+                f"Workflow already completed (last_pc={self.state.get('pc')!r}). "
+                "Use `camflow resume --from <node>` to re-run from a specific node."
+            )
+            return self.state
+
         if self.state.get("status") != "running":
             print(f"Workflow status is '{self.state.get('status')}', not running. Nothing to do.")
             return self.state
+
+        # Acquire the engine lock before spawning any agents. If another
+        # engine already holds it, EngineLockError bubbles up to the CLI
+        # which prints it and exits non-zero.
+        self._lock = EngineLock(self.project_dir)
+        self._lock.acquire()
+
+        # Start heartbeat thread AFTER lock acquisition so a rejected
+        # run never overwrites the live engine's heartbeat file.
+        self._heartbeat = HeartbeatThread(
+            self.project_dir,
+            state_getter=lambda: self.state,
+            interval=self.config.heartbeat_interval,
+            workflow_path=os.path.abspath(self.workflow_path),
+        )
+        self._heartbeat.start()
 
         self.workflow_started_at = time.time()
 
@@ -267,6 +369,19 @@ class Engine:
             # belt-and-suspenders, sweep the camc registry for any
             # camflow-* leftovers.
             self._cleanup_on_exit()
+            # Stop heartbeat + release lock LAST so concurrent `camflow
+            # status` invocations see an accurate "engine alive until
+            # cleanup finished" story.
+            try:
+                if self._heartbeat is not None:
+                    self._heartbeat.stop()
+            except Exception:
+                pass
+            try:
+                if self._lock is not None:
+                    self._lock.release()
+            except Exception:
+                pass
 
         print()
         print("=" * 60)
