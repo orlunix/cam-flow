@@ -7,6 +7,12 @@ three cases:
   * ALIVE   — heartbeat fresh, pid exists → engine is running now
   * DEAD    — heartbeat stale and pid missing → engine crashed
   * IDLE    — no heartbeat at all → engine never ran, or cleanly exited
+
+Workflow argument is optional. If not supplied, we look at
+``.camflow/heartbeat.json`` in the project directory (default: cwd)
+and pull the ``workflow_path`` the engine wrote there. That way the
+user can run ``camflow status`` from the project root without having
+to remember which yaml they started.
 """
 
 from __future__ import annotations
@@ -26,6 +32,9 @@ from camflow.engine.monitor import (
     is_stale,
     load_heartbeat,
 )
+
+
+# ---- formatting helpers --------------------------------------------------
 
 
 def _fmt_duration(seconds: float | int | None) -> str:
@@ -59,6 +68,76 @@ def _count_completed(state: dict) -> int:
     return 0
 
 
+def _completed_node_ids(state: dict) -> set[str]:
+    """Pull the set of completed node_ids out of state.completed.
+
+    state.completed is a list of dicts with at least a ``node`` key;
+    we also accept bare strings for robustness.
+    """
+    out: set[str] = set()
+    for entry in state.get("completed") or []:
+        if isinstance(entry, dict):
+            node = entry.get("node")
+            if isinstance(node, str):
+                out.add(node)
+        elif isinstance(entry, str):
+            out.add(entry)
+    return out
+
+
+def _progress_bars(workflow: dict, state: dict, liveness: str) -> list[str]:
+    """Render one line per node in declaration order::
+
+        [done] eval_vexriscv
+        [>>>>] eval_swerv
+        [    ] eval_c910
+
+    The current pc shows the in-progress marker when the engine is
+    ALIVE, a crash marker (``[X]``) when DEAD, and pending otherwise.
+    """
+    if not workflow:
+        return []
+    completed = _completed_node_ids(state)
+    current = state.get("pc")
+    lines = []
+    for node_id in workflow:
+        if node_id in completed:
+            marker = "[done]"
+        elif node_id == current:
+            if liveness == "ALIVE":
+                marker = "[>>>>]"
+            elif liveness == "DEAD":
+                marker = "[XXXX]"
+            else:
+                marker = "[----]"
+        else:
+            marker = "[    ]"
+        lines.append(f"  {marker} {node_id}")
+    return lines
+
+
+# ---- workflow discovery --------------------------------------------------
+
+
+def _discover_workflow(workflow_arg: str | None, project_dir: str) -> str | None:
+    """Resolve the workflow path.
+
+    Explicit arg wins. Otherwise read heartbeat.json or state.json for
+    a stored ``workflow_path``. Returns None if we cannot figure it out;
+    status still works in that case (we just won't know node order).
+    """
+    if workflow_arg:
+        return workflow_arg
+    hb = load_heartbeat(heartbeat_path(project_dir)) or {}
+    if hb.get("workflow_path"):
+        return hb["workflow_path"]
+    # state.json doesn't carry workflow_path today; left here for future.
+    return None
+
+
+# ---- main command --------------------------------------------------------
+
+
 def status_command(args) -> int:
     """Implementation of the subcommand. Returns a shell exit code.
 
@@ -66,33 +145,39 @@ def status_command(args) -> int:
     1 → engine DEAD (crashed) or workflow is in a terminal-error state
     2 → nothing to report (no state at all)
     """
-    workflow_path = args.workflow
-    project_dir = (
-        args.project_dir
-        or os.path.dirname(os.path.abspath(workflow_path))
-        or "."
-    )
+    project_dir = args.project_dir or os.getcwd()
+    workflow_path = _discover_workflow(args.workflow, project_dir)
 
-    if not os.path.isfile(workflow_path):
-        print(f"ERROR: workflow file not found: {workflow_path}", file=sys.stderr)
-        return 1
+    # If the workflow arg is what resolved the project dir (old behavior),
+    # fall back to the workflow's own directory when no explicit project_dir.
+    if args.workflow and not args.project_dir:
+        project_dir = os.path.dirname(os.path.abspath(args.workflow)) or "."
+        workflow_path = args.workflow
 
-    try:
-        workflow = load_workflow(workflow_path)
-    except Exception as e:
-        print(f"ERROR: failed to load workflow: {e}", file=sys.stderr)
-        return 1
+    workflow = None
+    if workflow_path:
+        if not os.path.isfile(workflow_path):
+            print(
+                f"ERROR: workflow file not found: {workflow_path}",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            workflow = load_workflow(workflow_path)
+        except Exception as e:
+            print(f"ERROR: failed to load workflow: {e}", file=sys.stderr)
+            return 1
 
     state_path = os.path.join(project_dir, ".camflow", "state.json")
     state = load_state(state_path) or {}
     if not state:
-        print(f"Workflow: {workflow_path}")
+        print(f"Workflow: {workflow_path or '(unknown)'}")
         print("State:    none (workflow has not been run)")
         return 2
 
     heartbeat = load_heartbeat(heartbeat_path(project_dir))
     pid = heartbeat.get("pid") if heartbeat else None
-    heartbeat_age_str, heartbeat_age_s = _fmt_age(
+    heartbeat_age_str, _ = _fmt_age(
         heartbeat.get("timestamp") if heartbeat else None
     )
 
@@ -112,7 +197,8 @@ def status_command(args) -> int:
     completed_count = _count_completed(state)
     total_nodes = len(workflow) if workflow else 0
 
-    print(f"Workflow: {workflow_path}")
+    print(f"Workflow: {workflow_path or '(unknown)'}")
+
     if liveness == "ALIVE":
         print(f"Engine:   ALIVE (pid {pid}, heartbeat {heartbeat_age_str})")
     elif liveness == "DEAD":
@@ -124,48 +210,62 @@ def status_command(args) -> int:
     else:
         print(f"Engine:   IDLE (no active heartbeat; workflow status={workflow_status!r})")
 
-    iter_hint = ""
-    if heartbeat and heartbeat.get("iteration") is not None:
-        iter_hint = f" (iteration {heartbeat['iteration']})"
+    # Node line — carries iteration + attempt so the user can see if
+    # the engine is stuck re-running the same node.
+    iteration = (heartbeat or {}).get("iteration")
+    if iteration is None:
+        iteration = state.get("iteration")
+    retry_counts = state.get("retry_counts") or {}
+    attempt = (retry_counts.get(pc) or 0) + 1
+    node_suffix_parts = []
+    if iteration is not None:
+        node_suffix_parts.append(f"iteration {iteration}")
+    node_suffix_parts.append(f"attempt {attempt}")
+    node_suffix = " (" + ", ".join(node_suffix_parts) + ")"
     if liveness == "DEAD":
-        print(f"Node:     {pc} (was in progress){iter_hint}")
+        print(f"Node:     {pc}{node_suffix} — was in progress")
     else:
-        print(f"Node:     {pc}{iter_hint}")
+        print(f"Node:     {pc}{node_suffix}")
 
+    # Agent line — include running duration when we know it.
     agent_id = (heartbeat or {}).get("agent_id") or state.get("current_agent_id")
     if agent_id:
-        agent_state = "running" if liveness == "ALIVE" else "orphan (will be reaped on resume)"
-        print(f"Agent:    {agent_id} ({agent_state})")
+        agent_started = (heartbeat or {}).get("agent_started_at") or state.get(
+            "current_node_started_at"
+        )
+        duration_str = ""
+        if agent_started:
+            try:
+                duration_str = f", {_fmt_duration(time.time() - float(agent_started))}"
+            except (TypeError, ValueError):
+                duration_str = ""
+        if liveness == "ALIVE":
+            print(f"Agent:    {agent_id} (running{duration_str})")
+        else:
+            print(f"Agent:    {agent_id} (orphan — will be reaped on resume)")
 
-    print(f"Completed: {completed_count}/{total_nodes} nodes")
-    completed = state.get("completed") or []
-    # Show up to 10 recent completions so the line doesn't explode on
-    # long workflows.
-    for entry in completed[-10:]:
-        if not isinstance(entry, dict):
-            continue
-        node = entry.get("node", "?")
-        action = entry.get("action", "")
-        action_suffix = f": {action}" if action else ""
-        print(f"  - {node}{action_suffix}")
+    # Progress block — bracket visualization for each node.
+    print(f"Progress: {completed_count}/{total_nodes} nodes completed")
+    for line in _progress_bars(workflow or {}, state, liveness):
+        print(line)
 
+    # Uptime comes from the heartbeat's engine-start timestamp.
     uptime = (heartbeat or {}).get("uptime_seconds")
     if uptime is not None:
         print(f"Uptime:   {_fmt_duration(uptime)}")
 
     if liveness == "DEAD":
+        wf_arg = workflow_path or "<workflow.yaml>"
         print(
-            f"Recovery: run `camflow run {workflow_path}` to auto-resume "
-            f"from {pc!r}"
+            f"Recovery: run `camflow resume {wf_arg}` to continue from {pc!r}"
         )
         return 1
 
     if workflow_status in ("failed", "engine_error", "aborted", "interrupted"):
-        # Engine isn't holding a heartbeat (clean exit), but the workflow
-        # ended in a resumable failure — same recovery path.
+        wf_arg = workflow_path or "<workflow.yaml>"
         print(
-            f"Recovery: run `camflow run {workflow_path}` to auto-resume "
-            f"from {pc!r} (prev status: {workflow_status})"
+            f"Recovery: run `camflow resume {wf_arg}` to continue from "
+            f"{pc!r} (prev status: {workflow_status})"
         )
         return 1
 
@@ -181,10 +281,17 @@ def build_parser(subparsers=None):
             "status",
             help="Report engine liveness + workflow progress",
         )
-    p.add_argument("workflow", help="Path to workflow YAML file")
+    # Workflow is now optional — the engine writes workflow_path into
+    # heartbeat.json so `camflow status` without args still works.
+    p.add_argument(
+        "workflow", nargs="?", default=None,
+        help="Path to workflow YAML file (optional; read from heartbeat "
+             "if omitted)",
+    )
     p.add_argument(
         "--project-dir", "-p", default=None,
-        help="Project directory (default: directory of the workflow file)",
+        help="Project directory (default: cwd, or the workflow's directory "
+             "if workflow is given)",
     )
     p.set_defaults(func=status_command)
     if subparsers is None:
