@@ -32,6 +32,7 @@ from camflow.engine.monitor import (
     is_stale,
     load_heartbeat,
 )
+from camflow.engine.watchdog import watchdog_pid_path
 
 
 # ---- formatting helpers --------------------------------------------------
@@ -59,6 +60,16 @@ def _fmt_age(timestamp_iso: str | None) -> tuple[str, int | None]:
         return ("unknown", None)
     age = int(time.time() - ts)
     return (_fmt_duration(age) + " ago", age)
+
+
+def _read_watchdog_pid(project_dir: str) -> int | None:
+    """Return the watchdog's pid from ``.camflow/watchdog.pid``, or None."""
+    try:
+        with open(watchdog_pid_path(project_dir), "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        return int(content) if content else None
+    except (FileNotFoundError, ValueError, OSError):
+        return None
 
 
 def _count_completed(state: dict) -> int:
@@ -209,6 +220,15 @@ def status_command(args) -> int:
         )
     else:
         print(f"Engine:   IDLE (no active heartbeat; workflow status={workflow_status!r})")
+
+    # Watchdog line — either ALIVE (pid x), DEAD (stale pidfile), or OFF.
+    wd_pid = _read_watchdog_pid(project_dir)
+    if wd_pid is None:
+        print("Watchdog: OFF (no .camflow/watchdog.pid)")
+    elif is_process_alive(wd_pid):
+        print(f"Watchdog: ALIVE (pid {wd_pid})")
+    else:
+        print(f"Watchdog: DEAD (pid {wd_pid} not running — stale pidfile)")
 
     # Node line — carries iteration + attempt so the user can see if
     # the engine is stuck re-running the same node.

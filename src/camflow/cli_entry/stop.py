@@ -37,6 +37,10 @@ from camflow.engine.monitor import (
     load_heartbeat,
     lock_path,
 )
+from camflow.engine.watchdog import (
+    watchdog_lock_path,
+    watchdog_pid_path,
+)
 
 
 ENGINE_PIDFILE = "engine.pid"
@@ -95,6 +99,8 @@ def _cleanup_leftover_files(project_dir: str) -> None:
         lock_path(project_dir),
         heartbeat_path(project_dir),
         os.path.join(project_dir, ".camflow", ENGINE_PIDFILE),
+        watchdog_lock_path(project_dir),
+        watchdog_pid_path(project_dir),
     ]
     for path in candidates:
         try:
@@ -103,8 +109,40 @@ def _cleanup_leftover_files(project_dir: str) -> None:
             pass
 
 
+def _read_watchdog_pid(project_dir: str) -> int | None:
+    path = watchdog_pid_path(project_dir)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        return int(content) if content else None
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+
+
+def _stop_watchdog(project_dir: str, timeout: int) -> None:
+    """Signal the sibling watchdog BEFORE the engine so it doesn't
+    trigger a restart of the engine we're about to stop.
+
+    Best-effort: if the watchdog is already gone, move on.
+    """
+    pid = _read_watchdog_pid(project_dir)
+    if pid is None or not is_process_alive(pid):
+        return
+    print(f"Stopping watchdog pid {pid} first...")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    _wait_for_exit(pid, timeout)
+
+
 def stop_command(args) -> int:
     project_dir = _resolve_project_dir(args.project_dir)
+
+    # Always stop the watchdog first (if any) so it doesn't observe
+    # the engine dying and trigger a restart behind our back.
+    _stop_watchdog(project_dir, args.timeout)
+
     pid, source = _find_engine_pid(project_dir)
 
     if pid is None:

@@ -45,6 +45,7 @@ import sys
 
 from camflow.backend.cam.engine import Engine, EngineConfig
 from camflow.backend.persistence import load_state, save_state_atomic
+from camflow.cli_entry.daemon import daemonize_engine, spawn_watchdog
 from camflow.engine.dsl import load_workflow
 
 
@@ -195,6 +196,21 @@ def resume_command(args) -> int:
         )
         return 0
 
+    if getattr(args, "daemon", False):
+        parent = daemonize_engine(project_dir)
+        if parent:
+            # Spawn watchdog for the resumed engine too. If a watchdog is
+            # already running (common case: watchdog itself invoked this
+            # resume), the new one will fail to acquire the lock and
+            # exit harmlessly.
+            if not getattr(args, "no_watchdog", False):
+                spawn_watchdog(
+                    args.workflow, project_dir,
+                    max_restarts=getattr(args, "watchdog_max_restarts", None),
+                )
+            return 0
+        # Child falls through as the daemonized engine.
+
     cfg = EngineConfig(
         poll_interval=args.poll_interval,
         node_timeout=args.node_timeout,
@@ -245,6 +261,19 @@ def build_parser(subparsers=None):
     resume.add_argument("--workflow-timeout", type=int, default=3600)
     resume.add_argument("--max-retries", type=int, default=3)
     resume.add_argument("--max-node-executions", type=int, default=10)
+    resume.add_argument(
+        "--daemon", action="store_true",
+        help="Fork the resumed engine to the background (same as "
+             "`camflow run --daemon`). Also spawns a sibling watchdog.",
+    )
+    resume.add_argument(
+        "--no-watchdog", action="store_true",
+        help="Skip the sibling watchdog on --daemon resumes.",
+    )
+    resume.add_argument(
+        "--watchdog-max-restarts", type=int, default=None,
+        help="Override the watchdog's max-restarts budget.",
+    )
     resume.set_defaults(func=resume_command)
 
     if subparsers is None:

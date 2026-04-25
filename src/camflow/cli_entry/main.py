@@ -4,10 +4,12 @@ Usage modes (the first positional argument decides the mode):
 
     camflow <workflow.yaml> [flags]         # run a workflow (default)
     camflow run <workflow.yaml> [flags]     # explicit form of the default
-    camflow run --daemon <workflow.yaml>    # run in the background
+    camflow run --daemon <workflow.yaml>    # run in the background (+ watchdog)
+    camflow run --daemon --no-watchdog ...  # daemon engine, no watchdog
     camflow resume <workflow.yaml> [flags]  # resume a stopped/failed workflow
     camflow stop [--force]                  # signal a running engine to exit
     camflow status [workflow.yaml]          # report engine liveness + progress
+    camflow watchdog <workflow.yaml>        # run the watchdog loop manually
     camflow plan "<request>" [flags]        # generate workflow.yaml from NL
     camflow scout --type ... --query ...    # read-only scout for the planner
     camflow evolve report <dir> [--json]    # trace-based eval reports
@@ -24,6 +26,7 @@ import os
 import sys
 
 from camflow.backend.cam.engine import Engine, EngineConfig
+from camflow.cli_entry.daemon import daemonize_engine, spawn_watchdog
 from camflow.cli_entry.evolve import build_parser as build_evolve_parser
 from camflow.cli_entry.plan import build_parser as build_plan_parser
 from camflow.cli_entry.resume import build_parser as build_resume_parser
@@ -34,12 +37,15 @@ from camflow.cli_entry.stop import build_parser as build_stop_parser
 from camflow.cli_entry.stop import stop_command
 from camflow.engine.dsl import load_workflow, validate_workflow
 from camflow.engine.monitor import EngineLockError
+from camflow.engine.watchdog import build_parser as build_watchdog_parser
+from camflow.engine.watchdog import watchdog_command
 
 
 RUN_FLAGS = {  # subset so we can help-dispatch cleanly
     "--project-dir", "-p", "--validate", "--dry-run",
     "--force-restart", "--poll-interval", "--node-timeout",
     "--workflow-timeout", "--max-retries", "--max-node-executions",
+    "--no-watchdog", "--watchdog-max-restarts",
 }
 
 
@@ -69,56 +75,17 @@ def _build_run_parser():
         help="Fork to background; redirect stdout/stderr to "
              ".camflow/engine.log and write PID to .camflow/engine.pid.",
     )
-    return parser
-
-
-def _daemonize(project_dir):
-    """Detach the current process to run in the background.
-
-    Minimal POSIX double-fork. Parent exits (0) after printing the
-    child's pid; child becomes session leader, closes stdio, and
-    redirects stdout/stderr to ``.camflow/engine.log``. Parent returns
-    True so the caller can exit; child returns False and keeps running.
-    """
-    camflow_dir = os.path.join(project_dir, ".camflow")
-    os.makedirs(camflow_dir, exist_ok=True)
-    log_path = os.path.join(camflow_dir, "engine.log")
-    pid_path = os.path.join(camflow_dir, "engine.pid")
-
-    pid = os.fork()
-    if pid > 0:
-        # Original parent — print child pid, let it go.
-        print(f"camflow daemon started (pid {pid}); logs at {log_path}")
-        return True
-
-    # First child: detach from controlling terminal.
-    os.setsid()
-    pid = os.fork()
-    if pid > 0:
-        # Intermediate parent exits; prevents re-acquiring a TTY.
-        os._exit(0)
-
-    # Grandchild: the actual daemon.
-    os.chdir(project_dir)
-    with open(pid_path, "w", encoding="utf-8") as f:
-        f.write(str(os.getpid()))
-
-    # Redirect stdio. Keep stdout/stderr pointed at engine.log so a
-    # crash message still lands somewhere readable.
-    sys.stdout.flush()
-    sys.stderr.flush()
-    devnull = os.open(os.devnull, os.O_RDONLY)
-    os.dup2(devnull, 0)
-    os.close(devnull)
-    log_fd = os.open(
-        log_path,
-        os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-        0o644,
+    parser.add_argument(
+        "--no-watchdog", action="store_true",
+        help="Skip spawning the sibling watchdog process that auto-restarts "
+             "the engine on silent crash. Only meaningful with --daemon.",
     )
-    os.dup2(log_fd, 1)
-    os.dup2(log_fd, 2)
-    os.close(log_fd)
-    return False
+    parser.add_argument(
+        "--watchdog-max-restarts", type=int, default=None,
+        help="Max auto-restarts the watchdog will attempt before giving up "
+             "(default: watchdog's own default, currently 3).",
+    )
+    return parser
 
 
 def _run_workflow(argv):
@@ -141,8 +108,16 @@ def _run_workflow(argv):
         if args.dry_run:
             print("ERROR: --daemon is incompatible with --dry-run", file=sys.stderr)
             return 1
-        parent = _daemonize(project_dir)
+        parent = daemonize_engine(project_dir)
         if parent:
+            # Spawn the sibling watchdog so an engine crash auto-recovers.
+            # Must happen in the original parent — the engine daemon has
+            # already detached, and the grandchild is the engine itself.
+            if not args.no_watchdog:
+                spawn_watchdog(
+                    args.workflow, project_dir,
+                    max_restarts=args.watchdog_max_restarts,
+                )
             return 0
         # Fall through as the daemonized child.
 
@@ -215,6 +190,12 @@ def _run_stop(argv):
     return stop_command(args)
 
 
+def _run_watchdog(argv):
+    parser = build_watchdog_parser(None)
+    args = parser.parse_args(argv)
+    return watchdog_command(args)
+
+
 def _print_top_help():
     print(__doc__.strip())
     print(
@@ -243,6 +224,8 @@ def main():
         rc = _run_status(argv[1:])
     elif argv[0] == "stop":
         rc = _run_stop(argv[1:])
+    elif argv[0] == "watchdog":
+        rc = _run_watchdog(argv[1:])
     elif argv[0] == "run":
         # Explicit `run` is a synonym for the default positional-path
         # mode — same parser, same flags, argv[1] is the workflow.
