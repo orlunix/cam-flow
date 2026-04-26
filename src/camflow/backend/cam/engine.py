@@ -61,6 +61,15 @@ from camflow.engine.state import apply_updates, init_state
 from camflow.engine.state_enricher import enrich_state, init_structured_fields
 from camflow.engine.transition import resolve_next
 from camflow.registry import on_agent_finalized, on_agent_spawned
+from camflow.steward import (
+    emit_flow_started,
+    emit_flow_terminal,
+    emit_node_done,
+    emit_node_failed,
+    emit_node_started,
+    is_steward_alive,
+    spawn_steward,
+)
 
 
 STATE_FILENAME = "state.json"
@@ -90,6 +99,11 @@ class EngineConfig:
     # here (instead of at the CLI) keeps the lock acquisition and the
     # wipe atomic — no other engine can sneak in between them.
     reset: bool = False
+    # `no_steward=True` skips the project-scoped Steward agent: no
+    # spawn, no events, no chat. Engine + watchdog behave exactly as
+    # they did before the Steward existed — used for `camflow run
+    # --no-steward` and for tests.
+    no_steward: bool = False
 
 
 # ---- Helpers --------------------------------------------------------------
@@ -179,6 +193,104 @@ class Engine:
             if exc is not None:
                 f.write(traceback.format_exc())
                 f.write("\n")
+
+    def _ensure_steward(self):
+        """Spawn or reattach the project-scoped Steward.
+
+        Called once during ``run()`` after the engine.lock is held but
+        before the main loop starts. Steward is project-scoped, so a
+        live one from a previous flow is reused; only a missing /
+        dead one triggers a spawn. ``--no-steward`` short-circuits the
+        whole thing.
+
+        Failures are logged and swallowed: a Steward problem must
+        never prevent the engine from running.
+        """
+        if self.config.no_steward:
+            return None
+        try:
+            if is_steward_alive(self.project_dir):
+                return None  # reattach via subsequent emit() calls
+            spawn_steward(
+                self.project_dir,
+                workflow_path=self.workflow_path,
+                spawned_by=f"engine ({self.state.get('flow_id', 'unknown')})",
+            )
+        except Exception as e:
+            self._log_engine_error("steward spawn/reattach failed", e)
+            # Engine continues; events will be mirrored to disk and
+            # trace, but no live recipient is needed for correctness.
+        return None
+
+    def _emit_steward_node_started(self, node_id, attempt):
+        if self.config.no_steward:
+            return
+        try:
+            emit_node_started(
+                self.project_dir,
+                flow_id=self.state.get("flow_id"),
+                step=self.step,
+                node=node_id,
+                attempt=attempt,
+                agent_id=self.state.get("current_agent_id"),
+            )
+        except Exception as e:
+            self._log_engine_error("steward emit_node_started failed", e)
+
+    def _emit_steward_node_finished(self, node_id, result, agent_id):
+        if self.config.no_steward:
+            return
+        try:
+            status = (result or {}).get("status")
+            summary = (result or {}).get("summary") or ""
+            if status == "success":
+                emit_node_done(
+                    self.project_dir,
+                    flow_id=self.state.get("flow_id"),
+                    step=self.step,
+                    node=node_id,
+                    summary=summary,
+                    agent_id=agent_id,
+                )
+            else:
+                emit_node_failed(
+                    self.project_dir,
+                    flow_id=self.state.get("flow_id"),
+                    step=self.step,
+                    node=node_id,
+                    summary=summary,
+                    error=(result or {}).get("error") or {},
+                    agent_id=agent_id,
+                )
+        except Exception as e:
+            self._log_engine_error("steward emit_node_finished failed", e)
+
+    def _emit_steward_flow_started(self):
+        if self.config.no_steward:
+            return
+        try:
+            emit_flow_started(
+                self.project_dir,
+                flow_id=self.state.get("flow_id"),
+                workflow_path=os.path.abspath(self.workflow_path),
+            )
+        except Exception as e:
+            self._log_engine_error("steward emit_flow_started failed", e)
+
+    def _emit_steward_flow_terminal(self):
+        if self.config.no_steward:
+            return
+        try:
+            emit_flow_terminal(
+                self.project_dir,
+                flow_id=self.state.get("flow_id"),
+                final={
+                    "status": self.state.get("status"),
+                    "pc": self.state.get("pc"),
+                },
+            )
+        except Exception as e:
+            self._log_engine_error("steward emit_flow_terminal failed", e)
 
     def _load_workflow(self):
         self.workflow = load_workflow(self.workflow_path)
@@ -375,6 +487,13 @@ class Engine:
         )
         self._heartbeat.start()
 
+        # Spawn the project-scoped Steward (or reattach an existing
+        # one). Project-scoped → outlives single flows; idempotent on
+        # subsequent runs in the same project. Skipped under
+        # --no-steward.
+        self._ensure_steward()
+        self._emit_steward_flow_started()
+
         self.workflow_started_at = time.time()
 
         try:
@@ -411,6 +530,11 @@ class Engine:
                 self._save_state()
                 raise
         finally:
+            # Tell Steward the flow is over BEFORE cleanup. Steward
+            # itself stays alive (project-scoped); it just transitions
+            # to "no active flow" mode after writing its final summary.
+            self._emit_steward_flow_terminal()
+
             # ALWAYS clean up agents on exit — success, failure, signal,
             # uncaught exception, anything. Two passes: (1) explicitly
             # stop+rm the current agent if state still names one; (2)
@@ -572,11 +696,20 @@ class Engine:
             self.config.max_retries, _infer_exec_mode(node), 0,
         ))
 
+        # Tell the Steward we're starting this node — best-effort.
+        self._emit_steward_node_started(node_id, attempt)
+
         ts_start = time.time()
         result, agent_id, completion_signal = self._run_node(
             node_id, node, attempt=attempt, is_retry=is_retry,
         )
         ts_end = time.time()
+
+        # Tell the Steward how the node finished. We emit BEFORE the
+        # transition resolver runs; the Steward sees the raw result,
+        # not the engine's routing decision (which lands in trace.log
+        # as a `step` entry).
+        self._emit_steward_node_finished(node_id, result, agent_id)
 
         return self._apply_result_and_transition(
             node_id, node, result,

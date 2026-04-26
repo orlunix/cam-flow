@@ -86,6 +86,11 @@ def _build_run_parser():
         help="Max auto-restarts the watchdog will attempt before giving up "
              "(default: watchdog's own default, currently 3).",
     )
+    parser.add_argument(
+        "--no-steward", action="store_true",
+        help="Skip the project-scoped Steward agent. Engine + watchdog "
+             "behave exactly as they did before the Steward existed.",
+    )
     return parser
 
 
@@ -130,6 +135,7 @@ def _run_workflow(argv):
         max_node_executions=args.max_node_executions,
         dry_run=args.dry_run,
         force_restart=args.force_restart,
+        no_steward=getattr(args, "no_steward", False),
         # `camflow run` always starts fresh. `--dry-run` is inherently
         # non-mutating so we leave it alone.
         reset=not args.dry_run,
