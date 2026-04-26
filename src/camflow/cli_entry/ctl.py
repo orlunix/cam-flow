@@ -357,10 +357,8 @@ def _load_verb_registrations() -> None:
     Add new verb modules to the list below. Try/except keeps the CLI
     usable when an individual module is removed during refactors.
     """
-    # Phase A: read-only verbs are added in a follow-up commit (A5).
-    # When that lands, replace this list.
     modules_to_load: list[str] = [
-        # "camflow.cli_entry.ctl_read",
+        "camflow.cli_entry.ctl_read",
     ]
     for mod in modules_to_load:
         try:
