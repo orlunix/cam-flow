@@ -562,10 +562,17 @@ class Engine:
         return self.state
 
     def _cleanup_on_exit(self):
-        """Last-resort agent cleanup. Best-effort; never raises."""
+        """Last-resort agent cleanup. Best-effort; never raises.
+
+        Scoped to workers of THIS flow via the project agent registry —
+        a Steward (project-scoped) is never killed here, and unrelated
+        agents on the same host (sibling dev agents, other camflow
+        runs) are not touched even if their tmux session name shares
+        the ``camflow-`` prefix.
+        """
         from camflow.backend.cam.agent_runner import (
             _cleanup_agent,
-            cleanup_all_camflow_agents,
+            cleanup_workers_of_flow,
         )
 
         try:
@@ -580,12 +587,10 @@ class Engine:
         except Exception:
             pass
 
-        # Belt and suspenders: any camflow-* agent in the registry,
-        # remove it. If the engine is sharing the host with another
-        # engine instance this is overly aggressive — but the alternative
-        # (leaks) has been worse in practice (6 dead agents observed).
         try:
-            cleanup_all_camflow_agents()
+            cleanup_workers_of_flow(
+                self.project_dir, self.state.get("flow_id"),
+            )
         except Exception:
             pass
 
@@ -801,14 +806,15 @@ class Engine:
         # we refactor: use low-level start/finalize for explicit state save.
         from camflow.backend.cam.agent_runner import (
             _wait_for_result,
+            cleanup_workers_of_flow,
             finalize_agent,
-            kill_existing_camflow_agents,
             start_agent,
         )
 
-        # Defense in depth: kill any lingering camflow-* agent from a
-        # crashed previous run so we never accumulate. Cheap idempotent op.
-        kill_existing_camflow_agents()
+        # Defense in depth: clean up any alive worker from THIS flow
+        # left behind by a crashed prior step. Registry-scoped — never
+        # touches Stewards or unrelated host agents.
+        cleanup_workers_of_flow(self.project_dir, self.state.get("flow_id"))
 
         allowed_tools = node.get("allowed_tools") if isinstance(node, dict) else None
         try:

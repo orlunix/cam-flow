@@ -139,40 +139,59 @@ def _list_camflow_agent_ids():
     return [aid for aid in out if aid]
 
 
-def cleanup_all_camflow_agents():
-    """Belt-and-suspenders: remove every camflow-* agent from camc.
+def cleanup_workers_of_flow(project_dir, flow_id):
+    """Cleanup alive worker agents belonging to one flow of one project.
 
-    Called from the engine's finally block at end-of-run so we never
-    leak agents even if the per-node cleanup path was bypassed (engine
-    crash, signal interrupt, missed except branch).
+    Source of truth: ``.camflow/agents.json``. Stewards (``role=steward``)
+    are NEVER touched — they are project-scoped and only die by explicit
+    human action (``camflow steward kill`` / ``camc rm``). Agents that
+    are not in this project's registry are also never touched, even if
+    their tmux session name happens to start with ``camflow-`` (this is
+    the bug that previously self-killed a parent ``camflow-dev`` agent).
+
+    Args:
+        project_dir: project directory containing ``.camflow/agents.json``.
+        flow_id: only kill workers whose ``flow_id`` matches this value.
+                 Pass ``None`` to skip cleanup entirely (defensive default
+                 for "no scope known").
     """
-    for aid in _list_camflow_agent_ids():
-        try:
-            subprocess.run(
-                [CAMC_BIN, "rm", aid, "--kill"],
-                capture_output=True, text=True, timeout=10,
-            )
-        except Exception:
-            pass
+    if not project_dir or not flow_id:
+        return
+    try:
+        from camflow.registry import list_agents
+        workers = list_agents(project_dir, role="worker")
+    except Exception:
+        return
+
+    for agent in workers:
+        if agent.get("flow_id") != flow_id:
+            continue
+        if agent.get("status") != "alive":
+            continue
+        aid = agent.get("id")
+        if aid:
+            _cleanup_agent(aid)
+
+
+def cleanup_all_camflow_agents():
+    """DEPRECATED — kept as a no-op for tests that monkey-patch it.
+
+    The original implementation killed every ``camflow-*`` agent on
+    the host, which once self-killed a parent ``camflow-dev`` agent
+    that happened to share the name prefix. Engine now uses
+    :func:`cleanup_workers_of_flow` which is registry-scoped.
+    """
+    return None
 
 
 def kill_existing_camflow_agents(except_id=None):
-    """Pre-start cleanup: kill any lingering camflow-* agents before launching a new one.
+    """DEPRECATED — kept as a no-op for tests that monkey-patch it.
 
-    Defense in depth: if a previous run leaked an agent (or the user
-    started two engines), this prevents accumulation. Pass `except_id`
-    to keep the orphan you're about to adopt.
+    Same rationale as :func:`cleanup_all_camflow_agents`. Engine no
+    longer calls this; pre-start cleanup uses
+    :func:`cleanup_workers_of_flow` instead.
     """
-    for aid in _list_camflow_agent_ids():
-        if except_id and aid == except_id:
-            continue
-        try:
-            subprocess.run(
-                [CAMC_BIN, "rm", aid, "--kill"],
-                capture_output=True, text=True, timeout=10,
-            )
-        except Exception:
-            pass
+    return None
 
 
 def _send_key(agent_id, key):
