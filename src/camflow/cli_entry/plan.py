@@ -2,6 +2,13 @@
 
 Generates a workflow.yaml from a natural-language request and writes it
 to disk. Prints an ASCII graph and any quality warnings.
+
+By default since Phase A, planning runs as an **agent** (a camc-spawned
+Claude Code session that explores the project, drafts the yaml,
+self-validates, iterates). The legacy single-shot LLM Planner remains
+available for one release cycle behind ``--legacy`` so we can compare
+behaviour and roll back without a code change if the agent path
+misbehaves on a real workflow.
 """
 
 from __future__ import annotations
@@ -13,6 +20,10 @@ import sys
 
 import yaml
 
+from camflow.planner.agent_planner import (
+    PlannerAgentError,
+    generate_workflow_via_agent,
+)
 from camflow.planner.planner import (
     ascii_graph,
     generate_workflow,
@@ -68,21 +79,96 @@ def _resolve_claude_md(arg):
 
 
 def plan_command(args):
+    if args.legacy:
+        return _plan_legacy(args)
+    return _plan_via_agent(args)
+
+
+def _plan_via_agent(args):
+    """Default since Phase A: spawn a Planner agent and let it drive
+    its own explore / draft / validate loop. The agent writes
+    ``.camflow/workflow.yaml`` and ``.camflow/plan-rationale.md``.
+    """
+    project_dir = os.path.abspath(args.project_dir or os.getcwd())
+    print(
+        "[plan] spawning Planner agent (this typically takes 30s-2m)...",
+        file=sys.stderr,
+    )
+    try:
+        result = generate_workflow_via_agent(
+            args.request,
+            project_dir=project_dir,
+            timeout_seconds=args.timeout,
+        )
+    except PlannerAgentError as exc:
+        print(f"ERROR: Planner agent failed: {exc}", file=sys.stderr)
+        print(
+            "Fall back to the legacy single-shot Planner with "
+            "`camflow plan --legacy`.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        f"[plan] Planner {result.agent_id} finished in "
+        f"{result.duration_s:.1f}s",
+        file=sys.stderr,
+    )
+    print(f"[plan] workflow:  {result.workflow_path}", file=sys.stderr)
+    if result.rationale_path:
+        print(
+            f"[plan] rationale: {result.rationale_path}",
+            file=sys.stderr,
+        )
+    if result.warnings:
+        print("", file=sys.stderr)
+        print("Plan-quality warnings:", file=sys.stderr)
+        for w in result.warnings:
+            print(f"  - {w}", file=sys.stderr)
+
+    # If the user asked for a custom output path, copy from .camflow/
+    # to it. The agent always writes inside .camflow/ for sandboxing.
+    if args.output and os.path.abspath(args.output) != result.workflow_path:
+        try:
+            with open(result.workflow_path, encoding="utf-8") as src:
+                content = src.read()
+            with open(args.output, "w", encoding="utf-8") as dst:
+                dst.write(content)
+            print(f"[plan] also copied to {args.output}", file=sys.stderr)
+        except OSError as exc:
+            print(
+                f"WARNING: could not copy to {args.output}: {exc}",
+                file=sys.stderr,
+            )
+
+    print("", file=sys.stderr)
+    print("ASCII graph:", file=sys.stderr)
+    print(ascii_graph(result.workflow), file=sys.stderr)
+    return 0
+
+
+def _plan_legacy(args):
+    """Legacy single-shot LLM Planner. Kept available for one release
+    cycle so we can roll back from the agent Planner without a code
+    change. Behaviour identical to pre-Phase-A ``camflow plan``.
+    """
     claude_md = _resolve_claude_md(args.claude_md)
     skills_dir = _resolve_skills_dir(args.skills_dir)
 
     if claude_md:
-        print(f"[plan] using CLAUDE.md: {claude_md}", file=sys.stderr)
+        print(f"[plan --legacy] using CLAUDE.md: {claude_md}", file=sys.stderr)
     if skills_dir:
-        print(f"[plan] using skills dir: {skills_dir}", file=sys.stderr)
+        print(
+            f"[plan --legacy] using skills dir: {skills_dir}", file=sys.stderr,
+        )
 
     scout_reports = _load_scout_reports(args.scout_report)
     if scout_reports:
         print(
-            f"[plan] loaded {len(scout_reports)} scout report(s)",
+            f"[plan --legacy] loaded {len(scout_reports)} scout report(s)",
             file=sys.stderr,
         )
-    print(f"[plan] generating workflow...", file=sys.stderr)
+    print("[plan --legacy] generating workflow...", file=sys.stderr)
 
     try:
         workflow = generate_workflow(
@@ -109,8 +195,6 @@ def plan_command(args):
         )
         return 1
 
-    # Serialize the workflow. yaml.safe_dump with default_flow_style=False
-    # gives block format (readable).
     out = args.output or "workflow.yaml"
     serialized = yaml.safe_dump(
         workflow, default_flow_style=False, sort_keys=False, width=120,
@@ -122,7 +206,7 @@ def plan_command(args):
         print(f"ERROR: could not write {out}: {exc}", file=sys.stderr)
         return 1
 
-    print(f"[plan] wrote {out}", file=sys.stderr)
+    print(f"[plan --legacy] wrote {out}", file=sys.stderr)
     print("", file=sys.stderr)
     print("ASCII graph:", file=sys.stderr)
     print(ascii_graph(workflow), file=sys.stderr)
@@ -156,9 +240,25 @@ def build_parser(subparsers=None):
                             "(default: ~/.claude/agents/)")
     plan.add_argument(
         "--scout-report", action="append", default=[],
-        help="Path to a scout report JSON file produced by `camflow scout`. "
-             "Pass `-` to read one report from stdin. May be repeated; "
+        help="(legacy mode only) Path to a scout report JSON file. Pass "
+             "`-` to read one report from stdin. May be repeated; "
              "capped at MAX_SCOUT_REPORTS (3) entries.",
+    )
+    plan.add_argument(
+        "--legacy", action="store_true",
+        help="Use the pre-Phase-A single-shot LLM Planner (one Claude "
+             "API call, no agent). Kept for one release cycle as a "
+             "fallback while the agent Planner stabilises.",
+    )
+    plan.add_argument(
+        "--project-dir", "-p", default=None,
+        help="Project directory (default: cwd). The agent Planner "
+             "writes to <project>/.camflow/.",
+    )
+    plan.add_argument(
+        "--timeout", type=int, default=180,
+        help="Seconds the agent Planner has to write workflow.yaml "
+             "(default: 180).",
     )
     plan.set_defaults(func=plan_command)
 
