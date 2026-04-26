@@ -321,3 +321,26 @@ def emit_node_failed(
         agent_id=agent_id,
         **kwargs,
     )
+
+
+def emit_engine_resumed(
+    project_dir: str | os.PathLike,
+    *,
+    flow_id: str,
+    pc: str | None = None,
+    resumed_from: str | None = None,
+    **kwargs: Any,
+) -> bool:
+    """Tell the Steward the engine just came back up — either via
+    watchdog auto-restart or explicit ``camflow resume``. Steward
+    uses this to re-orient: the previous "current node" may already
+    be done (orphan adoption) or still in progress.
+    """
+    return emit(
+        project_dir,
+        "engine_resumed",
+        flow_id=flow_id,
+        pc=pc,
+        resumed_from=resumed_from,
+        **kwargs,
+    )

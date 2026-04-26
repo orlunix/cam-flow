@@ -62,6 +62,7 @@ from camflow.engine.state_enricher import enrich_state, init_structured_fields
 from camflow.engine.transition import resolve_next
 from camflow.registry import on_agent_finalized, on_agent_spawned
 from camflow.steward import (
+    emit_engine_resumed,
     emit_flow_started,
     emit_flow_terminal,
     emit_node_done,
@@ -292,6 +293,24 @@ class Engine:
         except Exception as e:
             self._log_engine_error("steward emit_flow_terminal failed", e)
 
+    def _emit_steward_engine_resumed(self, resumed_from: str):
+        """Emitted right after the Steward is reattached on a resumed
+        engine startup. Helps the Steward distinguish "fresh flow" from
+        "engine came back up" so it can re-orient instead of repeating
+        flow_started narration.
+        """
+        if self.config.no_steward:
+            return
+        try:
+            emit_engine_resumed(
+                self.project_dir,
+                flow_id=self.state.get("flow_id"),
+                pc=self.state.get("pc"),
+                resumed_from=resumed_from,
+            )
+        except Exception as e:
+            self._log_engine_error("steward emit_engine_resumed failed", e)
+
     def _load_workflow(self):
         self.workflow = load_workflow(self.workflow_path)
         valid, errors = validate_workflow(self.workflow)
@@ -493,6 +512,16 @@ class Engine:
         # --no-steward.
         self._ensure_steward()
         self._emit_steward_flow_started()
+
+        # On resume (config.reset=False), additionally tell the
+        # Steward the engine just came back up so it can distinguish
+        # "fresh flow" from "engine restarted, same flow". Project-
+        # scoped Stewards see this when the watchdog rebooted us or
+        # the user ran `camflow resume`.
+        if not self.config.reset:
+            self._emit_steward_engine_resumed(
+                resumed_from="watchdog_or_explicit_resume",
+            )
 
         self.workflow_started_at = time.time()
 
