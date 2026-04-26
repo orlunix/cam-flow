@@ -31,6 +31,12 @@ from camflow.registry.agents import (
     set_current_steward,
     update_agent_status,
 )
+from camflow.registry.hooks import (
+    on_agent_finalized,
+    on_agent_handoff_archived,
+    on_agent_killed,
+    on_agent_spawned,
+)
 
 __all__ = [
     "REGISTRY_FILE",
@@ -41,6 +47,10 @@ __all__ = [
     "get_current_steward",
     "list_agents",
     "load_registry",
+    "on_agent_finalized",
+    "on_agent_handoff_archived",
+    "on_agent_killed",
+    "on_agent_spawned",
     "register_agent",
     "registry_path",
     "set_current_steward",

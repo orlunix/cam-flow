@@ -15,6 +15,7 @@ from camflow.backend.cam.agent_runner import (
     finalize_agent,
     RESULT_FILE,
 )
+from camflow.registry import get_agent, on_agent_finalized
 
 
 # Classification returned by decide_orphan_action
@@ -64,6 +65,27 @@ def decide_orphan_action(state, project_dir):
     return (ACTION_TREAT_AS_CRASH, agent_id)
 
 
+def _update_registry_if_present(project_dir, agent_id, result, completion_signal):
+    """Best-effort: flip an orphaned agent's registry status to match
+    the synthesized / read result. If the agent isn't in the registry
+    (engine crashed before registering it), do nothing — the registry
+    is observability, not correctness.
+    """
+    try:
+        if get_agent(project_dir, agent_id) is None:
+            return
+        on_agent_finalized(
+            project_dir,
+            agent_id=agent_id,
+            result=result,
+            flow_id=None,  # orphan path doesn't carry flow_id context
+            completion_signal=completion_signal,
+        )
+    except Exception:
+        # Recovery path — never raise; the resume must continue.
+        pass
+
+
 def handle_orphan(action, agent_id, project_dir, timeout, poll_interval):
     """Execute the decided action and return a node result.
 
@@ -84,11 +106,13 @@ def handle_orphan(action, agent_id, project_dir, timeout, poll_interval):
             agent_id, result_path, timeout, poll_interval
         )
         result = finalize_agent(agent_id, completion_signal, project_dir)
+        _update_registry_if_present(project_dir, agent_id, result, completion_signal)
         return (result, completion_signal)
 
     if action == ACTION_ADOPT_RESULT:
         # Result file already exists; read it, clean up agent, return
         result = finalize_agent(agent_id, "file_appeared", project_dir)
+        _update_registry_if_present(project_dir, agent_id, result, "adopted_result")
         return (result, "adopted_result")
 
     if action == ACTION_TREAT_AS_CRASH:
@@ -102,6 +126,7 @@ def handle_orphan(action, agent_id, project_dir, timeout, poll_interval):
         # Clean up stale agent if it's still lingering
         from camflow.backend.cam.agent_runner import _cleanup_agent
         _cleanup_agent(agent_id)
+        _update_registry_if_present(project_dir, agent_id, result, "adopted_crash")
         return (result, "adopted_crash")
 
     raise ValueError(f"unknown action: {action}")

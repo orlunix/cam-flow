@@ -16,6 +16,7 @@ Responsibilities (from docs/cam-phase-plan.md):
 
 import copy
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -59,6 +60,7 @@ from camflow.engine.monitor import (
 from camflow.engine.state import apply_updates, init_state
 from camflow.engine.state_enricher import enrich_state, init_structured_fields
 from camflow.engine.transition import resolve_next
+from camflow.registry import on_agent_finalized, on_agent_spawned
 
 
 STATE_FILENAME = "state.json"
@@ -99,9 +101,14 @@ def _init_runtime_state(state):
     Also initializes the six-section structured fields via
     init_structured_fields so enrich_state can work against a consistent
     shape from step one.
+
+    ``flow_id`` is generated once per fresh run; ``camflow resume``
+    preserves it (state is loaded, not re-init'd) so registry and trace
+    correlations survive engine restarts.
     """
     state.setdefault("node_execution_count", {})
     state.setdefault("current_agent_id", None)
+    state.setdefault("flow_id", f"flow_{secrets.token_hex(4)}")
     init_structured_fields(state)
     return state
 
@@ -692,11 +699,51 @@ class Engine:
         self.state["current_node_started_at"] = time.time()
         self._save_state()
 
+        # Register the worker in the project agent registry and emit
+        # `agent_spawned` to trace.log. Failures here must not crash
+        # the engine — registry is observability, not correctness.
+        try:
+            on_agent_spawned(
+                self.project_dir,
+                role="worker",
+                agent_id=agent_id,
+                spawned_by=f"engine ({self.state['flow_id']} step {self.step})",
+                flow_id=self.state["flow_id"],
+                node_id=node_id,
+                prompt_file=os.path.join(self.project_dir, ".camflow", "node-prompt.txt"),
+            )
+        except Exception as e:
+            self._log_engine_error(
+                f"registry write failed for spawn agent_id={agent_id}", e
+            )
+
         result_path = os.path.join(self.project_dir, RESULT_FILE)
         completion_signal, _ = _wait_for_result(
             agent_id, result_path, per_node_timeout, self.config.poll_interval,
         )
         result = finalize_agent(agent_id, completion_signal, self.project_dir)
+
+        # Flip the registry status (alive → completed/failed) and emit
+        # `agent_completed` / `agent_failed` to trace.log.
+        try:
+            duration_ms = None
+            if self.state.get("current_node_started_at"):
+                duration_ms = int(
+                    (time.time() - self.state["current_node_started_at"]) * 1000
+                )
+            on_agent_finalized(
+                self.project_dir,
+                agent_id=agent_id,
+                result=result,
+                flow_id=self.state["flow_id"],
+                duration_ms=duration_ms,
+                completion_signal=completion_signal,
+                result_file=os.path.join(self.project_dir, ".camflow", "node-result.json"),
+            )
+        except Exception as e:
+            self._log_engine_error(
+                f"registry write failed for finalize agent_id={agent_id}", e
+            )
 
         # Plan-level verify: if the node declares a verify cmd and the
         # agent reported success, run the cmd and downgrade the result to
