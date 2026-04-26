@@ -26,6 +26,7 @@ import os
 import sys
 
 from camflow.backend.cam.engine import Engine, EngineConfig
+from camflow.cli_entry.ctl import ctl_command
 from camflow.cli_entry.daemon import daemonize_engine, spawn_watchdog
 from camflow.cli_entry.evolve import build_parser as build_evolve_parser
 from camflow.cli_entry.plan import build_parser as build_plan_parser
@@ -196,6 +197,10 @@ def _run_watchdog(argv):
     return watchdog_command(args)
 
 
+def _run_ctl(argv):
+    return ctl_command(argv)
+
+
 def _print_top_help():
     print(__doc__.strip())
     print(
@@ -226,6 +231,8 @@ def main():
         rc = _run_stop(argv[1:])
     elif argv[0] == "watchdog":
         rc = _run_watchdog(argv[1:])
+    elif argv[0] == "ctl":
+        rc = _run_ctl(argv[1:])
     elif argv[0] == "run":
         # Explicit `run` is a synonym for the default positional-path
         # mode — same parser, same flags, argv[1] is the workflow.
