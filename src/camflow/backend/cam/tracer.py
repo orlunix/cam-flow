@@ -1,20 +1,52 @@
 """Trace entry builder.
 
-Produces a self-contained dict for one step of engine execution.
-Written to trace.log as one JSONL line per step.
+Produces a self-contained dict for one trace.log line. Two shapes:
 
-Entry schema (see docs/cam-phase-plan.md §7.1 + docs/evaluation.md §2):
-  step, ts_start, ts_end, duration_ms, node_id, do, attempt, is_retry,
+  ``kind="step"`` — one engine step (the original schema; see fields below)
+  ``kind="<event>"`` — agent lifecycle, file ops, control commands, engine
+                       /watchdog/lock events, steward handoff. Schema lives
+                       in ``docs/design-next-phase.md`` §13.
+
+Step-entry schema (see docs/cam-phase-plan.md §7.1 + docs/evaluation.md §2):
+  kind, step, ts_start, ts_end, duration_ms, node_id, do, attempt, is_retry,
   retry_mode, input_state, node_result, output_state, transition,
   agent_id, exec_mode, completion_signal, lesson_added, event,
   # evaluation fields (see docs/evaluation.md):
   prompt_tokens, context_tokens, task_tokens,
   tools_available, tools_used, context_position,
   enricher_enabled, fenced, methodology, escalation_level
+
+Event-entry schema (any non-step kind):
+  kind, ts, actor, flow_id, plus kind-specific fields.
+
+Readers MUST default missing ``kind`` to ``"step"`` for backward compat
+with traces written before this field existed.
 """
 
 import copy
 from datetime import datetime, timezone
+
+
+# Step entries get this; event entries set kind to one of EVENT_KINDS.
+STEP_KIND = "step"
+
+# Closed set of event kinds. Adding one is a design-doc change; do not
+# extend casually. See docs/design-next-phase.md §13.1.
+EVENT_KINDS = frozenset({
+    # agent lifecycle
+    "agent_spawned", "agent_completed", "agent_failed", "agent_killed",
+    # file operations (significant only — see §13.4)
+    "file_written", "file_removed", "file_archived",
+    # control plane
+    "control_command", "control_resolution", "event_emitted",
+    # engine / lock / watchdog
+    "engine_started", "engine_stopped",
+    "lock_acquired", "lock_released", "lock_stolen",
+    "watchdog_action",
+    # steward-specific
+    "compaction_detected", "handoff_completed",
+    "flow_started", "flow_terminal", "flow_idle",
+})
 
 
 def _utc_iso(ts_float):
@@ -76,6 +108,7 @@ def build_trace_entry(
     them for the evaluation framework.
     """
     return {
+        "kind": STEP_KIND,
         "step": step,
         "ts_start": _utc_iso(ts_start),
         "ts_end": _utc_iso(ts_end),
@@ -106,3 +139,48 @@ def build_trace_entry(
         "methodology": methodology,
         "escalation_level": escalation_level,
     }
+
+
+def build_event_entry(kind, actor, flow_id=None, ts=None, **fields):
+    """Build a non-step trace entry (agent lifecycle, file op, control, etc.).
+
+    Inputs:
+      kind     — one of ``EVENT_KINDS`` (raises ``ValueError`` otherwise).
+      actor    — ``"engine"`` / ``"watchdog"`` / ``"user"`` / ``"steward-<id>"``
+                 / ``"planner-<id>"`` / ``"worker-<id>"``.
+      flow_id  — flow context, or ``None`` for project-level events
+                 (e.g. steward handoff).
+      ts       — Unix timestamp; defaults to now.
+      fields   — kind-specific extra fields, merged in verbatim.
+
+    Output: a dict ready for ``append_trace_atomic``.
+    """
+    if kind not in EVENT_KINDS:
+        raise ValueError(
+            f"Unknown event kind {kind!r}; must be one of EVENT_KINDS "
+            f"(see docs/design-next-phase.md §13.1)"
+        )
+    if ts is None:
+        ts = datetime.now(timezone.utc).timestamp()
+    entry = {
+        "kind": kind,
+        "ts": _utc_iso(ts),
+        "actor": actor,
+        "flow_id": flow_id,
+    }
+    # Kind-specific fields override only the four base fields above if
+    # explicitly set; that's intentional — callers occasionally pre-format
+    # ts as ISO. Defensive copy not needed (fields are usually scalars or
+    # short strings; deep-copy on the rare dict caller is the caller's
+    # responsibility).
+    entry.update(fields)
+    return entry
+
+
+def is_step(entry):
+    """True if ``entry`` is a per-step record (the original schema).
+
+    Old entries written before the ``kind`` field existed have no key;
+    treat them as steps for backward compatibility.
+    """
+    return entry.get("kind", STEP_KIND) == STEP_KIND

@@ -127,6 +127,12 @@ def rollup_trace(trace_path):
     total_steps = 0
     last_entry = None
     for entry in _load_trace(trace_path):
+        # Filter to per-step entries. Trace v2 also contains agent
+        # lifecycle, file ops, and control events (kind != "step").
+        # Old entries pre-dating the kind field have no key; those
+        # are steps too.
+        if entry.get("kind", "step") != "step":
+            continue
         total_steps += 1
         last_entry = entry
         node_id = entry.get("node_id", "unknown")
