@@ -47,9 +47,11 @@ def test_resume_continues_from_saved_pc(tmp_path):
     assert final["status"] == "done"
 
     # Trace should only have entries for b and c (a was skipped because state.pc=b)
+    # Filter to per-step entries; trace.log is now tagged-union.
     trace = camflow_dir / "trace.log"
     entries = [json.loads(l) for l in trace.read_text().strip().split("\n")]
-    nodes = [e["node_id"] for e in entries]
+    steps = [e for e in entries if e.get("kind", "step") == "step"]
+    nodes = [e["node_id"] for e in steps]
     assert "a" not in nodes
     assert "b" in nodes
     assert "c" in nodes
@@ -148,7 +150,10 @@ def test_resume_orphan_adopt_result(tmp_path, monkeypatch):
 
     trace = camflow_dir / "trace.log"
     entries = [json.loads(l) for l in trace.read_text().strip().split("\n")]
-    # First entry should be the orphan adoption (event starts with "orphan_")
-    first = entries[0]
+    # First per-step entry should be the orphan adoption.
+    # (trace.log also has agent_spawned / event_emitted / flow_started
+    # entries now; we want the first step record.)
+    steps = [e for e in entries if e.get("kind", "step") == "step"]
+    first = steps[0]
     assert first["node_id"] == "start"
     assert first.get("event", "").startswith("orphan_")

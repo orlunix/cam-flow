@@ -251,9 +251,12 @@ def test_stateless_loop_accumulates_state(tmp_path, monkeypatch):
     assert "iteration" in second_fix_prompt.lower()
 
     # --- Trace is complete ---
+    # Filter to per-step entries; trace.log is now tagged-union and
+    # also carries agent_spawned / event_emitted / flow_started entries.
     trace_path = tmp_path / ".camflow" / "trace.log"
     entries = [json.loads(l) for l in trace_path.read_text().strip().split("\n")]
-    node_seq = [e["node_id"] for e in entries]
+    steps = [e for e in entries if e.get("kind", "step") == "step"]
+    node_seq = [e["node_id"] for e in steps]
     # Canonical: start, fix, test(fail), fix, test(success), done
     assert node_seq[0] == "start"
     assert node_seq[-1] == "done"
