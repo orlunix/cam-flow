@@ -863,10 +863,13 @@ class Engine:
         cleanup_workers_of_flow(self.project_dir, self.state.get("flow_id"))
 
         allowed_tools = node.get("allowed_tools") if isinstance(node, dict) else None
+        flow_id = self.state.get("flow_id")
         try:
             agent_id = start_agent(
                 node_id, prompt, self.project_dir,
                 allowed_tools=allowed_tools,
+                flow_id=flow_id,
+                attempt_n=attempt,
             )
         except RuntimeError as e:
             return (
@@ -906,7 +909,10 @@ class Engine:
         completion_signal, _ = _wait_for_result(
             agent_id, result_path, per_node_timeout, self.config.poll_interval,
         )
-        result = finalize_agent(agent_id, completion_signal, self.project_dir)
+        result = finalize_agent(
+            agent_id, completion_signal, self.project_dir,
+            flow_id=flow_id, node_id=node_id, attempt_n=attempt,
+        )
 
         # Flip the registry status (alive → completed/failed) and emit
         # `agent_completed` / `agent_failed` to trace.log.

@@ -157,8 +157,8 @@ class TestSpawnSteward:
         )
         assert agent_id == "7c2a3f12"
 
-        # Boot pack landed.
-        prompt_file = tmp_path / ".camflow" / "steward-prompt.txt"
+        # Boot pack landed (Phase B: per-agent private dir).
+        prompt_file = tmp_path / ".camflow" / "steward" / "prompt.txt"
         assert prompt_file.exists()
         body = prompt_file.read_text()
         assert "Steward agent" in body

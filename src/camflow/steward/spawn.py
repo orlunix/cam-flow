@@ -31,11 +31,17 @@ from camflow.backend.persistence import load_state, save_state_atomic
 from camflow.registry import on_agent_spawned, set_current_steward
 
 
+# Pointer file lives at the project's .camflow/ root (not in steward/)
+# so it's easy for callers to find without knowing the per-agent layout.
 STEWARD_POINTER_FILE = "steward.json"
-STEWARD_PROMPT_FILE = "steward-prompt.txt"
-STEWARD_HISTORY_FILE = "steward-history.log"
-STEWARD_SUMMARY_FILE = "steward-summary.md"
-STEWARD_ARCHIVE_FILE = "steward-archive.md"
+
+# Phase B: per-agent private directory layout (see camflow.paths).
+# These constants describe the FILE NAMES inside that directory; the
+# directory itself is `.camflow/steward/` per `camflow.paths.steward_dir()`.
+STEWARD_PROMPT_FILE = "prompt.txt"          # was steward-prompt.txt
+STEWARD_HISTORY_FILE = "session.log"        # was steward-history.log
+STEWARD_SUMMARY_FILE = "summary.md"         # was steward-summary.md
+STEWARD_ARCHIVE_FILE = "archive.md"         # was steward-archive.md
 
 
 # ---- subprocess plumbing ------------------------------------------------
@@ -52,6 +58,12 @@ def _resolve_camflow_dir(project_dir: str | os.PathLike) -> Path:
     p = Path(project_dir) / ".camflow"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def _resolve_steward_dir(project_dir: str | os.PathLike) -> Path:
+    """``.camflow/steward/`` — Steward's private directory."""
+    from camflow import paths
+    return paths.steward_dir(project_dir)
 
 
 def _now_iso() -> str:
@@ -277,9 +289,9 @@ def _default_camc_runner(name: str, project_dir: str, prompt: str) -> str:
     """Default subprocess implementation. Replaced in tests via
     the ``camc_runner`` parameter of ``spawn_steward``."""
     short_prompt = (
-        f"Read the file .camflow/{STEWARD_PROMPT_FILE} and follow ALL "
-        f"instructions inside it exactly. The file contains your full "
-        f"role description, tools, and default behavior."
+        f"Read the file .camflow/steward/{STEWARD_PROMPT_FILE} and "
+        f"follow ALL instructions inside it exactly. The file contains "
+        f"your full role description, tools, and default behavior."
     )
     proc = subprocess.run(
         [
@@ -316,22 +328,23 @@ def spawn_steward(
 
     Steps:
       1. Build the boot pack (workflow summary + rationale + role).
-      2. Write it to ``.camflow/steward-prompt.txt``.
+      2. Write it to ``.camflow/steward/prompt.txt`` (Phase B private dir).
       3. ``camc run`` the agent (or the injected ``camc_runner``).
       4. Update the agent registry (``on_agent_spawned``) and the
-         pointer file (``steward.json``).
+         pointer file (``.camflow/steward.json``).
       5. Return the agent id.
 
     Caller must hold the engine.lock (in production) so two engines
     can't race to register two Stewards for the same project.
     """
     pdir = str(Path(project_dir).resolve())
-    camflow_dir = _resolve_camflow_dir(pdir)
+    _resolve_camflow_dir(pdir)               # ensure .camflow/ exists
+    sdir = _resolve_steward_dir(pdir)        # ensure .camflow/steward/ exists
 
     # Boot pack to disk first so a separate inspector can read it before
     # camc has a chance to consume it.
     boot_pack = build_boot_pack(pdir, workflow_path)
-    prompt_path = camflow_dir / STEWARD_PROMPT_FILE
+    prompt_path = sdir / STEWARD_PROMPT_FILE
     prompt_path.write_text(boot_pack, encoding="utf-8")
 
     name = f"{name_prefix}-{_short_id()}"
@@ -355,10 +368,10 @@ def spawn_steward(
         extra={
             "name": name,
             "memory_files": [
-                str(camflow_dir / STEWARD_SUMMARY_FILE),
-                str(camflow_dir / STEWARD_ARCHIVE_FILE),
+                str(sdir / STEWARD_SUMMARY_FILE),
+                str(sdir / STEWARD_ARCHIVE_FILE),
             ],
-            "session_log": str(camflow_dir / STEWARD_HISTORY_FILE),
+            "session_log": str(sdir / STEWARD_HISTORY_FILE),
             "flows_witnessed": [],
         },
     )
@@ -372,8 +385,8 @@ def spawn_steward(
             "spawned_at": _now_iso(),
             "spawned_by": spawned_by,
             "prompt_file": str(prompt_path),
-            "summary_path": str(camflow_dir / STEWARD_SUMMARY_FILE),
-            "archive_path": str(camflow_dir / STEWARD_ARCHIVE_FILE),
+            "summary_path": str(sdir / STEWARD_SUMMARY_FILE),
+            "archive_path": str(sdir / STEWARD_ARCHIVE_FILE),
         },
     )
 

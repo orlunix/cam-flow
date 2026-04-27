@@ -180,7 +180,7 @@ def test_stateless_loop_accumulates_state(tmp_path, monkeypatch):
     def fake_wait(agent_id, result_path, timeout, poll_interval):
         return ("file_appeared", None)
 
-    def fake_finalize(agent_id, completion_signal, project_dir, cleanup=True):
+    def fake_finalize(agent_id, completion_signal, project_dir, cleanup=True, **kw):
         # Determine which node this was from the call log
         entry = agent_call_log[-1]
         node = entry["node"]

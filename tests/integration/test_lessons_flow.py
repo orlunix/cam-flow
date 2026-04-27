@@ -48,7 +48,7 @@ def test_lessons_accumulate_and_inject(tmp_path, monkeypatch):
     def fake_wait(agent_id, result_path, timeout, poll_interval):
         return ("file_appeared", None)
 
-    def fake_finalize(agent_id, completion_signal, project_dir, cleanup=True):
+    def fake_finalize(agent_id, completion_signal, project_dir, cleanup=True, **kw):
         r = results[idx[0]]
         idx[0] += 1
         return r

@@ -38,7 +38,7 @@ class TestAllowedToolsPassedToStartAgent:
 
         captured = {}
 
-        def fake_start(node_id, prompt, project_dir, allowed_tools=None):
+        def fake_start(node_id, prompt, project_dir, allowed_tools=None, **kw):
             captured["node_id"] = node_id
             captured["allowed_tools"] = allowed_tools
             return "agent01"
@@ -46,7 +46,7 @@ class TestAllowedToolsPassedToStartAgent:
         def fake_wait(*a, **kw):
             return ("file_appeared", None)
 
-        def fake_finalize(agent_id, signal, project_dir, cleanup=True):
+        def fake_finalize(agent_id, signal, project_dir, cleanup=True, **kw):
             return {
                 "status": "success",
                 "summary": "did it",
@@ -88,7 +88,7 @@ class TestAllowedToolsPassedToStartAgent:
 
         captured = {}
 
-        def fake_start(node_id, prompt, project_dir, allowed_tools=None):
+        def fake_start(node_id, prompt, project_dir, allowed_tools=None, **kw):
             captured["allowed_tools"] = allowed_tools
             return "agent01"
 

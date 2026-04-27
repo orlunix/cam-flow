@@ -282,12 +282,26 @@ def _wait_for_result(agent_id, result_path, timeout, poll_interval):
 # ---- public API ----------------------------------------------------------
 
 
-def start_agent(node_id, prompt, project_dir, allowed_tools=None):
+def start_agent(
+    node_id, prompt, project_dir, allowed_tools=None,
+    flow_id=None, attempt_n=None,
+):
     """Start a camc agent for a node.
 
-    Writes the prompt to `.camflow/node-prompt.txt` (because tmux paste
-    corrupts long multiline prompts), then runs camc with a short
-    instruction telling the agent to read the file.
+    Phase B: when ``flow_id`` and ``attempt_n`` are provided, the
+    prompt is written to the per-attempt private directory
+    (``.camflow/flows/<flow_id>/nodes/<node_id>/attempts/<n>/prompt.txt``)
+    and the agent is told to Read that path. The agent's tmux cwd is
+    still the project root so it can edit user code.
+
+    Phase A back-compat: when ``flow_id`` / ``attempt_n`` are missing,
+    the legacy ``.camflow/node-prompt.txt`` path is used. This keeps
+    older test code working without modification.
+
+    No matter the path, the worker writes its result to the canonical
+    ``.camflow/node-result.json`` (the long-standing contract).
+    ``finalize_agent`` archives that file into the per-attempt private
+    slot after reading.
 
     Notably: NO --auto-exit flag. The engine owns shutdown via
     cleanup_agent once the result file appears.
@@ -304,19 +318,34 @@ def start_agent(node_id, prompt, project_dir, allowed_tools=None):
     Returns:
         agent_id (str). Raises RuntimeError on launch failure.
     """
+    from camflow import paths
+
     camflow_dir = os.path.join(project_dir, ".camflow")
     os.makedirs(camflow_dir, exist_ok=True)
 
     clear_node_result(project_dir)
 
-    prompt_path = os.path.join(camflow_dir, "node-prompt.txt")
-    with open(prompt_path, "w", encoding="utf-8") as f:
-        f.write(prompt)
+    if flow_id and attempt_n:
+        # Phase B: per-attempt private directory.
+        prompt_path = paths.attempt_dir(
+            project_dir, flow_id, node_id, attempt_n,
+        ) / "prompt.txt"
+        prompt_path.write_text(prompt, encoding="utf-8")
+        prompt_rel = (
+            f".camflow/flows/{flow_id}/nodes/{node_id}/"
+            f"attempts/{attempt_n}/prompt.txt"
+        )
+    else:
+        # Legacy back-compat path.
+        prompt_path = os.path.join(camflow_dir, "node-prompt.txt")
+        with open(prompt_path, "w", encoding="utf-8") as f:
+            f.write(prompt)
+        prompt_rel = ".camflow/node-prompt.txt"
 
     short_prompt = (
-        "Read the file .camflow/node-prompt.txt and follow ALL instructions "
-        "inside it exactly. The file contains your complete task and output "
-        "requirements."
+        f"Read the file {prompt_rel} and follow ALL instructions "
+        "inside it exactly. The file contains your complete task and "
+        "output requirements."
     )
 
     try:
@@ -344,6 +373,15 @@ def start_agent(node_id, prompt, project_dir, allowed_tools=None):
             f"could not parse agent ID from camc output: {proc.stdout[:500]}"
         )
 
+    # Record this attempt's agent id for resume / audit.
+    if flow_id and attempt_n:
+        try:
+            paths.attempt_agent_id_path(
+                project_dir, flow_id, node_id, attempt_n,
+            ).write_text(agent_id, encoding="utf-8")
+        except OSError:
+            pass
+
     # camc pastes the prompt into the TUI input box but doesn't submit it;
     # send Enter once the TUI is ready so the agent actually starts working.
     _kick_prompt(agent_id)
@@ -351,12 +389,21 @@ def start_agent(node_id, prompt, project_dir, allowed_tools=None):
     return agent_id
 
 
-def finalize_agent(agent_id, completion_signal, project_dir, cleanup=True):
+def finalize_agent(
+    agent_id, completion_signal, project_dir, cleanup=True,
+    flow_id=None, node_id=None, attempt_n=None,
+):
     """Read the node result, capture screen on failure, and stop+rm the agent.
 
     The engine ALWAYS owns shutdown — we stop and rm the agent here
     regardless of how completion was reached (file_appeared / agent_gone /
     timeout). Without --auto-exit the agent would sit forever otherwise.
+
+    Phase B: when ``flow_id`` / ``node_id`` / ``attempt_n`` are
+    provided, the result is archived to the per-attempt private slot
+    (``attempts/<n>/result.json``) and — if successful — promoted to
+    the node-level winning slot (``nodes/<node_id>/result.json``) so
+    sibling nodes can read it.
     """
     result_path = os.path.join(project_dir, RESULT_FILE)
     result = read_node_result(project_dir)
@@ -383,6 +430,33 @@ def finalize_agent(agent_id, completion_signal, project_dir, cleanup=True):
             }
         # No status_terminal/status_idle_stable branches anymore — those
         # signals are not produced by _wait_for_result.
+
+    # Phase B: archive the result into the per-attempt private slot
+    # and (on success) promote it to the node-level winning slot so
+    # sibling nodes can Read it directly.
+    if flow_id and node_id and attempt_n:
+        from camflow import paths
+        try:
+            attempt_path = paths.attempt_result_path(
+                project_dir, flow_id, node_id, attempt_n,
+            )
+            attempt_path.write_text(
+                json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        if (result or {}).get("status") == "success":
+            try:
+                winning = paths.node_winning_result_path(
+                    project_dir, flow_id, node_id,
+                )
+                winning.write_text(
+                    json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
 
     if cleanup:
         _cleanup_agent(agent_id)

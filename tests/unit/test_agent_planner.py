@@ -114,8 +114,13 @@ class TestHappyPath:
             camc_remover=lambda aid: None,
             camc_status=lambda aid: "alive",
         )
+        # Phase B: request lives in the Planner's private dir under
+        # .camflow/flows/<flow>/planner/request.txt.
+        flows_dir = tmp_path / ".camflow" / "flows"
+        flow_dirs = list(flows_dir.iterdir())
+        assert len(flow_dirs) == 1
         request_text = (
-            tmp_path / ".camflow" / REQUEST_FILE
+            flow_dirs[0] / "planner" / REQUEST_FILE
         ).read_text(encoding="utf-8")
         assert "the user's exact request text" in request_text
 
@@ -130,7 +135,10 @@ class TestHappyPath:
             camc_remover=lambda aid: None,
             camc_status=lambda aid: "alive",
         )
-        prompt = (tmp_path / ".camflow" / PROMPT_FILE).read_text(
+        # Phase B: prompt lives under planner private dir.
+        flow_dirs = list((tmp_path / ".camflow" / "flows").iterdir())
+        assert len(flow_dirs) == 1
+        prompt = (flow_dirs[0] / "planner" / PROMPT_FILE).read_text(
             encoding="utf-8"
         )
         assert "PLANNER" in prompt.upper() or "Planner" in prompt

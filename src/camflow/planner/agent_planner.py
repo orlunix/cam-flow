@@ -61,11 +61,17 @@ from camflow.registry import (
 
 CAMC_BIN = shutil.which("camc") or "camc"
 
+# Canonical workflow / rationale paths — stay at the project's
+# .camflow/ root so the engine and downstream tools always find them.
 WORKFLOW_FILE = "workflow.yaml"
 RATIONALE_FILE = "plan-rationale.md"
-REQUEST_FILE = "plan-request.txt"
-PROMPT_FILE = "planner-prompt.txt"
-WARNINGS_FILE = "plan-warnings.txt"
+
+# Phase B: Planner's private files live under
+# .camflow/flows/<flow_id>/planner/ (see camflow.paths). These are
+# the file names inside that directory.
+REQUEST_FILE = "request.txt"        # was plan-request.txt at .camflow/ root
+PROMPT_FILE = "prompt.txt"          # was planner-prompt.txt at .camflow/ root
+WARNINGS_FILE = "warnings.txt"      # was plan-warnings.txt
 
 DEFAULT_TIMEOUT_SECONDS = 180  # 3 minutes — design §4.6 said up to ~2m
 DEFAULT_POLL_INTERVAL = 2.0
@@ -241,10 +247,19 @@ def build_boot_pack(project_dir: str | os.PathLike, request: str) -> str:
 def _default_camc_runner(name: str, project_dir: str, prompt: str) -> str:
     """Run ``camc run`` for the Planner. Returns the agent id parsed
     from stdout. Raises ``PlannerAgentError`` if camc fails or output
-    is unparseable."""
+    is unparseable.
+
+    The Planner reads its boot pack from a project-relative path
+    derived from where ``generate_workflow_via_agent`` wrote it. We
+    re-derive that here from a marker line embedded in the prompt
+    (``# camflow-prompt-path: <relpath>``) so the runner doesn't need
+    extra args — keeps the dependency-injection signature stable for
+    legacy tests that pass a 3-arg runner.
+    """
+    rel = _extract_prompt_path_marker(prompt) or f".camflow/{PROMPT_FILE}"
     short_prompt = (
-        f"Read .camflow/{PROMPT_FILE} and follow ALL instructions there "
-        "exactly. Drop workflow.yaml + plan-rationale.md, then stop."
+        f"Read {rel} and follow ALL instructions there exactly. "
+        "Drop workflow.yaml + plan-rationale.md, then stop."
     )
     try:
         proc = subprocess.run(
@@ -272,6 +287,19 @@ def _default_camc_runner(name: str, project_dir: str, prompt: str) -> str:
             f"{proc.stdout[:500]}"
         )
     return agent_id
+
+
+_PROMPT_PATH_MARKER_RE = re.compile(
+    r"^# camflow-prompt-path:\s*(?P<rel>[\w./-]+)\s*$",
+    re.MULTILINE,
+)
+
+
+def _extract_prompt_path_marker(prompt: str) -> str | None:
+    """Pull the ``# camflow-prompt-path: <rel>`` marker out of the
+    boot pack, if present."""
+    m = _PROMPT_PATH_MARKER_RE.search(prompt or "")
+    return m.group("rel") if m else None
 
 
 def _default_camc_remover(agent_id: str) -> None:
@@ -336,6 +364,8 @@ def generate_workflow_via_agent(
         :class:`PlannerResult` with the parsed workflow + paths +
         warnings + agent metadata.
     """
+    from camflow import paths as camflow_paths
+
     runner = camc_runner or _default_camc_runner
     remover = camc_remover or _default_camc_remover
     status_probe = camc_status or _default_camc_status
@@ -343,24 +373,49 @@ def generate_workflow_via_agent(
     project_dir = str(Path(project_dir).resolve())
     cf = _camflow_dir(project_dir)
 
-    # Mirror request to disk before we spawn so the agent has a
-    # reliable copy independent of its boot prompt being truncated.
-    (cf / REQUEST_FILE).write_text(
+    # Phase B: Planner gets its own private directory.
+    # Effective flow_id: caller-provided if any, else a synthetic
+    # planner-only flow id so this Planner still gets a tidy private
+    # directory even outside an engine flow (e.g. ``camflow plan``).
+    effective_flow_id = flow_id or f"planner_{_short_id()}"
+    planner_prompt_p = camflow_paths.planner_prompt_path(
+        project_dir, effective_flow_id,
+    )
+    planner_request_p = camflow_paths.planner_request_path(
+        project_dir, effective_flow_id,
+    )
+
+    # Mirror request to disk in the Planner's private dir so the agent
+    # has a reliable copy independent of its boot prompt being truncated.
+    planner_request_p.write_text(
         user_request.rstrip() + "\n", encoding="utf-8",
     )
 
-    # Build + write the boot prompt.
-    boot_pack = build_boot_pack(project_dir, user_request)
-    prompt_path = cf / PROMPT_FILE
-    prompt_path.write_text(boot_pack, encoding="utf-8")
+    # Build + write the boot prompt to the private dir. Embed the
+    # relative path in the prompt itself as a marker the runner can
+    # parse — keeps the runner's 3-arg signature stable.
+    rel_prompt = str(
+        planner_prompt_p.relative_to(Path(project_dir))
+    )
+    boot_pack = (
+        f"# camflow-prompt-path: {rel_prompt}\n\n"
+        + build_boot_pack(project_dir, user_request)
+    )
+    planner_prompt_p.write_text(boot_pack, encoding="utf-8")
 
     # Pre-clear stale outputs from a prior planner run in this project,
     # so polling can't pick them up as "this run's success".
-    for stale in (WORKFLOW_FILE, RATIONALE_FILE, WARNINGS_FILE):
+    for stale in (WORKFLOW_FILE, RATIONALE_FILE):
         try:
             (cf / stale).unlink(missing_ok=True)
         except OSError:
             pass
+    try:
+        camflow_paths.planner_warnings_path(
+            project_dir, effective_flow_id,
+        ).unlink(missing_ok=True)
+    except OSError:
+        pass
 
     name = f"planner-{_short_id()}"
     started_at = time.time()
@@ -381,8 +436,12 @@ def generate_workflow_via_agent(
             agent_id=agent_id,
             spawned_by="generate_workflow_via_agent",
             flow_id=flow_id,
-            prompt_file=str(prompt_path),
-            extra={"name": name, "request_file": str(cf / REQUEST_FILE)},
+            prompt_file=str(planner_prompt_p),
+            extra={
+                "name": name,
+                "request_file": str(planner_request_p),
+                "private_dir": str(planner_prompt_p.parent),
+            },
         )
     except Exception:
         pass
@@ -442,10 +501,12 @@ def generate_workflow_via_agent(
             "validation:\n  - " + "\n  - ".join(quality_errors)
         )
 
-    # Persist warnings to disk (non-fatal but visible).
+    # Persist warnings to the Planner's private dir (non-fatal but visible).
     if quality_warnings:
         try:
-            (cf / WARNINGS_FILE).write_text(
+            camflow_paths.planner_warnings_path(
+                project_dir, effective_flow_id,
+            ).write_text(
                 "\n".join(quality_warnings) + "\n", encoding="utf-8",
             )
         except OSError:
