@@ -399,16 +399,45 @@ camflow chat --history [--tail N]           # tail steward-events.jsonl
 
 ### Steward control plane (`camflow ctl`)
 
-Read-only verbs ship in Phase A; mutating verbs land in Phase B
-behind an autonomy / confirm flow.
+Read-only verbs (Phase A) and mutating verbs (Phase B). Mutating
+verbs route through an autonomy config (cautious / default / bold +
+per-verb override) and — for the ``confirm`` ones — a queue the user
+reviews via ``camflow chat --pending``.
 
 ```bash
+# Read (Phase A) — autonomous, run inline
 camflow ctl read-state [-p <dir>]                       # state.json
 camflow ctl read-trace [--tail N] [--kind step|...]     # trace.log
 camflow ctl read-events [--tail N]                      # steward-events.jsonl
 camflow ctl read-rationale                              # plan-rationale.md
 camflow ctl read-registry [--json]                      # agents.json
+
+# Mutating (Phase B) — queue to .camflow/control.jsonl (autonomous)
+# or .camflow/control-pending.jsonl (confirm); engine drains on tick
+camflow ctl pause [--reason ...]                        # autonomous
+camflow ctl resume [--reason ...]                       # autonomous
+camflow ctl kill-worker --reason "..."                  # autonomous + 30s
+                                                        # per-(flow,node,agent)
+                                                        # cooldown
+camflow ctl spawn --node <id> [--brief "..."]           # confirm
+camflow ctl skip --reason "..."                         # confirm
+
+# Steward memory verbs (Phase B) — autonomous, file-only
+camflow ctl summarize "<text>"                          # write summary.md
+camflow ctl archive-summary [--label <flow_id>]         # fold into archive.md
 ```
+
+Confirm-flow review:
+
+```bash
+camflow chat --pending                                  # interactive [y/N/never]
+camflow chat --pending --yes-to-all                     # batch approve
+camflow chat --pending --no-to-all                      # batch reject
+```
+
+Reply ``never`` adds a ``<verb>: block`` override to
+``steward-config.yaml`` so subsequent calls of that verb refuse
+with exit 1 until the override is cleared.
 
 ### Status
 
@@ -574,6 +603,69 @@ system state:
 The agent registry (`agents.json`) and the trace log (`trace.log`)
 together let the engine reason about "who is alive right now?" and
 "what happened?" without ever asking an LLM.
+
+---
+
+## 11. Per-agent private directories (Phase B)
+
+Each agent — Steward, Planner, Worker — gets its own directory
+under `.camflow/`. The directory is the persistent unit; the agent
+itself (the camc tmux session) is one-shot. When an agent dies,
+its folder stays — that's what makes "reboot" cheap: a new agent in
+the same folder picks up boot pack + scratch + prior progress.
+
+```
+project_dir/.camflow/
+├── state.json / agents.json / trace.log / workflow.yaml /
+│   plan-rationale.md / steward.json / node-result.json
+├── control.jsonl / control-pending.jsonl / control-rejected.jsonl
+├── steward-config.yaml         (Phase B autonomy)
+├── steward/                    (project-scoped, persistent)
+│   ├── prompt.txt context.md summary.md archive.md
+│   ├── inbox.jsonl session.log
+│   └── archive/<old-id>-<ts>/  (compaction handoff)
+└── flows/<flow_id>/
+    ├── flow-summary.md
+    ├── planner/                (one per workflow generation)
+    │   └── prompt.txt request.txt workflow-draft.yaml
+    │       plan-rationale.md warnings.txt session.log
+    ├── planner-replan-<n>/     (subsequent replans)
+    └── nodes/<node_id>/
+        ├── prompt.txt context.md inputs/ result.json (winning)
+        └── attempts/<n>/
+            └── agent_id.txt progress.json result.json session.log
+```
+
+Three context flow directions:
+
+1. **IN** (project → agent's private dir) — engine writes
+   `prompt.txt` (boot pack, immutable post-spawn) and `context.md`
+   (regenerated each spawn) into the agent's folder before
+   spawning.
+2. **OUT** (agent → engine) — workers write `result.json` to the
+   canonical `.camflow/node-result.json` (existing contract); the
+   engine archives the file into the per-attempt private slot
+   after reading. Successful results promote to the node-level
+   `result.json` (the winning slot) so downstream nodes can read
+   them.
+3. **Sibling-to-sibling** — engine acts as courier. A worker's
+   output flows through `state.json` (via `state_enricher`) and a
+   per-input copy lands in `nodes/<next>/inputs/from-<prior>.json`
+   for the next node. LLMs never directly read another LLM's
+   files.
+
+Reboot semantics: a dead worker leaves `attempts/<n>/` intact
+(prompt, partial progress, possibly a mid-write result). The
+orphan handler can adopt-result, treat-as-crash, or — Phase C —
+spawn `attempts/<n+1>/` with `context.md` regenerated to point at
+the prior attempt's progress so the new worker continues instead
+of restarting from scratch.
+
+The single-source-of-truth path module is `src/camflow/paths.py`.
+Anything that needs a per-agent path uses its helpers
+(`steward_dir`, `flow_dir`, `planner_dir`, `node_dir`,
+`attempt_dir` and the per-file variants); no other code does
+string concatenation against `.camflow/`.
 
 ---
 

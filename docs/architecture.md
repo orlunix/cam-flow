@@ -717,15 +717,60 @@ behind `--legacy`.
 
 ---
 
-## CLI entry — Phase A subcommand modules
+## CLI entry — Phase A + B subcommand modules
 
 | Module | Subcommand | What it does |
 |--------|-----------|-------------|
-| `cli_entry/ctl.py` | `camflow ctl <verb>` | Dispatcher for the Steward's verb whitelist. Two autonomy levels: `autonomous` runs inline; `confirm` queues to `.camflow/control-pending.jsonl` (Phase B drain). Verbs register lazily on import |
-| `cli_entry/ctl_read.py` | `read-state`, `read-trace`, `read-events`, `read-rationale`, `read-registry` | Five autonomous read-only verbs. Local file I/O — even a stuck engine can still answer "what do we know?" |
-| `cli_entry/chat.py` | `camflow chat "<msg>"` / `--history` | One-shot send via `camc send` (no `[CAMFLOW EVENT]` prefix so Steward routes as user input); `--history` tails `steward-events.jsonl` |
+| `cli_entry/ctl.py` | `camflow ctl <verb>` | Dispatcher for the Steward's verb whitelist. Resolution: per-verb override → preset table (`autonomy.PRESET_TABLE`) → verb's spec default. Three levels: `autonomous` runs inline; `confirm` queues to `.camflow/control-pending.jsonl`; `block` refuses |
+| `cli_entry/ctl_read.py` | `read-state`, `read-trace`, `read-events`, `read-rationale`, `read-registry` | Five autonomous read-only verbs (Phase A). Local file I/O — even a stuck engine can still answer "what do we know?" |
+| `cli_entry/ctl_mutate.py` | `pause`, `resume`, `kill-worker`, `spawn`, `skip` | Phase B mutating verbs. All five queue uniformly to `.camflow/control.jsonl` (autonomous) or `.camflow/control-pending.jsonl` (confirm); engine drains via `control_drain` on each tick |
+| `cli_entry/ctl_steward.py` | `summarize "<text>"`, `archive-summary [--label]` | Phase B Steward memory verbs. Autonomous, file-only (write to `steward/summary.md`, fold into `steward/archive.md`). The Steward calls these in response to `checkpoint_now` / `flow_idle` events |
+| `cli_entry/chat.py` | `camflow chat "<msg>"` / `--history` / `--pending` | One-shot send via `camc send`; `--history` tails `steward-events.jsonl`; Phase B `--pending` interactively reviews confirm-queue entries with `[y/N/never]`, applies timeout-deny, and persists `never` as a `block` override |
 | `cli_entry/steward.py` | `camflow steward {status,kill,restart}` | Lifecycle commands. `kill` flips registry status to `killed`, clears the pointer, runs `camc rm --kill`. `restart` is kill + spawn fresh |
 | `cli_entry/plan_tool.py` | `camflow plan-tool {validate,write}` | Internal tools the Planner agent shells out to during its self-validate loop. `validate` prints `{ok, errors[], warnings[]}` JSON and exits 0/1. `write` atomic-writes yaml from stdin, sandboxed to `.camflow/` |
+
+---
+
+## Filesystem layout — `camflow.paths`
+
+Phase B introduced `src/camflow/paths.py` as the single source of
+truth for per-agent directory layout. Every file path under
+`.camflow/` is computed via a helper here; nothing else does string
+concatenation. Helpers cover:
+
+  * Project root — `state_path`, `trace_path`, `workflow_path`,
+    `plan_rationale_path`, `node_result_path`, `camflow_dir`.
+  * Steward (one per project, persistent) — `steward_dir`,
+    `steward_prompt_path`, `steward_context_path`,
+    `steward_summary_path`, `steward_archive_path`,
+    `steward_inbox_path`, `steward_session_log_path`,
+    `steward_archive_subdir(old_id, ts)` (Phase B handoff).
+  * Flow — `flow_dir`, `flow_summary_path`.
+  * Planner (one per workflow generation, plus replans) —
+    `planner_dir(replan_n=...)`, `planner_prompt_path`,
+    `planner_request_path`, `planner_draft_path`,
+    `planner_warnings_path`, `planner_session_log_path`,
+    `planner_context_path`.
+  * Worker (per-node, per-attempt) — `node_dir`, `node_prompt_path`,
+    `node_context_path`, `node_inputs_dir`,
+    `node_winning_result_path`, `attempt_dir`,
+    `attempt_agent_id_path`, `attempt_progress_path`,
+    `attempt_result_path`, `attempt_session_log_path`.
+  * Counters — `latest_attempt_n(project, flow, node)`,
+    `next_attempt_n(...)` (used by reboot logic).
+
+See `strategy.md` §11 for the full layout diagram and rationale.
+
+---
+
+## Phase B modules
+
+| Module | What it does |
+|--------|-------------|
+| `backend/cam/control_drain.py` | Reads `.camflow/control.jsonl` at the top of every engine tick and applies each command to engine state: `pause` flips status to `waiting`; `resume` to `running`; `kill-worker` runs `_cleanup_agent` on `state.current_agent_id` (subject to a 30s per-`(flow_id, node_id, agent_id)` cooldown that lives in this module's process-local state); `spawn` overrides `state.pc`; `skip` sets `state.skip_current` for `_execute_step` to consume. Each command emits a paired `kind=control_resolution` trace entry so the audit trail shows both the user's intent (`control_command` from ctl) and the engine's action |
+| `steward/autonomy.py` | Loader / resolver for `.camflow/steward-config.yaml`. Three presets (`PRESET_CAUTIOUS`, `PRESET_DEFAULT`, `PRESET_BOLD`) plus a `LEVEL_BLOCK` sentinel for "user said never". `effective_autonomy(verb, config, default=...)` resolves: per-verb override → preset table → caller-supplied default (the verb's spec autonomy). `set_override(verb, level)` persists a single change atomically |
+| `steward/handoff.py` | `handoff_steward(project_dir, reason=...)` archives the live `steward/` directory under `steward/archive/<old-id>-<ts>/`, folds `summary.md` into `archive.md` with a "Pre-handoff summary" section, resets `summary.md` to a clean post-handoff slate, kills the old camc agent (best-effort), marks the old record `handoff_archived` in `agents.json` with `successor_id` + `archived_dir` + `handoff_reason`, and spawns a fresh Steward via `spawn_steward` so the carried-over archive sits next to the new boot pack |
+| `steward/events.py` (extended) | Phase B event wrappers: `emit_node_retry` (rate-limited engine-side, 30s coalesce window per `(flow_id, node_id)`), `emit_escalation_level_change`, `emit_verify_failed`, `emit_heartbeat_stale_worker`, `emit_checkpoint_now`, `emit_flow_idle`. Plus `RETRY_COALESCE_WINDOW` (30s) and `reset_retry_coalesce_for_tests()` |
 
 ---
 

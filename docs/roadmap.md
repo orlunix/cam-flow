@@ -111,6 +111,61 @@ Engine + Watchdog dual-process pattern with heartbeat, lock,
 stale auto-heal, max-restart cap. `camflow status` shows engine +
 watchdog state. See `docs/self-monitoring.md` for the full spec.
 
+### 2.7 Phase B: Agency — DONE (2026-04-26)
+
+Builds on Phase A. The Steward graduates from "passive observer with
+read verbs" to "advisor with bounded mutating power, confirm flow,
+and durable memory across compaction." Ships:
+
+- **Per-agent private directories.** `.camflow/steward/`,
+  `.camflow/flows/<flow_id>/planner/`,
+  `.camflow/flows/<flow_id>/nodes/<node_id>/attempts/<n>/`. Each
+  agent's boot pack / scratch / output lives in its own namespace;
+  the engine ferries data between siblings via `state.json` and the
+  per-node `result.json` winning slot. Sole-writer discipline
+  (engine writes state/agents/trace) is now a path fact, not just
+  convention. New `camflow.paths` module is the single source of
+  truth for layout helpers.
+- **5 mutating ctl verbs**: `pause`, `resume`, `kill-worker`
+  (autonomous, with 30s cooldown per `(flow, node, agent)` tuple),
+  `spawn`, `skip` (confirm). Engine drains
+  `.camflow/control.jsonl` at the top of every tick via the new
+  `control_drain` module; verbs queue uniformly through
+  `queue_approved` / `queue_pending`. `pause` flips engine status
+  to `waiting`; the main loop now sleeps + re-drains on `waiting`
+  so `resume` wakes it up without re-running camflow.
+- **Autonomy config**: `.camflow/steward-config.yaml` with three
+  presets (`cautious` / `default` / `bold`) + per-verb override.
+  `set_override(verb, "block")` persists a "user said never" choice
+  so the dispatcher refuses with exit 1 next time.
+  `confirm.timeout_minutes` controls the per-entry expiry.
+- **Confirm flow**: `camflow chat --pending` interactive review
+  with `[y/N/never]`. Timeout-deny (OQ-11 = B): expired entries
+  auto-rejected before the user is prompted. Both rejected and
+  approved entries leave a paired `kind=control_resolution` audit
+  entry in `trace.log`.
+- **Extended events**: `node_retry` (rate-limited per OQ-3 with a
+  30s coalesce window per `(flow, node)`), `escalation_level_change`
+  (emitted when escalation actually moves), `verify_failed`
+  (engine downgrades success→fail and tells Steward), and
+  `heartbeat_stale_worker` (wrapper exposed; engine probe in a
+  later phase).
+- **Compaction handoff**: `checkpoint_now` event fires every 20
+  events / 30 minutes; `flow_idle` fires after `flow_terminal` so
+  the Steward archives this flow's working memory.
+  `summarize` and `archive-summary` ctl verbs let the Steward
+  write to `summary.md` and fold it into `archive.md`.
+  New `steward.handoff.handoff_steward(project_dir, reason=...)`
+  archives the live `steward/` directory under
+  `steward/archive/<old-id>-<ts>/`, folds `summary.md` into
+  `archive.md`, spawns a fresh Steward with the predecessor's
+  memory carried over, and updates `agents.json` (old →
+  `handoff_archived` with `successor_id` + `archived_dir`).
+- **Resume reattach via handoff**: when the engine starts and
+  finds a registered Steward whose camc agent is dead,
+  `_ensure_steward` routes through `handoff_steward` instead of
+  doing a fresh spawn. Working memory survives engine restarts.
+
 ### 2.6 Phase A: Steward + agent Planner + trust model — DONE (2026-04-26)
 
 Design landed in `docs/design-next-phase.md`. Triage of the 9-commit
