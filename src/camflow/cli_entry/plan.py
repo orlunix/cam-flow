@@ -81,6 +81,8 @@ def _resolve_claude_md(arg):
 def plan_command(args):
     if args.legacy:
         return _plan_legacy(args)
+    if getattr(args, "interactive", False):
+        return _plan_interactive(args)
     return _plan_via_agent(args)
 
 
@@ -144,6 +146,290 @@ def _plan_via_agent(args):
     print("", file=sys.stderr)
     print("ASCII graph:", file=sys.stderr)
     print(ascii_graph(result.workflow), file=sys.stderr)
+    return 0
+
+
+def _plan_interactive(args):
+    """``camflow plan -i "<request>"`` — spawn the Planner agent and
+    let the user converse with it via stdin while waiting for
+    workflow.yaml to land.
+
+    Each line you type is forwarded to the agent via ``camc send``.
+    The agent's screen is tailed back every 5 s. Ctrl-D switches to
+    poll-only (still waits for workflow.yaml). Ctrl-C aborts.
+    """
+    import select
+    import shutil
+    import subprocess
+    import time
+    from pathlib import Path
+
+    import yaml as _yaml
+
+    from camflow import paths as camflow_paths
+    from camflow.engine.dsl import validate_workflow as validate_dsl
+    from camflow.planner.agent_planner import (
+        PROMPT_FILE,
+        REQUEST_FILE,
+        WORKFLOW_FILE,
+        _short_id,
+        build_boot_pack,
+    )
+    from camflow.planner.validator import validate_plan_quality
+    from camflow.registry import on_agent_finalized, on_agent_spawned
+
+    CAMC_BIN = shutil.which("camc") or "camc"
+
+    project_dir = os.path.abspath(args.project_dir or os.getcwd())
+    request = args.request
+    timeout_s = args.timeout
+
+    # Setup: write request + boot pack to the Planner's private dir.
+    flow_id = f"planner_{_short_id()}"
+    prompt_p = camflow_paths.planner_prompt_path(project_dir, flow_id)
+    request_p = camflow_paths.planner_request_path(project_dir, flow_id)
+    request_p.write_text(request.rstrip() + "\n", encoding="utf-8")
+
+    rel_prompt = str(prompt_p.relative_to(Path(project_dir)))
+    boot_pack = (
+        f"# camflow-prompt-path: {rel_prompt}\n\n"
+        + build_boot_pack(project_dir, request)
+    )
+    prompt_p.write_text(boot_pack, encoding="utf-8")
+
+    # Pre-clear stale outputs.
+    cf = Path(project_dir) / ".camflow"
+    for stale in (WORKFLOW_FILE, "plan-rationale.md"):
+        try:
+            (cf / stale).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    name = f"planner-{_short_id()}"
+    started_at = time.time()
+
+    print(
+        "[plan -i] spawning Planner agent...", file=sys.stderr,
+    )
+    try:
+        proc = subprocess.run(
+            [
+                CAMC_BIN, "run",
+                "--name", name,
+                "--path", project_dir,
+                f"Read {rel_prompt} and follow ALL instructions there "
+                "exactly. Drop workflow.yaml + plan-rationale.md, "
+                "then stop.",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        print(f"ERROR: camc run failed: {exc}", file=sys.stderr)
+        return 1
+
+    if proc.returncode != 0:
+        print(
+            f"ERROR: camc run exited {proc.returncode}\n"
+            f"stdout: {proc.stdout}\nstderr: {proc.stderr}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Parse agent id from stdout.
+    import re as _re
+    m = (
+        _re.search(r"agent\s+([0-9a-f]{6,12})", proc.stdout)
+        or _re.search(r"ID:\s+([0-9a-f]{6,12})", proc.stdout)
+    )
+    if not m:
+        print(
+            "ERROR: could not parse agent id from camc output",
+            file=sys.stderr,
+        )
+        return 1
+    agent_id = m.group(1)
+
+    # Register in agents.json (best-effort).
+    try:
+        on_agent_spawned(
+            project_dir,
+            role="planner",
+            agent_id=agent_id,
+            spawned_by="camflow plan -i",
+            flow_id=None,
+            prompt_file=str(prompt_p),
+            extra={"name": name},
+        )
+    except Exception:
+        pass
+
+    print(
+        f"[plan -i] Planner agent: {agent_id}\n"
+        "[plan -i] type a line to send to the agent; Ctrl-D for "
+        "poll-only; Ctrl-C aborts.\n",
+        file=sys.stderr,
+    )
+
+    workflow_path = cf / WORKFLOW_FILE
+    deadline = started_at + timeout_s
+    last_capture_emit = 0.0
+    capture_interval = 5.0
+    stdin_open = sys.stdin.isatty()
+
+    def _camc_send(text: str) -> None:
+        try:
+            subprocess.run(
+                [CAMC_BIN, "send", agent_id, text],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+
+    def _camc_capture_tail(n: int = 8) -> str:
+        try:
+            p = subprocess.run(
+                [CAMC_BIN, "capture", agent_id, "-n", str(n)],
+                capture_output=True, text=True, timeout=5,
+            )
+            if p.returncode == 0:
+                return p.stdout
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        return ""
+
+    def _cleanup() -> None:
+        try:
+            subprocess.run(
+                [CAMC_BIN, "rm", agent_id, "--kill"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+
+    try:
+        while time.time() < deadline:
+            # 1. Has workflow.yaml landed?
+            if workflow_path.exists():
+                break
+
+            # 2. Periodic screen tail.
+            now = time.time()
+            if now - last_capture_emit >= capture_interval:
+                last_capture_emit = now
+                cap = _camc_capture_tail()
+                if cap:
+                    sys.stderr.write(
+                        "\n--- planner screen ----------------\n"
+                    )
+                    sys.stderr.write(cap)
+                    sys.stderr.write(
+                        "----------------------------------\n"
+                    )
+
+            # 3. Non-blocking stdin read.
+            if stdin_open:
+                try:
+                    r, _, _ = select.select([sys.stdin], [], [], 1.0)
+                except KeyboardInterrupt:
+                    print(
+                        "\n[plan -i] Ctrl-C — aborting Planner.",
+                        file=sys.stderr,
+                    )
+                    _cleanup()
+                    return 130
+                if r:
+                    line = sys.stdin.readline()
+                    if not line:  # EOF
+                        stdin_open = False
+                        print(
+                            "[plan -i] stdin closed; switching to "
+                            "poll-only.",
+                            file=sys.stderr,
+                        )
+                        continue
+                    text = line.rstrip("\n")
+                    if text:
+                        _camc_send(text)
+                        sys.stderr.write(f"[plan -i] sent: {text[:80]}\n")
+            else:
+                time.sleep(1.0)
+    except KeyboardInterrupt:
+        print(
+            "\n[plan -i] Ctrl-C — aborting Planner.", file=sys.stderr,
+        )
+        _cleanup()
+        return 130
+
+    # Workflow.yaml landed (or timeout).
+    if not workflow_path.exists():
+        print(
+            f"ERROR: timed out waiting for {workflow_path} after "
+            f"{int(time.time() - started_at)}s",
+            file=sys.stderr,
+        )
+        _cleanup()
+        return 1
+
+    # Validate.
+    try:
+        text = workflow_path.read_text(encoding="utf-8")
+        workflow = _yaml.safe_load(text)
+    except Exception as exc:
+        print(f"ERROR: workflow.yaml parse: {exc}", file=sys.stderr)
+        _cleanup()
+        return 1
+    if not isinstance(workflow, dict) or not workflow:
+        print(
+            "ERROR: workflow.yaml is empty / not a mapping",
+            file=sys.stderr,
+        )
+        _cleanup()
+        return 1
+    ok, errors = validate_dsl(workflow)
+    if not ok:
+        print(
+            "ERROR: workflow.yaml fails DSL validation:\n  - "
+            + "\n  - ".join(errors),
+            file=sys.stderr,
+        )
+        _cleanup()
+        return 1
+    quality_errors, quality_warnings = validate_plan_quality(workflow)
+    if quality_errors:
+        print(
+            "ERROR: workflow fails plan-quality validation:\n  - "
+            + "\n  - ".join(quality_errors),
+            file=sys.stderr,
+        )
+        _cleanup()
+        return 1
+
+    # Mark planner completed in registry.
+    try:
+        on_agent_finalized(
+            project_dir,
+            agent_id=agent_id,
+            result={"status": "success"},
+            duration_ms=int((time.time() - started_at) * 1000),
+            result_file=str(workflow_path),
+        )
+    except Exception:
+        pass
+
+    _cleanup()
+
+    duration = time.time() - started_at
+    print(
+        f"[plan -i] Planner finished in {duration:.1f}s; "
+        f"workflow at {workflow_path}",
+        file=sys.stderr,
+    )
+    if quality_warnings:
+        print("\nPlan-quality warnings:", file=sys.stderr)
+        for w in quality_warnings:
+            print(f"  - {w}", file=sys.stderr)
+    print("\nASCII graph:", file=sys.stderr)
+    print(ascii_graph(workflow), file=sys.stderr)
     return 0
 
 
@@ -249,6 +535,13 @@ def build_parser(subparsers=None):
         help="Use the pre-Phase-A single-shot LLM Planner (one Claude "
              "API call, no agent). Kept for one release cycle as a "
              "fallback while the agent Planner stabilises.",
+    )
+    plan.add_argument(
+        "-i", "--interactive", action="store_true",
+        help="Spawn the Planner agent and run an interactive loop: "
+             "lines you type are forwarded to the agent via "
+             "`camc send`; the agent's screen is tailed back to you "
+             "every few seconds until workflow.yaml is written.",
     )
     plan.add_argument(
         "--project-dir", "-p", default=None,
