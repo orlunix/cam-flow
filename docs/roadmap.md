@@ -105,6 +105,51 @@ Pachaar's "Anatomy of an Agent Harness" (April 2026). Distilled 4
 high-leverage improvements applicable to cam-flow (see §5). The
 article's 7 principles are codified at §1.
 
+### 2.5 Watchdog + self-monitoring — DONE (2026-04-25)
+
+Engine + Watchdog dual-process pattern with heartbeat, lock,
+stale auto-heal, max-restart cap. `camflow status` shows engine +
+watchdog state. See `docs/self-monitoring.md` for the full spec.
+
+### 2.6 Phase A: Steward + agent Planner + trust model — DONE (2026-04-26)
+
+Design landed in `docs/design-next-phase.md`. Triage of the 9-commit
+implementation wave is in `docs/triage-2026-04-26.md`. Ships:
+
+- **Project-scoped Steward agent** (`steward-<shortid>`). Persistent
+  across flows, killed only by explicit human action. Receives 5
+  Phase-A events: `flow_started`, `flow_terminal`, `node_started`,
+  `node_done`, `node_failed`, plus `engine_resumed` on resume.
+- **agents.json registry** — engine is sole writer; tracks every
+  steward, planner, and worker spawned in the project, with
+  `flows_witnessed` correlation on the Steward record.
+- **trace.log tagged-union** with `kind` discriminator. Backward-
+  compatible reader convention (missing `kind` → `step`). New
+  kinds: `agent_spawned/completed/failed/killed`, `event_emitted`,
+  `control_command`, `handoff_completed`, etc.
+- **`camflow ctl`** read-only verbs (`read-state`, `read-trace`,
+  `read-events`, `read-rationale`, `read-registry`). Mutating
+  verbs land in Phase B.
+- **`camflow chat`** one-shot send + `--history`.
+- **`camflow steward {status,kill,restart}`** lifecycle commands.
+- **`camflow status`** shows a Steward row.
+- **Agent Planner**: `camflow plan` defaults to a camc-spawned
+  Planner agent with internal critique loop. `--legacy` keeps the
+  pre-Phase-A single-shot Planner for one release cycle.
+  `camflow plan-tool validate|write` are the agent's CLI tool
+  surface.
+- **Trust model formalized** (strategy.md §10). LLMs (Planner,
+  Steward) are advisory; Engine + Watchdog are the only
+  deterministic dispatchers / state writers.
+- **Self-destruct fix**: registry-scoped cleanup
+  (`cleanup_workers_of_flow`) replaces the old name-prefix sweep
+  that once self-killed a parent `camflow-dev` agent. See
+  `docs/triage-2026-04-26.md` §2 for the full root-cause analysis.
+- **Test infra**: global `_block_real_camc` autouse fixture
+  prevents tests from spawning real Steward / Planner agents.
+  Tests that truly want a real `camc` mark themselves with
+  `@pytest.mark.allow_real_camc`.
+
 ---
 
 ## 3. Critical Gaps (MUST fix)

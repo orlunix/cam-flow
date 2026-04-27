@@ -651,13 +651,81 @@ Shared across backends; fsync'd writes; JSONL append-only trace.
 - `main() -> None`
   - **What.** argparse: workflow path + `--project-dir`, `--validate`,
     `--dry-run`, `--force-restart`, `--poll-interval`, `--node-timeout`,
-    `--workflow-timeout`, `--max-retries`, `--max-node-executions`.
-    Validates the workflow, then runs the engine. Exits 0 on
-    `status == "done"`, 1 otherwise.
+    `--workflow-timeout`, `--max-retries`, `--max-node-executions`,
+    `--no-steward`. Dispatches to `evolve` / `plan` / `plan-tool` /
+    `scout` / `resume` / `status` / `stop` / `watchdog` / `ctl` /
+    `chat` / `steward` / `run` subcommands; the default positional
+    path is "run a workflow." Validates the workflow, then runs the
+    engine. Exits 0 on `status == "done"`, 1 otherwise.
   - **Evaluation metric.** The CLI is the one-line quickstart — does
     `camflow examples/cam/workflow.yaml` work out of the box?
   - **How to measure.** Runbook check: fresh clone → `pip install -e .`
     → `camflow …` completes a demo.
+
+---
+
+## Steward (`src/camflow/steward/`)
+
+Phase A (2026-04-26). Project-scoped LLM agent that owns chat and
+project memory. See `strategy.md` §9.
+
+| Module | What it does |
+|--------|-------------|
+| `spawn.py` | Boot-pack assembly + ``camc run`` for a fresh Steward; pointer file at ``.camflow/steward.json``; `is_steward_alive` liveness probe via `camc status`; `_camc_status` / `_default_camc_runner` are the leaf subprocess wrappers blocked in tests |
+| `events.py` | Engine→Steward push channel. `emit(project_dir, event_type, **fields)` mirrors to `steward-events.jsonl`, locates the Steward via the pointer file, sends `[CAMFLOW EVENT] {json}` via `camc send`, and writes a paired `kind=event_emitted` trace entry. Convenience wrappers: `emit_flow_started/terminal`, `emit_node_started/done/failed`, `emit_engine_resumed`. Event types are a closed `EVENT_TYPES` frozenset documented in §7.3 of the design doc and cross-referenced with `tracer.EVENT_KINDS` |
+
+The Steward has no Python module of its own — it's a Claude Code
+session running inside camc. The `steward/` package owns the Python
+side of "spawn it / talk to it / mirror events to disk." The
+mutating `ctl` verb support, autonomy config, and compaction handoff
+land in Phase B.
+
+---
+
+## Registry (`src/camflow/registry/`)
+
+Phase A. Project-scoped agent registry — the snapshot view of "who
+exists?" complementing trace.log's "what happened?" view.
+
+| Module | What it does |
+|--------|-------------|
+| `agents.py` | `agents.json` reader/writer. Atomic write via `save_state_atomic`. Public API: `register_agent`, `update_agent_status`, `get_agent`, `list_agents` (filter by role / status), `set_current_steward`, `get_current_steward`, `append_flow_to_steward` (idempotent flow_id append). Engine is the SOLE writer; CLI commands and the Steward read but never write |
+| `hooks.py` | Lifecycle hooks that update registry + write a paired trace event in lockstep. `on_agent_spawned`, `on_agent_finalized`, `on_agent_killed`, `on_agent_handoff_archived`. Trace events use `build_event_entry` so registry status flips and audit entries can never drift |
+
+Roles: `worker` (per-node, flow-scoped), `planner` (one-shot per yaml
+generation), `steward` (project-scoped, persistent). Statuses:
+`alive`, `completed`, `failed`, `killed`, `handoff_archived`.
+
+---
+
+## Planner agent (`src/camflow/planner/`)
+
+Phase A made the Planner agent-based — a camc-spawned Claude Code
+session that explores, drafts, self-validates, and writes the final
+yaml. The single-shot LLM Planner is preserved for one release cycle
+behind `--legacy`.
+
+| Module | What it does |
+|--------|-------------|
+| `agent_planner.py` | `generate_workflow_via_agent(request, project_dir, ...)` — spawn `planner-<id>` via camc, register it, poll `.camflow/workflow.yaml` until it appears, run final DSL + plan-quality validation, mark agent completed, `camc rm` it. Boot pack `_BOOT_TEMPLATE` instructs the agent to read `plan-request.txt`, draft → `camflow plan-tool validate` → iterate → `plan-tool write`. Failure modes (camc unreachable, agent dies before writing, timeout, invalid yaml, DSL or plan-quality failure) raise `PlannerAgentError`. All `camc` shell-outs are dependency-injected for tests |
+| `planner.py` | Pre-Phase-A single-shot LLM Planner. Used when `camflow plan --legacy` is passed |
+| `validator.py` | `validate_plan_quality(workflow)` — heuristic checks (verify on long nodes, OUTCOME-not-OUTPUT, methodology routing). Used both by the legacy Planner post-hoc and by `camflow plan-tool validate` (which the agent Planner calls every loop iteration) |
+| `prompt_template.py` | Legacy Planner prompt assembly |
+| `examples.py` | Legacy Planner few-shot examples |
+| `scouts.py` | Legacy Planner scout integration |
+| `llm.py` | Legacy Planner LLM call wrapper |
+
+---
+
+## CLI entry — Phase A subcommand modules
+
+| Module | Subcommand | What it does |
+|--------|-----------|-------------|
+| `cli_entry/ctl.py` | `camflow ctl <verb>` | Dispatcher for the Steward's verb whitelist. Two autonomy levels: `autonomous` runs inline; `confirm` queues to `.camflow/control-pending.jsonl` (Phase B drain). Verbs register lazily on import |
+| `cli_entry/ctl_read.py` | `read-state`, `read-trace`, `read-events`, `read-rationale`, `read-registry` | Five autonomous read-only verbs. Local file I/O — even a stuck engine can still answer "what do we know?" |
+| `cli_entry/chat.py` | `camflow chat "<msg>"` / `--history` | One-shot send via `camc send` (no `[CAMFLOW EVENT]` prefix so Steward routes as user input); `--history` tails `steward-events.jsonl` |
+| `cli_entry/steward.py` | `camflow steward {status,kill,restart}` | Lifecycle commands. `kill` flips registry status to `killed`, clears the pointer, runs `camc rm --kill`. `restart` is kill + spawn fresh |
+| `cli_entry/plan_tool.py` | `camflow plan-tool {validate,write}` | Internal tools the Planner agent shells out to during its self-validate loop. `validate` prints `{ok, errors[], warnings[]}` JSON and exits 0/1. `write` atomic-writes yaml from stdin, sandboxed to `.camflow/` |
 
 ---
 

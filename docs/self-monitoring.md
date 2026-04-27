@@ -317,6 +317,25 @@ command exits with code 1 and tells you to re-run with `--force`.
 engines; SIGKILL means no cleanup, so any in-flight agent will be
 detected as an orphan by the next `camflow resume`.
 
+### What `camflow stop` does NOT touch
+
+`camflow stop` ends the **engine** (and the watchdog supervising it).
+It does **not** touch the project's **Steward** — the Steward is
+project-scoped and outlives any single flow on purpose, so you don't
+lose project memory just because a flow ended.
+
+To end the Steward explicitly, use `camflow steward kill` (or
+`camc rm <steward-id>`). The order during a normal shutdown is:
+
+```
+camflow stop          → engine (and watchdog) exit cleanly
+camflow steward kill  → only when you actually want to abandon the
+                        project's persistent assistant
+```
+
+`camflow run --no-steward <yaml>` opts out of the Steward entirely;
+in that mode `camflow stop` is the whole story.
+
 ## Example session
 
 ```

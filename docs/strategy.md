@@ -343,32 +343,78 @@ report + explicit approval is the right pace.
 
 ## 8. camflow CLI Reference
 
-This is what ships **today** (2026-04-19). Commands marked **(planned)**
-appear in roadmap / ideas-backlog but are not yet in the dispatcher.
+This is what ships **today** (2026-04-26 — Phase A). Commands marked
+**(planned)** appear in roadmap / ideas-backlog but are not yet in the
+dispatcher.
 
 ### Run + resume
 
 ```bash
 camflow <workflow.yaml> [flags]          # run a workflow (default mode)
+camflow run <workflow.yaml> [flags]      # explicit synonym
+camflow run --no-steward <wf>            # skip the project-scoped Steward
 camflow resume <workflow.yaml>           # resume a stopped/failed workflow
 camflow resume <wf> --from <node>        # resume from a specific node
 camflow resume <wf> --retry              # force-flip non-running → running
 camflow resume <wf> --dry-run            # plan the resume without running
 ```
 
-### Plan
+### Plan (Phase A: Planner is now an agent)
 
 ```bash
-camflow plan "<natural-language request>"   # generate workflow.yaml
+camflow plan "<natural-language request>"   # default: spawn Planner agent
+  --project-dir <path>                      # project root (writes to .camflow/)
+  --timeout <seconds>                       # agent budget (default 180)
+  --legacy                                  # use the pre-Phase-A single-shot
+                                            # LLM Planner (one Claude call)
   --claude-md <path>                        # override CLAUDE.md location
+                                            # (legacy mode only; agent reads
+                                            # the file itself)
   --skills-dir <path>                       # override skills dir
   --agents-dir <path>                       # override agents dir
   --domain {hardware,software,deployment,research}
                                             # load a domain rule pack
+                                            # (legacy mode only)
   --scout-report <file>                     # include a scout's JSON report
-                                            # (repeatable, "-" = stdin,
-                                            # capped at 3)
-  --output <path>                           # output path (default workflow.yaml)
+                                            # (legacy mode only)
+  --output <path>                           # also copy plan to this path
+
+# Internal tools the Planner agent shells out to during its loop.
+# Users normally don't invoke these directly.
+camflow plan-tool validate <yaml>           # DSL + plan-quality validators
+camflow plan-tool write <yaml>              # atomic write yaml from stdin
+                                            # (sandboxed to .camflow/)
+```
+
+### Steward
+
+```bash
+camflow steward status [-p <dir>]           # alive/dead + flows witnessed
+camflow steward kill [-p <dir>]             # explicit human kill
+camflow steward restart [-p <dir>]          # kill + spawn fresh
+                       [--workflow <yaml>]
+camflow chat "<msg>" [-p <dir>]             # send to project's Steward
+camflow chat --history [--tail N]           # tail steward-events.jsonl
+```
+
+### Steward control plane (`camflow ctl`)
+
+Read-only verbs ship in Phase A; mutating verbs land in Phase B
+behind an autonomy / confirm flow.
+
+```bash
+camflow ctl read-state [-p <dir>]                       # state.json
+camflow ctl read-trace [--tail N] [--kind step|...]     # trace.log
+camflow ctl read-events [--tail N]                      # steward-events.jsonl
+camflow ctl read-rationale                              # plan-rationale.md
+camflow ctl read-registry [--json]                      # agents.json
+```
+
+### Status
+
+```bash
+camflow status [<workflow.yaml>] [-p <dir>]   # pretty-print engine + watchdog
+                                              # + Steward + node + progress
 ```
 
 ### Scout (read-only)
@@ -414,6 +460,123 @@ ln -sf <repo>/bin/camflow ~/bin/camflow
 
 ---
 
+## 9. Steward agent (Phase A)
+
+A **Steward** is one persistent project-scoped LLM agent per
+`.camflow/` directory. It is the user's natural-language interface to
+everything camflow does in that project.
+
+### What the Steward IS
+- The project's persistent memory across flows. It outlives any single
+  flow and `engine` restart; only an explicit human action ends it
+  (`camflow steward kill` or `camc rm <id>`).
+- The user's chat front-end. `camflow chat "现在状况?"` routes to it.
+- The interpreter of structured engine events. The engine pushes
+  `[CAMFLOW EVENT] {...}` JSON via `camc send`; the Steward decides
+  what (if anything) to say to the user.
+- A camc agent named `steward-<project-shortid>`. Visible in
+  `camc list` like any other.
+
+### What the Steward IS NOT
+- The dispatcher. The engine schedules workers per `workflow.yaml`.
+- A writer of `state.json` or `agents.json` — the engine is the sole
+  writer of both. (See §10.)
+- Required. `--no-steward` ships with engine and skips Steward
+  entirely.
+- A reader of raw worker logs by default. Read happens through
+  `camflow ctl read-trace` / `read-state` / `read-events` —
+  structured, scoped, observable.
+
+### Lifecycle
+
+```
+   first camflow run                   explicit human kill
+   in this project                     `camflow steward kill`
+        │                                     │
+        ▼                                     ▼
+   ┌─────────┐                            ┌───────┐
+   │  BORN   │                            │ DEAD  │
+   └────┬────┘                            └───────┘
+        │                                     ▲
+        ▼                                     │
+   ┌──────────────────────────────────────────┘
+   │ ALIVE
+   │   between flows: idle, zero CPU / token cost
+   │   on event:      one Claude turn, back to idle
+   │   on resume:     reattached, sees engine_resumed event
+   └────
+```
+
+`flow_idle` and the compaction-handoff path land in Phase B.
+
+### Project memory files (under `.camflow/`)
+
+| File                       | Owner   | Purpose                            |
+|----------------------------|---------|------------------------------------|
+| `steward.json`             | engine  | pointer: id, paths, spawn time     |
+| `steward-prompt.txt`       | engine  | boot pack (written once at spawn)  |
+| `steward-events.jsonl`     | engine  | append-only mirror of every event  |
+| `steward-summary.md`       | Steward | working memory (Phase B checkpoint) |
+| `steward-archive.md`       | Steward | per-flow condensed memory (Phase B) |
+| `steward-history.log`      | engine  | session log on handoff (Phase B)    |
+
+### `flows_witnessed`
+
+Each Steward record in `agents.json` carries a `flows_witnessed: []`
+list — the flow_ids it saw during its lifetime. Engine appends on
+every `flow_started` (idempotent on resume).
+`camflow steward status` surfaces the count.
+
+---
+
+## 10. Trust Model — LLMs off the dispatch path
+
+The central tension solved by the Phase A redesign: we want a chat
+interface and persistent project memory (that's what an LLM is good
+at) **without** trusting an LLM with deterministic state writes,
+locks, or scheduling.
+
+```
+                    Implementation         Failure containment
+   ┌─────────────────────────────────────────────────────────────┐
+   │ Engine          │  deterministic Python  │ code review,        │
+   │ Watchdog        │  deterministic Python  │ unit tests, atomic   │
+   │                 │                        │ state writes        │
+   ├─────────────────────────────────────────────────────────────┤
+   │ Planner agent   │  LLM                   │ DSL + plan-quality  │
+   │  (writes yaml)  │                        │ validators (every    │
+   │                 │                        │ loop iteration);    │
+   │                 │                        │ engine re-validates │
+   │                 │                        │ before launch       │
+   ├─────────────────────────────────────────────────────────────┤
+   │ Steward         │  LLM                   │ ctl verb whitelist; │
+   │  (proposes)     │                        │ Phase B: autonomy   │
+   │                 │                        │ config + risky      │
+   │                 │                        │ verbs need human    │
+   │                 │                        │ confirm             │
+   └─────────────────────────────────────────────────────────────┘
+```
+
+**LLMs never sit on the critical path.** Every LLM output is filtered
+through a deterministic validator/dispatcher before it can change
+system state:
+
+- Planner produces a yaml → `camflow plan-tool validate` runs DSL
+  + plan-quality every iteration; engine re-validates before
+  spawning anything.
+- Steward proposes a corrective action → `camflow ctl <verb>` checks
+  the verb against a whitelist + arg schema. In Phase B the risky
+  verbs (`spawn` / `skip` / `replan`) queue to
+  `control-pending.jsonl` and need human approval before drain.
+- Workers produce `node-result.json` → `result_reader` validates;
+  malformed results synthesize a typed fail.
+
+The agent registry (`agents.json`) and the trace log (`trace.log`)
+together let the engine reason about "who is alive right now?" and
+"what happened?" without ever asking an LLM.
+
+---
+
 ## Glossary
 
 - **agent** — an LLM-driven sub-process spawned via `camc run` to
@@ -430,11 +593,36 @@ ln -sf <repo>/bin/camflow ~/bin/camflow
 - **camflow-manager** — the user-facing skill. Runs the 8-phase
   lifecycle (GATHER → COLLECT → PLAN → REVIEW → SETUP → CONFIRM →
   KICKOFF → POST). Calls the Planner; launches the Engine; exits.
-- **Planner** — `camflow plan` CLI; one LLM call, produces a
-  validated workflow.yaml.
+- **Planner** — `camflow plan` CLI. As of Phase A the default is an
+  **agent** Planner: a camc-spawned Claude Code session that
+  explores, drafts, self-validates, iterates, and writes the final
+  yaml. The pre-Phase-A single-shot LLM Planner is preserved for one
+  release cycle behind `camflow plan --legacy`.
+- **plan-tool** — `camflow plan-tool` — internal subcommands the
+  Planner agent shells out to during its self-validate / write loop.
+  Two verbs: `validate` (DSL + plan-quality, prints JSON) and
+  `write` (atomic write yaml from stdin, sandboxed to `.camflow/`).
 - **Engine** — the Python process that runs workflows in CAM mode.
-  Owns agent lifecycle, state, trace.
+  Owns agent lifecycle, state, trace, and the agent registry. Sole
+  writer of `state.json` and `agents.json`.
 - **Runner** — the camflow-runner skill; per-tick executor for CLI
   mode.
 - **Scout** — `camflow scout`; read-only probes of the skill catalog
-  and environment that ground the Planner's decisions.
+  and environment that ground the legacy Planner's decisions. Demoted
+  from prerequisite to optional optimization in the agent Planner
+  path (the agent does its own exploration).
+- **Steward** — the project-scoped persistent LLM agent (one per
+  `.camflow/`). Phase A. The user's chat front-end and the project's
+  long-term memory. Never auto-exits — only human action ends it.
+  See §9.
+- **ctl / control plane** — `camflow ctl <verb>` is the narrow
+  whitelisted interface through which the Steward (and humans)
+  influence a running engine. Phase A ships read-only verbs;
+  mutating verbs land in Phase B with autonomy + confirm flow.
+- **agent registry** — `.camflow/agents.json`; the snapshot view of
+  every camc agent ever spawned in this project (steward, planner,
+  worker), with status. Engine is sole writer; everything else
+  reads. See `architecture.md`.
+- **trust model** — see §10. LLMs (Planner, Steward) are advisory;
+  Engine + Watchdog are the only deterministic dispatchers / state
+  writers.
