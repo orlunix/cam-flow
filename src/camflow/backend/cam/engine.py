@@ -60,7 +60,11 @@ from camflow.engine.monitor import (
 from camflow.engine.state import apply_updates, init_state
 from camflow.engine.state_enricher import enrich_state, init_structured_fields
 from camflow.engine.transition import resolve_next
-from camflow.registry import on_agent_finalized, on_agent_spawned
+from camflow.registry import (
+    append_flow_to_steward,
+    on_agent_finalized,
+    on_agent_spawned,
+)
 from camflow.steward import (
     emit_engine_resumed,
     emit_flow_started,
@@ -269,14 +273,27 @@ class Engine:
     def _emit_steward_flow_started(self):
         if self.config.no_steward:
             return
+        flow_id = self.state.get("flow_id")
         try:
             emit_flow_started(
                 self.project_dir,
-                flow_id=self.state.get("flow_id"),
+                flow_id=flow_id,
                 workflow_path=os.path.abspath(self.workflow_path),
             )
         except Exception as e:
             self._log_engine_error("steward emit_flow_started failed", e)
+
+        # Record this flow in the Steward's flows_witnessed list so
+        # `camflow steward status` can show the cross-flow correlation
+        # (design §12). Idempotent — re-runs of the same flow_id are
+        # no-ops.
+        if flow_id:
+            try:
+                append_flow_to_steward(self.project_dir, flow_id)
+            except Exception as e:
+                self._log_engine_error(
+                    "registry append_flow_to_steward failed", e,
+                )
 
     def _emit_steward_flow_terminal(self):
         if self.config.no_steward:

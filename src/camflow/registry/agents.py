@@ -179,3 +179,34 @@ def get_current_steward(
         if agent.get("id") == sid:
             return agent
     return None
+
+
+def append_flow_to_steward(
+    project_dir: str | os.PathLike, flow_id: str,
+) -> bool:
+    """Idempotently append ``flow_id`` to the current Steward's
+    ``flows_witnessed`` list. Returns True if the registry was
+    written, False if there was no Steward, the flow was already
+    listed, or anything else made the call a no-op.
+
+    Project-scoped: a single Steward witnesses many flows over its
+    lifetime. The list correlates the Steward back to the flows it
+    saw — used by ``camflow steward status`` and Phase B's
+    compaction-handoff boot pack.
+    """
+    if not flow_id:
+        return False
+    registry = load_registry(project_dir)
+    sid = registry.get("current_steward_id")
+    if not sid:
+        return False
+    for agent in registry["agents"]:
+        if agent.get("id") != sid:
+            continue
+        flows = agent.setdefault("flows_witnessed", [])
+        if flow_id in flows:
+            return False
+        flows.append(flow_id)
+        _save(project_dir, registry)
+        return True
+    return False
