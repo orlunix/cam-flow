@@ -300,13 +300,26 @@ def dispatch(verb_name: str, argv: list[str], project_dir: str | None = None) ->
                 )
                 return 1
 
-    # autonomy == "confirm" → queue and exit 0
+    # autonomy == "confirm" → queue and exit 0. Use the autonomy
+    # config's confirm.timeout_minutes so a project that wants a
+    # tighter / looser deadline gets it.
+    timeout_minutes = 30
+    try:
+        from camflow.steward.autonomy import (
+            confirm_timeout_minutes,
+            load_config,
+        )
+        timeout_minutes = confirm_timeout_minutes(load_config(pdir))
+    except Exception:
+        pass
+
     queue_pending(
         pdir,
         verb=verb_name,
         args=vars(args),
         issued_by=os.environ.get("CAMFLOW_CTL_ACTOR", "user"),
         flow_id=os.environ.get("CAMFLOW_CTL_FLOW_ID"),
+        timeout_minutes=timeout_minutes,
     )
     sys.stdout.write(
         f"queued {verb_name} for confirmation; "

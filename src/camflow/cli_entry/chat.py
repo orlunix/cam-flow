@@ -1,21 +1,17 @@
 """``camflow chat`` — talk to the project's Steward.
 
-Phase A surface (smaller than design §8.2 — we only ship what's
-backed by working plumbing in this phase):
-
     camflow chat "现在状况?"        one-shot send + brief reply note
     camflow chat                    same but reads message from stdin
-    camflow chat --history          print recent (user, steward) turns
+    camflow chat --history          print recent engine→Steward events
                                     from .camflow/steward-events.jsonl
-                                    (mirror of every event the engine
-                                    sent) and from steward-history.log
-                                    when present.
+    camflow chat --pending          interactively review pending
+                                    confirm-queue entries
+                                    (Phase B — see steward.autonomy)
 
-Deferred to Phase B:
+Deferred:
 
-    --inbox             — needs ``ask-user`` queue (Phase B mutating verb)
-    --pending           — needs the ``confirm`` queue (Phase B autonomy)
-    --all               — multi-project fan-out
+    --inbox             — Steward 'ask-user' queue (Phase B / later)
+    --all               — multi-project fan-out (OQ-7, deferred)
 
 Resolution order for "current Steward":
 
@@ -168,6 +164,218 @@ def _do_history(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---- pending (Phase B confirm-flow review) -----------------------------
+
+
+def _read_pending(project_dir: str) -> list[dict[str, Any]]:
+    p = Path(project_dir) / ".camflow" / "control-pending.jsonl"
+    if not p.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _truncate_pending(project_dir: str) -> None:
+    p = Path(project_dir) / ".camflow" / "control-pending.jsonl"
+    try:
+        p.write_text("", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _append_jsonl(path: Path, entry: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _is_expired(entry: dict[str, Any], now_iso: str) -> bool:
+    """Naive ISO8601 string comparison works because all timestamps
+    are UTC ISO8601."""
+    expires_at = entry.get("expires_at")
+    if not isinstance(expires_at, str):
+        return False
+    return now_iso > expires_at
+
+
+def _emit_resolution_trace(
+    project_dir: str,
+    *,
+    verb: str,
+    args: dict[str, Any],
+    flow_id: str | None,
+    resolution: str,
+    actor: str = "user",
+) -> None:
+    from camflow.backend.cam.tracer import build_event_entry
+    from camflow.backend.persistence import append_trace_atomic
+    import time
+
+    try:
+        append_trace_atomic(
+            str(Path(project_dir) / ".camflow" / "trace.log"),
+            build_event_entry(
+                "control_resolution",
+                actor=actor,
+                flow_id=flow_id,
+                ts=time.time(),
+                verb=verb,
+                args=args,
+                resolution=resolution,
+            ),
+        )
+    except Exception:
+        pass
+
+
+def _do_pending(args: argparse.Namespace) -> int:
+    """Interactive review of pending confirm-queue entries."""
+    project_dir = _resolve_project_dir(args.project_dir)
+
+    pending = _read_pending(project_dir)
+    if not pending:
+        print("(no pending confirms)")
+        return 0
+
+    # Drop expired entries first (timeout-deny per OQ-11 = B). The
+    # config's confirm.timeout_minutes is what shaped expires_at when
+    # the entry was queued; here we just compare against now.
+    from datetime import datetime, timezone
+    now_iso = (
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    )
+
+    rejected_path = (
+        Path(project_dir) / ".camflow" / "control-rejected.jsonl"
+    )
+    approved_path = (
+        Path(project_dir) / ".camflow" / "control.jsonl"
+    )
+
+    surviving: list[dict[str, Any]] = []
+    expired = 0
+    for entry in pending:
+        if _is_expired(entry, now_iso):
+            entry_with_outcome = dict(entry)
+            entry_with_outcome["resolution"] = "timeout-rejected"
+            entry_with_outcome["resolved_at"] = now_iso
+            _append_jsonl(rejected_path, entry_with_outcome)
+            _emit_resolution_trace(
+                project_dir,
+                verb=entry.get("verb", "?"),
+                args=entry.get("args") or {},
+                flow_id=entry.get("flow_id"),
+                resolution="timeout-rejected",
+                actor="system",
+            )
+            expired += 1
+        else:
+            surviving.append(entry)
+
+    if expired:
+        print(f"(expired {expired} entry/entries past timeout)")
+
+    if not surviving:
+        _truncate_pending(project_dir)
+        return 0
+
+    print(f"{len(surviving)} pending confirmation(s):")
+    print()
+
+    decisions: list[tuple[dict[str, Any], str]] = []
+    for entry in surviving:
+        ts = entry.get("ts", "?")
+        verb = entry.get("verb", "?")
+        verb_args = entry.get("args") or {}
+        issued_by = entry.get("issued_by", "?")
+        print(f"  ts:        {ts}")
+        print(f"  verb:      {verb}")
+        print(f"  args:      {verb_args}")
+        print(f"  issued by: {issued_by}")
+        print(f"  expires:   {entry.get('expires_at', '?')}")
+
+        if args.yes_to_all:
+            choice = "y"
+        elif args.no_to_all:
+            choice = "n"
+        else:
+            try:
+                raw = input("  approve? [y/N/never] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                raw = "n"
+            choice = raw or "n"
+        decisions.append((entry, choice))
+        print()
+
+    # Apply decisions: y → control.jsonl + resolution=approved;
+    # n → control-rejected.jsonl + resolution=rejected;
+    # never → set_override(verb, block) + control-rejected.jsonl.
+    from camflow.steward.autonomy import LEVEL_BLOCK, set_override
+
+    approved_count = rejected_count = blocked_count = 0
+    for entry, choice in decisions:
+        verb = entry.get("verb", "?")
+        verb_args = entry.get("args") or {}
+        flow_id = entry.get("flow_id")
+
+        if choice in ("y", "yes"):
+            approved_entry = {
+                "ts": now_iso,
+                "verb": verb,
+                "args": verb_args,
+                "issued_by": entry.get("issued_by", "user"),
+                "flow_id": flow_id,
+            }
+            _append_jsonl(approved_path, approved_entry)
+            _emit_resolution_trace(
+                project_dir, verb=verb, args=verb_args,
+                flow_id=flow_id, resolution="approved",
+            )
+            approved_count += 1
+        elif choice == "never":
+            try:
+                set_override(project_dir, verb, LEVEL_BLOCK)
+            except Exception:
+                pass
+            rej = dict(entry)
+            rej["resolution"] = "blocked-by-user"
+            rej["resolved_at"] = now_iso
+            _append_jsonl(rejected_path, rej)
+            _emit_resolution_trace(
+                project_dir, verb=verb, args=verb_args,
+                flow_id=flow_id, resolution="blocked-by-user",
+            )
+            blocked_count += 1
+        else:
+            rej = dict(entry)
+            rej["resolution"] = "rejected"
+            rej["resolved_at"] = now_iso
+            _append_jsonl(rejected_path, rej)
+            _emit_resolution_trace(
+                project_dir, verb=verb, args=verb_args,
+                flow_id=flow_id, resolution="rejected",
+            )
+            rejected_count += 1
+
+    _truncate_pending(project_dir)
+
+    print(
+        f"approved={approved_count} rejected={rejected_count} "
+        f"blocked={blocked_count} (and {expired} expired before review)"
+    )
+    return 0
+
+
 # ---- CLI hookup ---------------------------------------------------------
 
 
@@ -194,12 +402,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--tail", type=int, default=20,
         help="With --history, number of events to show (default: 20).",
     )
+    p.add_argument(
+        "--pending", action="store_true",
+        help="Interactively review pending confirm-queue entries.",
+    )
+    p.add_argument(
+        "--yes-to-all", action="store_true",
+        help="With --pending, approve every entry non-interactively.",
+    )
+    p.add_argument(
+        "--no-to-all", action="store_true",
+        help="With --pending, reject every entry non-interactively.",
+    )
     return p
 
 
 def chat_command(argv: list[str]) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.pending:
+        return int(_do_pending(args))
     if args.history:
         return int(_do_history(args))
     return int(_do_send(args))
