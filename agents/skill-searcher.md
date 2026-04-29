@@ -1,11 +1,11 @@
 ---
-name: skill_searcher
-description: Autonomous agent that discovers and filters skills relevant to a goal. Walks the skillm repo + project skills directories itself, reads SKILL.md frontmatters, returns the relevant subset. Frees the Planner from having to read 30+ skill files.
-metadata:
-  category: camflow-builtin-agent
-  tags: skill-search, planner-helper
-allowed-tools: Read Bash Glob Grep
+name: skill-searcher
+description: Discovers and filters skills relevant to a goal. Walks the skillm repo + project skills directories, reads SKILL.md frontmatters, returns the relevant subset. Frees the Planner from reading 30+ skill files itself.
+role: worker
+invocation: sub_agent
+tools: Read, Glob, Grep, Bash
 ---
+
 
 # Agent: skill_searcher
 

@@ -20,9 +20,9 @@ Two foundational principles — both load-bearing:
    - **Skill** = a capability template (`SKILL.md` prompt + tool grants).
      Agents USE skills.
 
-   Built-in agent definitions live in `agents/<name>/AGENT.md`. Built-in skill
+   Built-in agent definitions live in `agents/<name>.md`. Built-in skill
    templates live in `skills/<name>/SKILL.md`. Roles like Planner / Evaluator /
-   Worker / Orchestrator are AGENTS — `agents/planner/AGENT.md` (autonomous,
+   Worker / Orchestrator are AGENTS — `agents/planner.md` (autonomous,
    uses skill_searcher + workflow_designer internally) — NOT
    `skills/planner/SKILL.md` (one prompt) and NOT
    `workflows/planner/workflow.yaml` (sub-DAG). Both alternatives are wrong.
@@ -183,7 +183,7 @@ camflow/
 
 **DON'T**
 - **Don't model a role as a single skill OR as a sub-workflow.** Planner /
-  Evaluator / Worker / Orchestrator are AGENTS — `agents/<name>/AGENT.md`
+  Evaluator / Worker / Orchestrator are AGENTS — `agents/<name>.md`
   (autonomous Claude Code session, one camc spawn, multi-step internally). A
   single SKILL.md is too small (one prompt). A sub-workflow (DAG) is too
   big (agents don't kick off workflows). The right shape is one autonomous

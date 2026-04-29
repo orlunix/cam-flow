@@ -678,21 +678,31 @@ def _builtin_agents_root() -> Path:
 
 
 def _list_builtin_agents() -> list[str]:
-    """Names of all camflow-shipped agents (each is a dir with AGENT.md)."""
+    """Names of camflow-shipped agents.
+
+    Per Claude Code's subagent spec, agents are flat <name>.md files
+    (NOT subdirectories). Each lives at <repo>/agents/<name>.md.
+    """
     root = _builtin_agents_root()
     if not root.is_dir():
         return []
     return sorted(
-        p.name for p in root.iterdir()
-        if p.is_dir() and (p / "AGENT.md").exists()
+        p.stem for p in root.iterdir()
+        if p.is_file() and p.suffix == ".md"
     )
 
 
 def _ensure_builtin_agents_installed(project_root: Path) -> None:
     """Symlink camflow's built-in agents into <project>/.claude/agents/.
 
-    Mirrors _ensure_builtin_skills_installed. Idempotent. Respects user
-    overrides (if a real dir exists at target name, leave it).
+    Per Claude Code's subagent spec, agents are flat <name>.md files
+    (this differs from skills which are <name>/SKILL.md subdirectories).
+    Claude Code auto-discovers agents at .claude/agents/*.md, so once
+    symlinks exist any spawned camc agent in this project sees them as
+    slash-agents (callable via /name) without further setup.
+
+    Idempotent. Respects user overrides (if a real file exists at the
+    target name, leave it).
     """
     src_root = _builtin_agents_root()
     if not src_root.is_dir():
@@ -700,7 +710,7 @@ def _ensure_builtin_agents_installed(project_root: Path) -> None:
     target_root = project_root / ".claude" / "agents"
     target_root.mkdir(parents=True, exist_ok=True)
     for src in src_root.iterdir():
-        if not src.is_dir() or not (src / "AGENT.md").exists():
+        if not src.is_file() or src.suffix != ".md":
             continue
         target = target_root / src.name
         try:
@@ -709,23 +719,23 @@ def _ensure_builtin_agents_installed(project_root: Path) -> None:
                     continue
                 target.unlink()
             elif target.exists():
-                continue
+                continue  # user override
             target.symlink_to(src.resolve())
         except OSError:
             pass
 
 
 def _resolve_agent_md_path(name: str, project_root: Path) -> Path | None:
-    """Find an agent's AGENT.md. Lookup order:
+    """Find an agent's <name>.md (flat file, Claude Code spec). Lookup order:
 
-      1. <project>/.claude/agents/<name>/AGENT.md   (project-installed)
-      2. ~/.claude/agents/<name>/AGENT.md           (global)
-      3. <camflow-repo>/agents/<name>/AGENT.md      (built-in fallback)
+      1. <project>/.claude/agents/<name>.md   (project-installed)
+      2. ~/.claude/agents/<name>.md           (global)
+      3. <camflow-repo>/agents/<name>.md      (built-in fallback)
     """
     for p in [
-        project_root / ".claude" / "agents" / name / "AGENT.md",
-        Path.home() / ".claude" / "agents" / name / "AGENT.md",
-        _builtin_agents_root() / name / "AGENT.md",
+        project_root / ".claude" / "agents" / f"{name}.md",
+        Path.home() / ".claude" / "agents" / f"{name}.md",
+        _builtin_agents_root() / f"{name}.md",
     ]:
         if p.exists():
             return p
@@ -1065,7 +1075,7 @@ def _build_agent_prompt(role_md: str, workflow: dict, node: dict,
 
 
 def _exec_agent(name: str, actx: dict, run: Run, node: dict, attempt_n: int) -> dict:
-    """Run an autonomous camc agent loaded with agents/<name>/AGENT.md.
+    """Run an autonomous camc agent loaded with agents/<name>.md.
 
     Differs from _exec_skill in that the agent is autonomous: it can use
     Claude Code tools (Read/Write/Bash/Glob/Grep), read multiple skills,
@@ -1077,7 +1087,7 @@ def _exec_agent(name: str, actx: dict, run: Run, node: dict, attempt_n: int) -> 
     if role_md is None:
         return _empty_envelope("failure", error={
             "code": "AGENT_NOT_FOUND",
-            "message": f"agents/{name}/AGENT.md not found",
+            "message": f"agents/{name}.md not found",
         })
 
     prompt = _build_agent_prompt(role_md, run.workflow, node,
@@ -1255,36 +1265,44 @@ def run_verify(run: Run, node: dict, output: dict,
 
 def _run_verify_agent(rule: dict, run: Run, node: dict, output: dict,
                       attempt_n: int, rule_idx: int) -> tuple[bool, str]:
-    """Spawn an evaluator skill (default: skill.evaluator) to judge whether
-    `output.data` meets the rule's `criterion`.
+    """Spawn an evaluator agent (or skill) to judge whether `output.data`
+    meets the rule's `criterion`.
 
-    Rule schema:
-      - type: agent
-        skill: <name>          # optional, default "evaluator"
-        criterion: <string>    # required: what makes the output acceptable
+    Resolution order — prefer agent.evaluator (autonomous, can read context
+    files / run validation commands) over skill.evaluator (one-shot LLM):
 
-    The evaluator returns an envelope with data.approved (bool); if false,
-    we fail verify with its reasoning. Mock mode is supported via rule.mock
-    for deterministic tests (skips the real camc spawn).
+      1. rule.agent: <name>     →  use agent.<name> (top-level autonomous)
+      2. rule.skill: <name>     →  use skill.<name> (one-shot)
+      3. agents/evaluator.md exists  →  agent.evaluator (default)
+      4. otherwise              →  skill.evaluator (built-in fallback)
+
+    Mock mode (rule.mock = {approved: bool, reasoning: string}) bypasses
+    the spawn for deterministic tests.
     """
-    skill_name = rule.get("skill", "evaluator")
     criterion = rule.get("criterion") or ""
     if not criterion:
         return False, "verify type=agent: missing required `criterion`"
 
-    # Mock path: deterministic in tests, no LLM cost. Trigger by setting
-    # rule.mock = {approved: bool, reasoning: string}.
+    # Mock path: deterministic, no LLM cost.
     if isinstance(rule.get("mock"), dict):
         m = rule["mock"]
         if m.get("approved"):
             return True, "ok (mock)"
         return False, f"verify agent rejected: {m.get('reasoning', '<no reason>')}"
 
-    # Real path: spawn a sub-skill agent for this rule.
-    # Each verify-agent call is its own attempt-scoped sub-workspace so
-    # prompt + response + output are debuggable alongside the parent attempt.
+    # Resolve which evaluator to spawn.
+    if rule.get("agent"):
+        verifier_kind, verifier_name = "agent", rule["agent"]
+    elif rule.get("skill"):
+        verifier_kind, verifier_name = "skill", rule["skill"]
+    elif _resolve_agent_md_path("evaluator", run.project_root) is not None:
+        verifier_kind, verifier_name = "agent", "evaluator"
+    else:
+        verifier_kind, verifier_name = "skill", "evaluator"
+
+    # Per-rule sub-workspace so prompt + response + output are debuggable.
     sub_dir = (run.run_dir / "nodes" / node["id"]
-               / f"attempt-{attempt_n}" / f"verify-agent-{rule_idx}")
+               / f"attempt-{attempt_n}" / f"verify-{verifier_kind}-{rule_idx}")
     sub_dir.mkdir(parents=True, exist_ok=True)
     workspace = sub_dir / "workspace"
     workspace.mkdir(exist_ok=True)
@@ -1299,11 +1317,12 @@ def _run_verify_agent(rule: dict, run: Run, node: dict, output: dict,
         "node_goal": node.get("goal", ""),
     }
     (workspace / "input.json").write_text(json.dumps(inputs, indent=2))
+
     sub_node = {
-        "id": f"{node['id']}__verify_agent_{rule_idx}",
+        "id": f"{node['id']}__verify_{verifier_kind}_{rule_idx}",
         "goal": f"Judge whether the output of node `{node['id']}` "
                 f"meets: {criterion}",
-        "uses": f"skill.{skill_name}",
+        "uses": f"{verifier_kind}.{verifier_name}",
         "input": inputs,
         "output_schema": {
             "approved": "boolean",
@@ -1311,24 +1330,29 @@ def _run_verify_agent(rule: dict, run: Run, node: dict, output: dict,
             "issues": "array",
         },
     }
-    prompt = _build_skill_prompt(run.workflow, sub_node, inputs,
-                                 skill_name=skill_name, run=run)
-    (workspace / "prompt.txt").write_text(prompt)
-    actx = {
-        "att_dir": sub_dir,
-        "workspace": workspace,
-        "inputs": inputs,
-        "prompt_text": prompt,
-    }
-    env = _exec_skill(skill_name, actx, run, sub_node, attempt_n=1)
 
-    # Persist the verifier envelope alongside the parent attempt for
-    # post-mortem inspection.
+    if verifier_kind == "agent":
+        # Autonomous: use _build_agent_prompt + _exec_agent (loads AGENT.md)
+        role_md = _load_agent_md(verifier_name, run) or ""
+        prompt = _build_agent_prompt(role_md, run.workflow, sub_node,
+                                     inputs, run.project_root)
+        (workspace / "prompt.txt").write_text(prompt)
+        actx = {"att_dir": sub_dir, "workspace": workspace,
+                "inputs": inputs, "prompt_text": prompt}
+        env = _exec_agent(verifier_name, actx, run, sub_node, attempt_n=1)
+    else:
+        prompt = _build_skill_prompt(run.workflow, sub_node, inputs,
+                                     skill_name=verifier_name, run=run)
+        (workspace / "prompt.txt").write_text(prompt)
+        actx = {"att_dir": sub_dir, "workspace": workspace,
+                "inputs": inputs, "prompt_text": prompt}
+        env = _exec_skill(verifier_name, actx, run, sub_node, attempt_n=1)
+
     (sub_dir / "output.json").write_text(json.dumps(env, indent=2))
 
     if env.get("status") != "success":
         return False, (
-            f"verify agent (skill.{skill_name}) failed to run: "
+            f"verify {verifier_kind}.{verifier_name} failed to run: "
             f"{(env.get('error') or {}).get('message', 'unknown')}"
         )
     data = env.get("data") or {}
@@ -1337,7 +1361,7 @@ def _run_verify_agent(rule: dict, run: Run, node: dict, output: dict,
         issues = data.get("issues") or []
         if issues:
             reason += f" Issues: {issues}"
-        return False, f"verify agent rejected: {reason}"
+        return False, f"verify {verifier_kind}.{verifier_name} rejected: {reason}"
     return True, "ok"
 
 
@@ -1690,7 +1714,7 @@ def _planner_bootstrap_workflow() -> dict:
     autonomous agent (workflow IS multi-agent; agents don't kick off
     workflows):
 
-      1. search_skills  (agent.skill_searcher, autonomous)
+      1. search_skills  (agent.skill-searcher, autonomous)
          Walks ~/.skillm/repos and <project>/.claude/skills/ itself,
          uses Glob/Grep/Read to discover and filter SKILL.md files.
          Returns relevant subset with descriptions. Keeps Planner's
@@ -1716,7 +1740,7 @@ def _planner_bootstrap_workflow() -> dict:
                 "goal": "Discover skills relevant to the goal by walking the "
                         "skillm repository and project skills dirs. Don't "
                         "read every SKILL.md — Glob/Grep first, Read selectively.",
-                "uses": "agent.skill_searcher",
+                "uses": "agent.skill-searcher",
                 "input": {
                     "goal": "{{state.goal}}",
                 },

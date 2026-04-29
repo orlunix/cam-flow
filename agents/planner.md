@@ -1,11 +1,11 @@
 ---
 name: planner
-description: Autonomous camflow Planner agent. Given a natural-language goal, designs and emits a complete workflow.yaml. Reads the project's skill catalog itself, picks relevant skills, composes a DAG. Multi-step internally — uses Read/Write tools — but emits one final envelope.
-metadata:
-  category: camflow-builtin-agent
-  tags: planner, agent, workflow-design
-allowed-tools: Read Write Bash Glob Grep
+description: Autonomous camflow Planner agent. Given a natural-language goal, designs and emits a complete workflow.yaml that the runtime can execute. Multi-step internally, but emits one final envelope.
+role: planner
+invocation: top_level
+tools: Read, Write, Bash, Glob, Grep
 ---
+
 
 # Agent: planner
 
