@@ -656,6 +656,93 @@ def _load_skill_template(skill_name: str, run: Run) -> str | None:
     return p.read_text() if p else None
 
 
+def _parse_skill_md_frontmatter(text: str) -> dict:
+    """Extract YAML frontmatter from a SKILL.md / AGENT.md file.
+
+    Returns {} if no frontmatter or parse fails. Robust: never raises.
+    """
+    if not text.startswith("---"):
+        return {}
+    try:
+        end = text.index("\n---", 3)
+    except ValueError:
+        return {}
+    fm_text = text[3:end].strip()
+    try:
+        meta = yaml.safe_load(fm_text)
+        return meta if isinstance(meta, dict) else {}
+    except yaml.YAMLError:
+        return {}
+
+
+def _build_skill_catalog(project_root: Path) -> list[dict]:
+    """Read every reachable SKILL.md, extract frontmatter, return a compact
+    catalog. The catalog is what the skill_searcher and planner agents see —
+    they don't have to Read individual SKILL.md files themselves.
+
+    Each entry:
+      { name, source, description, tags, requires_tools, requires_skills,
+        argument_hint, compatibility }
+    """
+    seen: dict[str, dict] = {}
+
+    def consume(name: str, path: Path, source: str) -> None:
+        if name in seen:
+            return  # earlier source wins (built-in overrides skillm same-name)
+        try:
+            text = path.read_text()
+        except OSError:
+            return
+        fm = _parse_skill_md_frontmatter(text)
+        meta_raw = fm.get("metadata") or {}
+        # tags can be a comma-separated string or a YAML list
+        tags = meta_raw.get("tags") or fm.get("tags") or []
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(",") if t.strip()]
+        seen[name] = {
+            "name": name,
+            "source": source,
+            "description": (fm.get("description") or "").strip(),
+            "tags": tags,
+            "requires_tools": meta_raw.get("requires-tools")
+                              or meta_raw.get("requires_tools") or [],
+            "requires_skills": meta_raw.get("requires-skills")
+                               or meta_raw.get("requires_skills") or [],
+            "argument_hint": fm.get("argument-hint")
+                             or fm.get("argument_hint") or "",
+            "compatibility": fm.get("compatibility") or "",
+        }
+
+    # Order matters: project-installed first, then global, then skillm, then builtin.
+    proj_root = project_root / ".claude" / "skills"
+    if proj_root.is_dir():
+        for d in proj_root.iterdir():
+            if d.is_dir() and (d / "SKILL.md").exists():
+                consume(d.name, d / "SKILL.md", "project")
+
+    global_root = Path.home() / ".claude" / "skills"
+    if global_root.is_dir():
+        for d in global_root.iterdir():
+            if d.is_dir() and (d / "SKILL.md").exists():
+                consume(d.name, d / "SKILL.md", "global")
+
+    skillm_repos = Path.home() / ".skillm" / "repos"
+    if skillm_repos.is_dir():
+        for repo in skillm_repos.iterdir():
+            if repo.is_dir():
+                for d in repo.iterdir():
+                    if d.is_dir() and (d / "SKILL.md").exists():
+                        consume(d.name, d / "SKILL.md", f"skillm:{repo.name}")
+
+    bi = _builtin_skills_root()
+    if bi.is_dir():
+        for d in bi.iterdir():
+            if d.is_dir() and (d / "SKILL.md").exists():
+                consume(d.name, d / "SKILL.md", "builtin")
+
+    return sorted(seen.values(), key=lambda e: e["name"])
+
+
 # ─── Agent resolution (built-in autonomous agents) ─────────────────────
 
 def _builtin_agents_root() -> Path:
@@ -1201,6 +1288,21 @@ def run_verify(run: Run, node: dict, output: dict,
                                            attempt_n, idx)
             if not ok:
                 return False, reason
+        elif rtype == "workflow_yaml":
+            # Validate that a string field in `data` parses as a valid
+            # camflow workflow.yaml (full structural + skill validation).
+            # Used by the planner bootstrap to gate the Planner's output.
+            field = rule.get("field", "workflow_yaml")
+            data = output.get("data") or {}
+            yaml_text = data.get(field, "")
+            if not isinstance(yaml_text, str) or not yaml_text.strip():
+                return False, f"workflow_yaml: field `data.{field}` is empty or not a string"
+            try:
+                parse_workflow_yaml(yaml_text, project_root=run.project_root)
+            except WorkflowParseError as e:
+                # Surface the validation message verbatim so retry feedback
+                # can hand it back to the agent that wrote the YAML.
+                return False, f"workflow_yaml verify failed: {e}"
         else:
             return False, f"unknown verify type: {rtype}"
     return True, "ok"
@@ -1314,6 +1416,86 @@ def _propagate_skip(run: Run, halting_node: str,
                       reason=f"{code.lower()}")
 
 
+def _workflow_library_root() -> Path:
+    """Where successful workflows get backed up. Override via env var
+    CAMFLOW_LIBRARY_ROOT for tests / non-default locations."""
+    override = os.environ.get("CAMFLOW_LIBRARY_ROOT")
+    if override:
+        return Path(override)
+    return Path.home() / ".camflow" / "workflows"
+
+
+def _archive_successful_workflow(run: "Run", workflow: dict) -> None:
+    """After workflow_completed, copy the workflow.yaml to the library
+    and append metadata to index.json. Idempotent (safe to call multiple
+    times for the same run).
+
+    Skips internal/bootstrap workflows so the library stays user-meaningful:
+      - workflow name starts with 'planner-bootstrap' (camflow internal)
+      - workflow has top-level `archive: false`
+    """
+    name = workflow.get("workflow", "unnamed")
+    if name.startswith("planner-bootstrap"):
+        return
+    if workflow.get("archive") is False:
+        return
+
+    library = _workflow_library_root()
+    try:
+        library.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return  # silent; archiving is best-effort
+
+    # Use the run_id (the dir under .camflow/runs/) for the filename.
+    parts = run.run_dir.resolve().parts
+    if "runs" in parts:
+        i = parts.index("runs")
+        run_id = parts[i + 1] if i + 1 < len(parts) else parts[-1]
+    else:
+        run_id = run.run_dir.name
+    safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", name)
+    archive_name = f"{safe_name}-{run_id}.yaml"
+    archive_path = library / archive_name
+
+    # Copy the workflow.yaml snapshot. If the run_dir snapshot is missing
+    # (resume mode etc), serialize the in-memory workflow.
+    src = run.run_dir / "workflow.yaml"
+    try:
+        if src.exists():
+            archive_path.write_text(src.read_text())
+        else:
+            archive_path.write_text(yaml.safe_dump(workflow, sort_keys=False))
+    except OSError:
+        return
+
+    # Append to index.json with metadata so a future skill can search.
+    index_path = library / "index.json"
+    try:
+        index = json.loads(index_path.read_text()) if index_path.exists() else []
+    except (OSError, json.JSONDecodeError):
+        index = []
+    used = sorted({
+        n.get("uses") for n in (workflow.get("nodes") or [])
+        if isinstance(n.get("uses"), str)
+    })
+    entry = {
+        "name": name,
+        "run_id": run_id,
+        "archive": archive_name,
+        "goal": (workflow.get("goal") or "").strip(),
+        "node_count": len(workflow.get("nodes") or []),
+        "uses": used,
+        "completed_at": _utcnow_iso(),
+    }
+    # De-duplicate by archive filename (idempotent re-archive overwrites entry).
+    index = [e for e in index if e.get("archive") != archive_name]
+    index.append(entry)
+    try:
+        index_path.write_text(json.dumps(index, indent=2))
+    except OSError:
+        pass
+
+
 def _halt_workflow(run: Run, halted_node: str, halted_attempt: int,
                    reason: str, envelope: dict) -> None:
     """Pause execution for human/orchestrator handoff.
@@ -1368,6 +1550,7 @@ def _main_loop(run: "Run", workflow: dict) -> str:
                     run.trace("workflow_failed", reason="node failure terminal")
                     return "failure"
                 run.trace("workflow_completed", status="success")
+                _archive_successful_workflow(run, workflow)
                 return "success"
             run.trace("workflow_failed", reason="deadlock: no ready nodes")
             return "failure"
@@ -1558,41 +1741,79 @@ def _result_to_exit_code(result: str) -> int:
 
 
 def _planner_bootstrap_workflow() -> dict:
-    """Minimal 1-node scaffold so `camflow plan` reuses the Run / camc lifecycle
-    machinery to spawn a single autonomous agent (`agent.planner`).
+    """Two-node scaffold for `camflow plan`. Each node is a single agent
+    (workflow IS multi-agent; agents don't kick off workflows):
 
-    The Planner is **an agent, not a workflow** — but to invoke it we still
-    need a Run (workspace, persistence, retry). The runner sees this 1-node
-    scaffold as "spawn one autonomous agent and grab its output". The
-    bootstrap is internal — users never see or write it.
+      1. search_skills  (skill.skill_searcher)
+         A one-shot LLM that takes the full skill catalog and goal,
+         returns the relevant subset. Keeps the planner's context lean.
+      2. plan           (agent.planner, autonomous)
+         Reads only the filtered subset (`relevant_skills`) and the goal,
+         designs the DAG, emits workflow.yaml.
 
     Inputs (via state):
-      goal              required, NL description
-      state_schema      optional, schema for the produced workflow's state
-      available_skills  list of skill names available in the project
-    Output (data):
-      workflow_yaml     string — produced by the planner agent
+      goal             required, NL description
+      state_schema     optional, schema for the produced workflow's state
+      skill_catalog    runtime-injected: full SKILL.md catalog (rich metadata)
+    Output (data of `plan` node):
+      workflow_yaml    string — the user's runnable DAG.
     """
     return {
         "workflow": "planner-bootstrap",
         "version": "0.6",
-        "goal": "Spawn the Planner agent to produce a runnable workflow.yaml.",
+        "goal": "Plan a workflow: search relevant skills, then design the DAG.",
         "nodes": [
             {
+                "id": "search_skills",
+                "goal": "Filter the skill catalog to those plausibly relevant "
+                        "to the goal. Frees the planner's context.",
+                "uses": "skill.skill_searcher",
+                "input": {
+                    "goal": "{{state.goal}}",
+                    "catalog": "{{state.skill_catalog}}",
+                },
+                "output_schema": {
+                    "relevant_skills": "array",
+                    "reasoning": "string",
+                    "excluded_count": "integer",
+                },
+                "verify": [
+                    {"type": "rule",
+                     "assert": "output.data.relevant_skills != null"},
+                ],
+            },
+            {
                 "id": "plan",
-                "goal": "Run the Planner agent on the provided goal.",
+                "goal": "Run the Planner agent on the goal, using only the "
+                        "relevant skills surfaced by search_skills.",
+                "needs": ["search_skills"],
                 "uses": "agent.planner",
                 "input": {
                     "goal": "{{state.goal}}",
                     "state_schema": "{{state.state_schema?}}",
-                    "available_skills": "{{state.available_skills}}",
+                    "relevant_skills": "{{nodes.search_skills.latest.output.data.relevant_skills}}",
+                    "search_reasoning": "{{nodes.search_skills.latest.output.data.reasoning}}",
+                    "previous_validation_error": "{{retry.feedback?}}",
                 },
                 "output_schema": {"workflow_yaml": "string"},
                 "verify": [
                     {"type": "rule",
                      "assert": "output.data.workflow_yaml != ''"},
+                    # Real validation — parses + skill-resolves the YAML.
+                    # If it fails, retry kicks in with the error as feedback.
+                    {"type": "workflow_yaml"},
                 ],
-            }
+                "retry": {
+                    # `until` is meaningless here (workflow_yaml verify is
+                    # the actual gate); set true to never retry on success.
+                    "until": "true",
+                    "max_attempts": 3,
+                    # On verify failure, env.error.message contains the
+                    # workflow_yaml verify reason — feed it back to the
+                    # planner agent so it can self-correct.
+                    "feedback": "{{nodes.plan.latest.output.error.message?}}",
+                },
+            },
         ],
     }
 
@@ -1649,13 +1870,18 @@ def _plan_command(argv: list[str]) -> int:
     # Make sure built-ins are installed in the project so they're discoverable
     # both for the planner agent and for downstream validation.
     _ensure_builtin_skills_installed(cwd)
-    available_skills = sorted(set(_list_builtin_skills() + _list_skillm_skills()))
+    _ensure_builtin_agents_installed(cwd)
 
-    # Step 1: run the planner DAG
+    # Build a rich skill catalog (description, tags, requires) once. The
+    # bootstrap's search_skills node uses it to pick a relevant subset
+    # before invoking the Planner agent — keeps Planner's context focused.
+    skill_catalog = _build_skill_catalog(cwd)
+
+    # Step 1: run the 2-node planner bootstrap (search_skills → plan)
     planner_wf = _planner_bootstrap_workflow()
     planner_state = {
         "goal": args.goal,
-        "available_skills": available_skills,
+        "skill_catalog": skill_catalog,
     }
     if state_schema is not None:
         planner_state["state_schema"] = state_schema
@@ -1665,19 +1891,19 @@ def _plan_command(argv: list[str]) -> int:
               file=sys.stderr)
         return _result_to_exit_code(planner_result)
 
-    # Step 2: extract the produced workflow
-    plan_output_path = planner_dir / "nodes" / "plan" / "attempt-1" / "output.json"
-    plan_output = json.loads(plan_output_path.read_text())
+    # Step 2: extract the produced workflow. The plan node's verify chain
+    # already includes type=workflow_yaml, which means by the time we get
+    # here the YAML has been parsed + skill-resolved successfully (or the
+    # plan node retried up to max_attempts and halted). Find the latest
+    # attempt's output.
+    plan_attempts_dir = planner_dir / "nodes" / "plan"
+    attempt_dirs = sorted(plan_attempts_dir.glob("attempt-*"),
+                          key=lambda p: int(p.name.split("-")[1]))
+    plan_output = json.loads(
+        (attempt_dirs[-1] / "output.json").read_text()
+    )
     yaml_text = (plan_output.get("data") or {}).get("workflow_yaml", "")
-
-    # Step 3: parse + validate (skill.X must exist in built-ins or skillm)
-    try:
-        produced_wf = parse_workflow_yaml(yaml_text, project_root=cwd)
-    except WorkflowParseError as e:
-        print(f"PLAN OUTPUT INVALID: {e}", file=sys.stderr)
-        print("--- raw output ---", file=sys.stderr)
-        print(yaml_text[:1500], file=sys.stderr)
-        return 1
+    produced_wf = parse_workflow_yaml(yaml_text, project_root=cwd)
 
     # Step 4a: --out / stdout
     yaml_canonical = yaml.safe_dump(produced_wf, sort_keys=False,

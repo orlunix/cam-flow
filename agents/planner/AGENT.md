@@ -30,16 +30,27 @@ contains the user's goal and (optionally) a state schema for the workflow.
 
 ## What to do
 
-1. Read `input.json` for `goal`, optional `state_schema`, and `available_skills` (a
-   precomputed list runtime injected for convenience).
-2. **Pick relevant skills.** Don't read every SKILL.md — pick the ones whose
-   description in the available_skills list matches the goal. Read those
-   specific SKILL.md files for details.
+1. Read `input.json`. Key fields:
+   - `goal` — NL description.
+   - `state_schema` (optional) — schema for the produced workflow's state.
+   - `relevant_skills` — already filtered by skill_searcher upstream (you
+     don't see the full catalog; only the relevant subset with descriptions
+     and a one-line `why` per skill). If something seems missing, you can
+     `grep` other SKILL.md files at `<project>/.claude/skills/` or in
+     `~/.skillm/repos/`, but prefer trusting the upstream filter.
+   - `search_reasoning` — skill_searcher's overall filtering rationale.
+   - `previous_validation_error` (sometimes present) — if you produced a
+     workflow on a previous attempt and the runner's `type: workflow_yaml`
+     verify rejected it, you'll see the exact error message here. Read it
+     carefully and fix the specific issue (typo in skill name, bad needs
+     reference, retry.target field that shouldn't exist, missing
+     output_schema, etc.). Don't restart from scratch — patch the previous
+     workflow.
 3. **Design the DAG.** Apply the workflow language (below). Keep it minimal:
    2–6 nodes is usually right. Wire `retry` only on nodes whose output may
    need iteration.
 4. **Self-check.** Before emitting, verify:
-   - Every `uses: skill.X` is in available_skills (or is `tool.X` for shell, or `agent.X` for an autonomous role you know exists).
+   - Every `uses: skill.X` is in `relevant_skills` (or is `tool.X` for shell, or `agent.X` for an autonomous role you know exists).
    - Every node has `output_schema`. (Schema is auto-validated by runtime — you do NOT add `{type: schema}` to verify.)
    - Every cross-node reference uses the correct namespace (see expression rules below).
 5. **Emit.** Write the final envelope to `agent_output.json` in the cwd:
@@ -107,8 +118,9 @@ nodes:
    `nodes.X.latest.output.data.Y`.
 4. **`output_schema` mandatory per node.** Auto-validated; do NOT add
    `{type: schema}` to verify.
-5. **`uses: skill.X` only when X is in `available_skills`.** Don't invent
-   names. If no skill fits, `tool.X` (shell) or `agent.X` (autonomous role).
+5. **`uses: skill.X` only when X is in `relevant_skills`** (the filtered
+   subset upstream skill_searcher gave you). Don't invent names. If no
+   skill fits, `tool.X` (shell) or `agent.X` (autonomous role).
 6. **Halt for ambiguity.** If a node truly cannot proceed, return
    `status: halted` rather than retrying forever.
 
