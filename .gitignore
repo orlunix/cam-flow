@@ -9,6 +9,12 @@ data/
 # Runtime artifacts: every camflow run lands here. Not source.
 .camflow/
 
+# Auto-installed built-in skill/agent symlinks. The runner regenerates
+# these on each run; tracking them would just churn. Use ** so the
+# pattern matches at any depth (project root + every example dir).
+**/.claude/skills/
+**/.claude/agents/
+
 # Editor / OS noise
 .pytest_cache/
 .DS_Store

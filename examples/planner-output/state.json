@@ -1,5 +1,0 @@
-{
-  "stack_trace": "Traceback (most recent call last):\n  File \"app.py\", line 27, in handle_request\n    response = parser.tokenize(payload)\n  File \"parser.py\", line 48, in tokenize\n    for token in tokens:\nTypeError: 'NoneType' object is not iterable",
-  "source_context": "# parser.py\nclass Parser:\n    def tokenize(self, text):\n        if not text:\n            return\n        tokens = self._split(text)\n        for token in tokens:\n            yield self._normalize(token)\n",
-  "max_attempts": 3
-}

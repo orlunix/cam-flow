@@ -8,12 +8,28 @@ without explicit user consent — they were intentionally cut.
 
 ## What it is
 
-**camflow = camc + flow.** A workflow runner that drives agents through `camc`.
+**camflow = camc + flow.** A multi-agent workflow runner that drives agents through `camc`.
 
-This is project identity, not a design preference. Every LLM invocation in the
-runtime goes through `camc run`. `claude -p` and direct Anthropic SDK calls are
-**forbidden** — if any path in the runtime wants to call an LLM another way,
-that's a bug. See "Core infrastructure" below for the full rule.
+Two foundational principles — both load-bearing:
+
+1. **Multi-agent system.** Three primitives, strictly distinct:
+   - **Workflow** = a multi-agent DAG (the artifact). Lives in user space.
+   - **Agent** = a single `camc`-spawned execution unit. Autonomous *internally*
+     (multi-step, multi-skill, may use Read/Write/Bash) but **one camc run** —
+     agents do NOT kick off workflows.
+   - **Skill** = a capability template (`SKILL.md` prompt + tool grants).
+     Agents USE skills.
+
+   Built-in agent definitions live in `agents/<name>/AGENT.md`. Built-in skill
+   templates live in `skills/<name>/SKILL.md`. Roles like Planner / Evaluator /
+   Worker / Orchestrator are AGENTS — `agents/planner/AGENT.md` (autonomous,
+   uses skill_searcher + workflow_designer internally) — NOT
+   `skills/planner/SKILL.md` (one prompt) and NOT
+   `workflows/planner/workflow.yaml` (sub-DAG). Both alternatives are wrong.
+
+2. **Every LLM invocation goes through `camc run`.** `claude -p` and direct
+   Anthropic SDK calls are **forbidden** — if any path in the runtime wants to
+   call an LLM another way, that's a bug. See "Core infrastructure" below.
 
 DAG dependencies for modeling, serial runner for execution. Retry is the only
 backwards mechanism. Every node output is the same envelope.
@@ -166,6 +182,12 @@ camflow/
 - When adding a new tool script, use `python3 -c '...'` for output, not bash heredoc with f-strings — the bash/Python escaping is a footgun (we hit this on `code-review` first run).
 
 **DON'T**
+- **Don't model a role as a single skill OR as a sub-workflow.** Planner /
+  Evaluator / Worker / Orchestrator are AGENTS — `agents/<name>/AGENT.md`
+  (autonomous Claude Code session, one camc spawn, multi-step internally). A
+  single SKILL.md is too small (one prompt). A sub-workflow (DAG) is too
+  big (agents don't kick off workflows). The right shape is one autonomous
+  agent that internally uses multiple skills. See `multi_agent_system.md`.
 - Don't add features that aren't in the spec.md or roadmap.
 - Don't predict-build the Orchestrator / Planner — wait until they're needed.
 - Don't restore deleted concepts: methodology routing, escalation levels, error_classifier, result_reader, brainstorm, evolution. They were cut on purpose.

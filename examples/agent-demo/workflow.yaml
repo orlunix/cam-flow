@@ -2,8 +2,9 @@ workflow: agent_demo
 version: 0.6
 
 goal: |
-  Real-LLM demo: two skill nodes do bug analysis and fix proposal,
-  then a third reviews the proposal and decides if it ships.
+  Real-LLM demo built on the v0.2 built-in skills (analyzer, reviewer).
+  Step 1: analyzer reads a bug report and produces root cause + a candidate
+  patch. Step 2: reviewer judges the patch — approved or request_changes.
 
 state:
   bug_report:
@@ -14,54 +15,33 @@ state:
     default: python
 
 nodes:
-  - id: analyze
+  - id: diagnose_and_propose
     goal: |
-      Identify the most likely root cause of the reported bug.
-      Be specific — name the function or operation, not a category.
+      Identify the root cause of the bug AND produce a minimal candidate patch
+      that addresses it. The analyzer pattern fits: structured findings.
     input:
       bug_report: "{{state.bug_report}}"
       language: "{{state.language}}"
-    uses: skill.analyze
+    uses: skill.analyzer
     output_schema:
       root_cause: string
-      confidence: number
-      evidence: string
-    verify:
-      - type: schema
-
-  - id: propose_fix
-    goal: |
-      Propose a minimal, safe fix that addresses the root cause.
-      Output a tiny code patch in unified diff format.
-    needs: [analyze]
-    input:
-      bug_report: "{{state.bug_report}}"
-      root_cause: "{{nodes.analyze.latest.output.data.root_cause}}"
-      language: "{{state.language}}"
-    uses: skill.propose_fix
-    output_schema:
       patch: string
       explanation: string
-      risk: string
     verify:
-      - type: schema
       - type: rule
         assert: "output.data.patch != ''"
 
   - id: review
     goal: |
-      Review the proposed fix. Decide whether it's ready to merge.
-      Be skeptical — only approve if the patch directly addresses
-      the root cause without obvious risks.
-    needs: [propose_fix]
+      Decide whether the proposed patch directly addresses the root cause and
+      is safe to ship.
+    needs: [diagnose_and_propose]
     input:
-      bug_report: "{{state.bug_report}}"
-      root_cause: "{{nodes.analyze.latest.output.data.root_cause}}"
-      proposed_patch: "{{nodes.propose_fix.latest.output.data.patch}}"
-      proposed_explanation: "{{nodes.propose_fix.latest.output.data.explanation}}"
-    uses: skill.review
+      artifact: "{{nodes.diagnose_and_propose.latest.output.data.patch}}"
+      criteria: "{{nodes.diagnose_and_propose.latest.output.data.root_cause}}"
+      context: "{{nodes.diagnose_and_propose.latest.output.data.explanation}}"
+    uses: skill.reviewer
     output_schema:
       approved: boolean
       reasoning: string
-    verify:
-      - type: schema
+      feedback: string

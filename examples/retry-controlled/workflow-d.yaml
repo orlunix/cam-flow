@@ -1,0 +1,24 @@
+workflow: retry_via_verify_failure
+version: 0.6
+state:
+  pass_at_attempt: { type: integer, required: true }
+  max_attempts: { type: integer, required: true }
+  required_min_value: { type: integer, required: true }
+nodes:
+  - id: produce
+    input:
+      pass_at: "{{state.pass_at_attempt}}"
+    uses: tool.gradeable
+    output_schema:
+      value: integer
+      ok: boolean
+      reason: string
+    verify:
+      - type: rule
+        # value must be >= required_min_value; gradeable returns attempt*10
+        # so verify fails until attempt >= required_min_value/10
+        assert: "output.data.value >= state.required_min_value"
+    retry:
+      until: "true"   # always satisfied — retry only fires on FAILURE path
+      max_attempts: "{{state.max_attempts}}"
+      feedback: "verify rule rejected this attempt"

@@ -161,7 +161,13 @@ def load_workflow(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def validate_workflow(wf: dict) -> list[str]:
+def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
+    """Validate a workflow's structure.
+
+    If `project_root` is given, also validate that every `uses: skill.X`
+    resolves to a real SKILL.md (built-in or skillm). Pass None to skip
+    skill-resolution checks (useful for unit tests with mocks-only workflows).
+    """
     errors = []
     if not isinstance(wf, dict):
         return ["workflow is not a dict"]
@@ -191,6 +197,23 @@ def validate_workflow(wf: dict) -> list[str]:
                 errors.append(
                     f"{nid}.retry.target: unsupported in v0.6 — retry only "
                     f"re-runs the current node; remove the target field"
+                )
+        # Skill / agent existence check (only if project_root provided)
+        uses = n.get("uses", "")
+        if project_root and uses.startswith("skill."):
+            skill_name = uses[len("skill."):]
+            if _resolve_skill_md_path(skill_name, project_root) is None:
+                errors.append(
+                    f"{nid}.uses: skill.{skill_name} not found "
+                    f"(not in built-ins, not in <project>/.claude/skills, "
+                    f"not in skillm library)"
+                )
+        if project_root and uses.startswith("agent."):
+            agent_name = uses[len("agent."):]
+            if _resolve_agent_md_path(agent_name, project_root) is None:
+                errors.append(
+                    f"{nid}.uses: agent.{agent_name} not found "
+                    f"(no AGENT.md in built-ins or <project>/.claude/agents)"
                 )
 
     # cycle detection on `needs` graph
@@ -223,14 +246,14 @@ _FENCE_RE = re.compile(r"^```(?:yaml|yml)?\s*\n?|\n?```\s*$",
                        re.IGNORECASE | re.MULTILINE)
 
 
-def parse_workflow_yaml(text: str) -> dict:
+def parse_workflow_yaml(text: str, project_root: Path | None = None) -> dict:
     """Parse a YAML string into a workflow dict and validate it.
 
     Strips optional ```yaml fences. Raises WorkflowParseError on:
       - empty / whitespace-only input
       - invalid YAML
       - non-dict top level
-      - any validate_workflow error.
+      - any validate_workflow error (incl. skill.X existence if project_root given).
     """
     cleaned = text.strip()
     cleaned = re.sub(r"^```(?:yaml|yml)?\s*", "", cleaned, flags=re.IGNORECASE)
@@ -246,7 +269,7 @@ def parse_workflow_yaml(text: str) -> dict:
         raise WorkflowParseError(
             f"top level is not a dict (got {type(wf).__name__})"
         )
-    errors = validate_workflow(wf)
+    errors = validate_workflow(wf, project_root=project_root)
     if errors:
         raise WorkflowParseError(
             "validation failed:\n  " + "\n  ".join(errors)
@@ -311,6 +334,12 @@ class Run:
             self.project_root = Path(*parts[:idx]) if idx > 0 else Path("/")
         else:
             self.project_root = Path.cwd().resolve()
+
+        # Make sure camflow's built-in skills + agents are installed in the
+        # project so they appear under <project>/.claude/skills/ and
+        # <project>/.claude/agents/, alongside any user-managed installs.
+        _ensure_builtin_skills_installed(self.project_root)
+        _ensure_builtin_agents_installed(self.project_root)
 
         # Write our PID so `camflow stop <run_dir>` can SIGTERM us.
         self.pid_path.write_text(str(os.getpid()))
@@ -413,14 +442,16 @@ def _build_agent_context(run: Run, node: dict, attempt_n: int,
     }
 
     uses = node.get("uses", "")
-    if uses.startswith(("skill.", "agent.")):
-        skill_name = uses.split(".", 1)[1] if "." in uses else None
+    if uses.startswith("skill."):
+        skill_name = uses[len("skill."):]
         prompt = _build_skill_prompt(
             run.workflow, node, inputs,
             skill_name=skill_name, run=run,
         )
         (workspace / "prompt.txt").write_text(prompt)
         ctx["prompt_text"] = prompt
+    # agent.X builds its own prompt in _exec_agent (different shape:
+    # autonomous mode embeds AGENT.md as the role spec).
 
     return ctx
 
@@ -451,10 +482,7 @@ def execute_node(run: Run, node: dict, attempt_n: int,
     if uses.startswith("skill."):
         return _exec_skill(uses[len("skill."):], actx, run, node, attempt_n)
     if uses.startswith("agent."):
-        return _empty_envelope("failure", error={
-            "code": "NOT_IMPLEMENTED",
-            "message": f"agent.X (autonomous via camc) is v0.8; use skill.X for v0.7",
-        })
+        return _exec_agent(uses[len("agent."):], actx, run, node, attempt_n)
     return _empty_envelope("failure", error={
         "code": "BAD_USES",
         "message": f"unrecognized uses: {uses!r}",
@@ -523,25 +551,175 @@ def _exec_tool(name: str, actx: dict, run: Run,
     }
 
 
-# ─── Skill execution via Claude CLI ────────────────────────────────────
+# ─── Skill resolution (camflow built-ins + skillm) ─────────────────────
 
-def _load_skill_template(skill_name: str, run: Run) -> str | None:
-    """If `<project>/prompts/<skill_name>.md` exists, return its contents.
+def _camflow_repo_root() -> Path:
+    """Where camflow itself is installed — has `skills/` with built-ins."""
+    return Path(__file__).resolve().parents[2]
 
-    The runner looks in two places:
-      1. `<project>/prompts/<name>.md` (project-local, e.g. examples/foo/prompts/...)
-      2. `<repo>/prompts/<name>.md` (the runner's own bundled prompts)
 
-    First match wins. Returns None if neither exists.
+def _builtin_skills_root() -> Path:
+    return _camflow_repo_root() / "skills"
+
+
+def _list_builtin_skills() -> list[str]:
+    """Names of all camflow-shipped skills (each is a dir with SKILL.md)."""
+    root = _builtin_skills_root()
+    if not root.is_dir():
+        return []
+    return sorted(
+        p.name for p in root.iterdir()
+        if p.is_dir() and (p / "SKILL.md").exists()
+    )
+
+
+def _list_skillm_skills() -> list[str]:
+    """Names of all skills currently in skillm's library on this machine.
+
+    Discovers via `~/.skillm/repos/*/<name>/SKILL.md`. We don't shell out to
+    `skillm list` because its output is rich-formatted; the filesystem is
+    cheaper and equivalent.
+    """
+    repos = Path.home() / ".skillm" / "repos"
+    if not repos.is_dir():
+        return []
+    found = set()
+    for repo in repos.iterdir():
+        if not repo.is_dir():
+            continue
+        for skill_dir in repo.iterdir():
+            if skill_dir.is_dir() and (skill_dir / "SKILL.md").exists():
+                found.add(skill_dir.name)
+    return sorted(found)
+
+
+def _ensure_builtin_skills_installed(project_root: Path) -> None:
+    """Symlink camflow's built-in skills into <project>/.claude/skills/.
+
+    Idempotent. If a real (non-symlink) directory already exists at the
+    target name, leave it alone — assume the user has overridden.
+    """
+    src_root = _builtin_skills_root()
+    if not src_root.is_dir():
+        return
+    target_root = project_root / ".claude" / "skills"
+    target_root.mkdir(parents=True, exist_ok=True)
+
+    for src in src_root.iterdir():
+        if not src.is_dir() or not (src / "SKILL.md").exists():
+            continue
+        target = target_root / src.name
+        try:
+            if target.is_symlink():
+                if target.resolve() == src.resolve():
+                    continue  # already correctly linked
+                target.unlink()
+            elif target.exists():
+                # User-overridden real dir; respect it.
+                continue
+            target.symlink_to(src.resolve())
+        except OSError:
+            # Filesystem doesn't support symlinks (e.g., some Windows
+            # configs) — silent fallback to direct resolver lookup.
+            pass
+
+
+def _resolve_skill_md_path(skill_name: str, project_root: Path) -> Path | None:
+    """Find a skill's SKILL.md. Lookup order:
+
+      1. <project>/.claude/skills/<name>/SKILL.md   (project-installed)
+      2. ~/.claude/skills/<name>/SKILL.md           (global skillm install)
+      3. ~/.skillm/repos/*/<name>/SKILL.md          (skillm library)
+      4. <camflow-repo>/skills/<name>/SKILL.md      (built-in fallback if symlink missing)
+
+    Returns the first existing path, or None.
     """
     candidates = [
-        run.project_root / "prompts" / f"{skill_name}.md",
-        Path(__file__).resolve().parents[2] / "prompts" / f"{skill_name}.md",
+        project_root / ".claude" / "skills" / skill_name / "SKILL.md",
+        Path.home() / ".claude" / "skills" / skill_name / "SKILL.md",
     ]
+    repos = Path.home() / ".skillm" / "repos"
+    if repos.is_dir():
+        for repo in repos.iterdir():
+            if repo.is_dir():
+                candidates.append(repo / skill_name / "SKILL.md")
+    candidates.append(_builtin_skills_root() / skill_name / "SKILL.md")
     for p in candidates:
         if p.exists():
-            return p.read_text()
+            return p
     return None
+
+
+def _load_skill_template(skill_name: str, run: Run) -> str | None:
+    """Read the skill's SKILL.md content, or return None if not found."""
+    p = _resolve_skill_md_path(skill_name, run.project_root)
+    return p.read_text() if p else None
+
+
+# ─── Agent resolution (built-in autonomous agents) ─────────────────────
+
+def _builtin_agents_root() -> Path:
+    return _camflow_repo_root() / "agents"
+
+
+def _list_builtin_agents() -> list[str]:
+    """Names of all camflow-shipped agents (each is a dir with AGENT.md)."""
+    root = _builtin_agents_root()
+    if not root.is_dir():
+        return []
+    return sorted(
+        p.name for p in root.iterdir()
+        if p.is_dir() and (p / "AGENT.md").exists()
+    )
+
+
+def _ensure_builtin_agents_installed(project_root: Path) -> None:
+    """Symlink camflow's built-in agents into <project>/.claude/agents/.
+
+    Mirrors _ensure_builtin_skills_installed. Idempotent. Respects user
+    overrides (if a real dir exists at target name, leave it).
+    """
+    src_root = _builtin_agents_root()
+    if not src_root.is_dir():
+        return
+    target_root = project_root / ".claude" / "agents"
+    target_root.mkdir(parents=True, exist_ok=True)
+    for src in src_root.iterdir():
+        if not src.is_dir() or not (src / "AGENT.md").exists():
+            continue
+        target = target_root / src.name
+        try:
+            if target.is_symlink():
+                if target.resolve() == src.resolve():
+                    continue
+                target.unlink()
+            elif target.exists():
+                continue
+            target.symlink_to(src.resolve())
+        except OSError:
+            pass
+
+
+def _resolve_agent_md_path(name: str, project_root: Path) -> Path | None:
+    """Find an agent's AGENT.md. Lookup order:
+
+      1. <project>/.claude/agents/<name>/AGENT.md   (project-installed)
+      2. ~/.claude/agents/<name>/AGENT.md           (global)
+      3. <camflow-repo>/agents/<name>/AGENT.md      (built-in fallback)
+    """
+    for p in [
+        project_root / ".claude" / "agents" / name / "AGENT.md",
+        Path.home() / ".claude" / "agents" / name / "AGENT.md",
+        _builtin_agents_root() / name / "AGENT.md",
+    ]:
+        if p.exists():
+            return p
+    return None
+
+
+def _load_agent_md(name: str, run: Run) -> str | None:
+    p = _resolve_agent_md_path(name, run.project_root)
+    return p.read_text() if p else None
 
 
 def _build_skill_prompt(workflow: dict, node: dict, inputs: dict,
@@ -798,6 +976,189 @@ def _exec_skill(name: str, actx: dict, run: Run, node: dict, attempt_n: int) -> 
         }
     finally:
         # 5. Always kill the agent — no leaked tmux sessions.
+        _camc_kill(agent_id)
+
+
+# ─── Agent execution (autonomous mode) ─────────────────────────────────
+
+def _build_agent_prompt(role_md: str, workflow: dict, node: dict,
+                        inputs: dict, project_root: Path) -> str:
+    """Compose the autonomous agent's kickoff prompt.
+
+    Sections:
+      - AGENT.md (role + capabilities + protocol)
+      - Workflow goal
+      - Node task
+      - Inputs (JSON), with available_skills list embedded if not already in inputs
+      - Output schema reminder
+      - Delivery instruction (write agent_output.json, then stop)
+    """
+    parts = [role_md.strip()]
+
+    if wg := (workflow.get("goal") or "").strip():
+        parts.append(f"# Workflow goal\n{wg}")
+    if ng := (node.get("goal") or "").strip():
+        parts.append(f"# Your task\n{ng}")
+
+    enriched_inputs = dict(inputs)
+    if "available_skills" not in enriched_inputs:
+        enriched_inputs["available_skills"] = sorted(
+            set(_list_builtin_skills() + _list_skillm_skills())
+        )
+    if "available_agents" not in enriched_inputs:
+        enriched_inputs["available_agents"] = sorted(_list_builtin_agents())
+    parts.append(
+        "# Inputs\n```json\n"
+        + json.dumps(enriched_inputs, indent=2, ensure_ascii=False)
+        + "\n```"
+    )
+
+    schema = node.get("output_schema") or {}
+    if schema:
+        parts.append(
+            "# Output schema (your envelope's `data` MUST match)\n"
+            "```json\n" + json.dumps(schema, indent=2) + "\n```"
+        )
+
+    parts.append(
+        "# Delivery protocol\n"
+        f"Write the final envelope JSON to `{_OUTPUT_FILENAME}` in your "
+        "current working directory. Do not print it; the runner reads the "
+        "file. If the runner sends follow-up feedback during this session, "
+        "treat it as a schema-correction request — update the SAME file "
+        "and stop. Once you've written the file, do nothing else; the "
+        "runner will close the session."
+    )
+    return "\n\n".join(parts)
+
+
+def _exec_agent(name: str, actx: dict, run: Run, node: dict, attempt_n: int) -> dict:
+    """Run an autonomous camc agent loaded with agents/<name>/AGENT.md.
+
+    Differs from _exec_skill in that the agent is autonomous: it can use
+    Claude Code tools (Read/Write/Bash/Glob/Grep), read multiple skills,
+    and decide its own multi-step path. Same envelope contract though —
+    writes agent_output.json when done, runner picks up.
+    """
+    workspace = actx["workspace"]
+    role_md = _load_agent_md(name, run)
+    if role_md is None:
+        return _empty_envelope("failure", error={
+            "code": "AGENT_NOT_FOUND",
+            "message": f"agents/{name}/AGENT.md not found",
+        })
+
+    prompt = _build_agent_prompt(role_md, run.workflow, node,
+                                 actx["inputs"], run.project_root)
+    (workspace / "prompt.txt").write_text(prompt)
+
+    output_path = workspace / _OUTPUT_FILENAME
+    agent_runtime_name = f"{node['id']}-attempt-{attempt_n}"
+    parts = run.run_dir.resolve().parts
+    run_id_for_tag = (
+        parts[parts.index("runs") + 1]
+        if "runs" in parts and parts.index("runs") + 1 < len(parts)
+        else run.run_dir.name
+    )
+    tag = f"camflow:{run_id_for_tag}"
+
+    # 1. Spawn — agent is given the project as cwd-ish via --add-dir so it
+    # can Read/Write project paths (.claude/skills/, etc.). Workspace is
+    # the agent's main working dir.
+    proc = subprocess.run(
+        ["camc", "run",
+         "--path", str(workspace),
+         "--name", agent_runtime_name,
+         "--tag", tag,
+         prompt],
+        capture_output=True, text=True, timeout=30,
+    )
+    if proc.returncode != 0:
+        return _empty_envelope("failure", error={
+            "code": "CAMC_RUN_FAILED",
+            "message": f"camc run exited {proc.returncode}: {proc.stderr.strip()[:300]}",
+        })
+    m = _AGENT_ID_RE.search(proc.stdout)
+    if not m:
+        return _empty_envelope("failure", error={
+            "code": "CAMC_RUN_BAD_OUTPUT",
+            "message": f"could not parse agent ID from camc run output:\n{proc.stdout[:500]}",
+        })
+    agent_id = m.group(1)
+    (workspace / "agent.id").write_text(agent_id)
+
+    # Autonomous agents get a longer timeout — they're doing multi-step
+    # tool use, not a single LLM turn.
+    agent_timeout_s = int(os.environ.get("CAMFLOW_AGENT_TIMEOUT", "1800"))
+
+    last_mtime: float | None = None
+    schema = node.get("output_schema") or {}
+
+    try:
+        # 2. Wait for first output
+        ok, err = _wait_for_output(output_path, last_mtime, agent_timeout_s)
+        if not ok:
+            return _empty_envelope("failure", error={
+                "code": "AGENT_TIMEOUT", "message": err,
+                "details": {"agent_id": agent_id},
+            })
+        last_mtime = output_path.stat().st_mtime
+
+        # 3. Self-correction loop on schema mismatch (same as skills)
+        for inner_attempt in range(_SKILL_INNER_RETRIES + 1):
+            try:
+                env = json.loads(output_path.read_text())
+            except json.JSONDecodeError as e:
+                return _empty_envelope("failure", error={
+                    "code": "AGENT_BAD_OUTPUT",
+                    "message": f"agent_output.json not JSON: {e}",
+                    "details": {"agent_id": agent_id},
+                })
+
+            if schema:
+                data = env.get("data") or {}
+                missing = [k for k in schema if k not in data]
+            else:
+                missing = []
+            if not missing:
+                break
+            if inner_attempt >= _SKILL_INNER_RETRIES:
+                run.trace("agent_self_correct_exhausted",
+                          node=node["id"], attempt=attempt_n,
+                          extra={"missing": missing,
+                                 "inner_attempts": inner_attempt + 1})
+                break
+            feedback = (
+                f"Schema check failed. Missing required field(s) in `data`: "
+                f"{missing}. Update {_OUTPUT_FILENAME} with all required "
+                f"fields, then stop."
+            )
+            run.trace("agent_self_correct", node=node["id"], attempt=attempt_n,
+                      extra={"inner_attempt": inner_attempt + 1, "missing": missing})
+            _camc_send(agent_id, feedback)
+            ok, err = _wait_for_output(output_path, last_mtime, agent_timeout_s)
+            if not ok:
+                return _empty_envelope("failure", error={
+                    "code": "AGENT_TIMEOUT_SELF_CORRECT",
+                    "message": err, "details": {"agent_id": agent_id},
+                })
+            last_mtime = output_path.stat().st_mtime
+
+        status = _camc_status(agent_id)
+        metrics = dict(env.get("metrics") or {})
+        if cost := status.get("cost_estimate"):
+            metrics["camc_cost_usd"] = cost
+        if started := status.get("started_at"):
+            metrics["camc_started_at"] = started
+
+        return {
+            "status": env.get("status", "success"),
+            "data": env.get("data", {}) or {},
+            "error": env.get("error"),
+            "metrics": metrics,
+            "artifacts": env.get("artifacts", []) or [],
+        }
+    finally:
         _camc_kill(agent_id)
 
 
@@ -1065,7 +1426,12 @@ def _run_command(argv: list[str]) -> int:
     args = p.parse_args(argv)
 
     wf = load_workflow(args.workflow)
-    errs = validate_workflow(wf)
+    project = Path(args.workflow).resolve().parent
+    # Make sure built-in skills + agents are present in the project before
+    # we check that referenced skills/agents resolve.
+    _ensure_builtin_skills_installed(project)
+    _ensure_builtin_agents_installed(project)
+    errs = validate_workflow(wf, project_root=project)
     if errs:
         for e in errs:
             print(f"ERROR: {e}", file=sys.stderr)
@@ -1079,7 +1445,6 @@ def _run_command(argv: list[str]) -> int:
         with open(args.state) as f:
             state = json.load(f)
 
-    project = Path(args.workflow).resolve().parent
     run_id = _gen_run_id()
     run_dir = Path(args.run_dir) if args.run_dir else project / ".camflow" / "runs" / run_id
 
@@ -1100,37 +1465,48 @@ def _result_to_exit_code(result: str) -> int:
     return {"success": 0, "halted": 2}.get(result, 1)
 
 
-def _planner_workflow() -> dict:
-    """The fixed 1-node workflow that runs the Planner skill.
+def _planner_bootstrap_workflow() -> dict:
+    """Minimal 1-node scaffold so `camflow plan` reuses the Run / camc lifecycle
+    machinery to spawn a single autonomous agent (`agent.planner`).
+
+    The Planner is **an agent, not a workflow** — but to invoke it we still
+    need a Run (workspace, persistence, retry). The runner sees this 1-node
+    scaffold as "spawn one autonomous agent and grab its output". The
+    bootstrap is internal — users never see or write it.
 
     Inputs (via state):
-      goal           required, NL description of what the user wants
-      state_schema   optional, schema for the produced workflow's state
-    Output (in nodes.plan.attempt-<n>.output.data):
-      workflow_yaml  string — a YAML document parseable by parse_workflow_yaml.
+      goal              required, NL description
+      state_schema      optional, schema for the produced workflow's state
+      available_skills  list of skill names available in the project
+    Output (data):
+      workflow_yaml     string — produced by the planner agent
     """
     return {
-        "workflow": "planner",
+        "workflow": "planner-bootstrap",
         "version": "0.6",
-        "goal": "Generate a runnable workflow.yaml from a natural-language goal.",
+        "goal": "Spawn the Planner agent to produce a runnable workflow.yaml.",
         "nodes": [
             {
                 "id": "plan",
-                "goal": "Produce a complete, valid workflow.yaml.",
-                "uses": "skill.planner",
+                "goal": "Run the Planner agent on the provided goal.",
+                "uses": "agent.planner",
                 "input": {
                     "goal": "{{state.goal}}",
                     "state_schema": "{{state.state_schema?}}",
+                    "available_skills": "{{state.available_skills}}",
                 },
                 "output_schema": {"workflow_yaml": "string"},
                 "verify": [
-                    {"type": "schema"},
                     {"type": "rule",
                      "assert": "output.data.workflow_yaml != ''"},
                 ],
             }
         ],
     }
+
+
+# Back-compat: keep old name as alias so any external caller doesn't break.
+_planner_workflow = _planner_bootstrap_workflow
 
 
 def _plan_command(argv: list[str]) -> int:
@@ -1177,9 +1553,18 @@ def _plan_command(argv: list[str]) -> int:
     print(f"run_id:  {run_id}", file=sys.stderr)
     print(f"planner: {planner_dir}", file=sys.stderr)
 
+    # Discover skills the Planner is allowed to use (built-in + skillm library).
+    # Make sure built-ins are installed in the project so they're discoverable
+    # both for the planner agent and for downstream validation.
+    _ensure_builtin_skills_installed(cwd)
+    available_skills = sorted(set(_list_builtin_skills() + _list_skillm_skills()))
+
     # Step 1: run the planner DAG
-    planner_wf = _planner_workflow()
-    planner_state = {"goal": args.goal}
+    planner_wf = _planner_bootstrap_workflow()
+    planner_state = {
+        "goal": args.goal,
+        "available_skills": available_skills,
+    }
     if state_schema is not None:
         planner_state["state_schema"] = state_schema
     planner_result = run_workflow(planner_wf, planner_state, planner_dir)
@@ -1193,9 +1578,9 @@ def _plan_command(argv: list[str]) -> int:
     plan_output = json.loads(plan_output_path.read_text())
     yaml_text = (plan_output.get("data") or {}).get("workflow_yaml", "")
 
-    # Step 3: parse + validate
+    # Step 3: parse + validate (skill.X must exist in built-ins or skillm)
     try:
-        produced_wf = parse_workflow_yaml(yaml_text)
+        produced_wf = parse_workflow_yaml(yaml_text, project_root=cwd)
     except WorkflowParseError as e:
         print(f"PLAN OUTPUT INVALID: {e}", file=sys.stderr)
         print("--- raw output ---", file=sys.stderr)
