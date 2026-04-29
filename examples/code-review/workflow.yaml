@@ -1,0 +1,84 @@
+workflow: code_review
+version: 0.6
+
+goal: |
+  Multi-step PR review workflow.
+  Fan-out: intake → security_review + style_review (independent).
+  Fan-in: triage combines both reviews.
+  Conditional finish: approve if triage.approved, otherwise request changes.
+
+state:
+  pr_number:
+    type: integer
+    required: true
+  pr_title:
+    type: string
+    required: true
+
+nodes:
+  - id: intake
+    goal: Parse PR metadata into a normalized summary.
+    input:
+      pr: "{{state.pr_number}}"
+      title: "{{state.pr_title}}"
+    uses: tool.intake
+    output_schema:
+      summary: string
+      lines_changed: integer
+    verify:
+      - type: schema
+
+  - id: security_review
+    goal: Scan the change for security issues.
+    needs: [intake]
+    input:
+      pr_summary: "{{nodes.intake.latest.output.data.summary}}"
+    uses: tool.security_review
+    output_schema:
+      severity: string
+      issues_found: integer
+      notes: string
+
+  - id: style_review
+    goal: Check coding style.
+    needs: [intake]
+    input:
+      pr_summary: "{{nodes.intake.latest.output.data.summary}}"
+    uses: tool.style_review
+    output_schema:
+      warnings_found: integer
+      notes: string
+
+  - id: triage
+    goal: Combine reviews into approve/reject decision.
+    needs: [security_review, style_review]
+    input:
+      security_severity: "{{nodes.security_review.latest.output.data.severity}}"
+      security_issues: "{{nodes.security_review.latest.output.data.issues_found}}"
+      style_warnings: "{{nodes.style_review.latest.output.data.warnings_found}}"
+    uses: tool.triage
+    output_schema:
+      approved: boolean
+      reasoning: string
+
+  - id: approve
+    goal: Approve and merge the PR.
+    needs: [triage]
+    when: "nodes.triage.latest.output.data.approved == true"
+    input:
+      pr: "{{state.pr_number}}"
+      reasoning: "{{nodes.triage.latest.output.data.reasoning}}"
+    uses: tool.approve
+    output_schema:
+      result: string
+
+  - id: request_changes
+    goal: Request changes on the PR.
+    needs: [triage]
+    when: "nodes.triage.latest.output.data.approved == false"
+    input:
+      pr: "{{state.pr_number}}"
+      reasoning: "{{nodes.triage.latest.output.data.reasoning}}"
+    uses: tool.request_changes
+    output_schema:
+      result: string

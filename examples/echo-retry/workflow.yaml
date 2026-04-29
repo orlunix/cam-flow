@@ -1,0 +1,75 @@
+workflow: echo_demo
+version: 0.6
+
+goal: |
+  Smoke test for the v0.6 runtime: DAG ordering, when branching,
+  schema verify, and when=false skip propagation.
+
+state:
+  error:
+    type: string
+    required: true
+
+nodes:
+  - id: analyze
+    goal: Identify the root cause.
+    mock:
+      status: success
+      data:
+        root_cause: "null deref"
+        confidence: 0.9
+    output_schema:
+      root_cause: string
+      confidence: number
+    verify:
+      - type: schema
+
+  - id: fix
+    goal: Produce a patch.
+    needs: [analyze]
+    input:
+      error: "{{state.error}}"
+      root_cause: "{{nodes.analyze.latest.output.data.root_cause}}"
+    mock:
+      status: success
+      data:
+        patch: "diff --git a/foo b/foo"
+        explanation: "added null check"
+    output_schema:
+      patch: string
+      explanation: string
+    verify:
+      - type: schema
+      - type: rule
+        assert: "output.data.patch != ''"
+
+  - id: test
+    goal: Validate the patch.
+    needs: [fix]
+    input:
+      patch: "{{nodes.fix.latest.output.data.patch}}"
+    mock:
+      status: success
+      data:
+        passed: true
+        feedback: ""
+    output_schema:
+      passed: boolean
+
+  - id: summarize_success
+    goal: Summarize successful run.
+    needs: [analyze, fix, test]
+    when: "nodes.test.latest.output.data.passed == true"
+    mock:
+      status: success
+      data:
+        summary: "fixed null deref via guard"
+
+  - id: summarize_failure
+    goal: Summarize failed run.
+    needs: [analyze, fix, test]
+    when: "nodes.test.latest.output.data.passed == false"
+    mock:
+      status: success
+      data:
+        summary: "should not run in this demo"

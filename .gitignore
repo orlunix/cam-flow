@@ -5,3 +5,10 @@ dist/
 build/
 data/
 .eggs/
+
+# Runtime artifacts: every camflow run lands here. Not source.
+.camflow/
+
+# Editor / OS noise
+.pytest_cache/
+.DS_Store
