@@ -287,6 +287,21 @@ def _gen_run_id() -> str:
     return f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
 
 
+_VALID_STATUSES = {"success", "failure", "skipped", "halted"}
+
+
+def _coerce_envelope_status(env: dict) -> str:
+    """Be strict about envelope.status. The runtime only recognizes four
+    values. If an agent returns 'ok' / 'done' / 'completed' / etc., fail
+    LOUDLY rather than letting it deadlock.
+    """
+    s = env.get("status")
+    if s in _VALID_STATUSES:
+        return s
+    # Translate intuitive but invalid values to failure with clear error.
+    return "failure"
+
+
 def _empty_envelope(status: str, error: dict | None = None) -> dict:
     return {
         "status": status,
@@ -656,93 +671,6 @@ def _load_skill_template(skill_name: str, run: Run) -> str | None:
     return p.read_text() if p else None
 
 
-def _parse_skill_md_frontmatter(text: str) -> dict:
-    """Extract YAML frontmatter from a SKILL.md / AGENT.md file.
-
-    Returns {} if no frontmatter or parse fails. Robust: never raises.
-    """
-    if not text.startswith("---"):
-        return {}
-    try:
-        end = text.index("\n---", 3)
-    except ValueError:
-        return {}
-    fm_text = text[3:end].strip()
-    try:
-        meta = yaml.safe_load(fm_text)
-        return meta if isinstance(meta, dict) else {}
-    except yaml.YAMLError:
-        return {}
-
-
-def _build_skill_catalog(project_root: Path) -> list[dict]:
-    """Read every reachable SKILL.md, extract frontmatter, return a compact
-    catalog. The catalog is what the skill_searcher and planner agents see —
-    they don't have to Read individual SKILL.md files themselves.
-
-    Each entry:
-      { name, source, description, tags, requires_tools, requires_skills,
-        argument_hint, compatibility }
-    """
-    seen: dict[str, dict] = {}
-
-    def consume(name: str, path: Path, source: str) -> None:
-        if name in seen:
-            return  # earlier source wins (built-in overrides skillm same-name)
-        try:
-            text = path.read_text()
-        except OSError:
-            return
-        fm = _parse_skill_md_frontmatter(text)
-        meta_raw = fm.get("metadata") or {}
-        # tags can be a comma-separated string or a YAML list
-        tags = meta_raw.get("tags") or fm.get("tags") or []
-        if isinstance(tags, str):
-            tags = [t.strip() for t in tags.split(",") if t.strip()]
-        seen[name] = {
-            "name": name,
-            "source": source,
-            "description": (fm.get("description") or "").strip(),
-            "tags": tags,
-            "requires_tools": meta_raw.get("requires-tools")
-                              or meta_raw.get("requires_tools") or [],
-            "requires_skills": meta_raw.get("requires-skills")
-                               or meta_raw.get("requires_skills") or [],
-            "argument_hint": fm.get("argument-hint")
-                             or fm.get("argument_hint") or "",
-            "compatibility": fm.get("compatibility") or "",
-        }
-
-    # Order matters: project-installed first, then global, then skillm, then builtin.
-    proj_root = project_root / ".claude" / "skills"
-    if proj_root.is_dir():
-        for d in proj_root.iterdir():
-            if d.is_dir() and (d / "SKILL.md").exists():
-                consume(d.name, d / "SKILL.md", "project")
-
-    global_root = Path.home() / ".claude" / "skills"
-    if global_root.is_dir():
-        for d in global_root.iterdir():
-            if d.is_dir() and (d / "SKILL.md").exists():
-                consume(d.name, d / "SKILL.md", "global")
-
-    skillm_repos = Path.home() / ".skillm" / "repos"
-    if skillm_repos.is_dir():
-        for repo in skillm_repos.iterdir():
-            if repo.is_dir():
-                for d in repo.iterdir():
-                    if d.is_dir() and (d / "SKILL.md").exists():
-                        consume(d.name, d / "SKILL.md", f"skillm:{repo.name}")
-
-    bi = _builtin_skills_root()
-    if bi.is_dir():
-        for d in bi.iterdir():
-            if d.is_dir() and (d / "SKILL.md").exists():
-                consume(d.name, d / "SKILL.md", "builtin")
-
-    return sorted(seen.values(), key=lambda e: e["name"])
-
-
 # ─── Agent resolution (built-in autonomous agents) ─────────────────────
 
 def _builtin_agents_root() -> Path:
@@ -1055,7 +983,7 @@ def _exec_skill(name: str, actx: dict, run: Run, node: dict, attempt_n: int) -> 
             metrics["camc_started_at"] = started
 
         return {
-            "status": env.get("status", "success"),
+            "status": _coerce_envelope_status(env),
             "data": env.get("data", {}) or {},
             "error": env.get("error"),
             "metrics": metrics,
@@ -1101,17 +1029,34 @@ def _build_agent_prompt(role_md: str, workflow: dict, node: dict,
     )
 
     schema = node.get("output_schema") or {}
-    if schema:
-        parts.append(
-            "# Output schema (your envelope's `data` MUST match)\n"
-            "```json\n" + json.dumps(schema, indent=2) + "\n```"
-        )
+    schema_block = (
+        json.dumps(schema, indent=2) if schema
+        else "(any object — node declared no schema)"
+    )
+    parts.append(
+        "# Envelope shape — write THIS JSON to "
+        f"`{_OUTPUT_FILENAME}`\n"
+        "```json\n"
+        "{\n"
+        '  "status": "success",            // exact string. Allowed values:\n'
+        '                                  //   "success"  — work done, data populated\n'
+        '                                  //   "halted"   — give up, set error.code/message\n'
+        '                                  //   "failure"  — runtime/tooling error\n'
+        f'  "data": <object matching this schema>: {schema_block},\n'
+        '  "error": null,                  // or {"code": "...", "message": "..."} when not success\n'
+        '  "metrics": {},                  // optional; may include numeric counters/cost\n'
+        '  "artifacts": []                 // optional; list of files you produced\n'
+        "}\n"
+        "```\n"
+        "DO NOT use other status strings (no 'ok', 'done', 'completed', etc.). "
+        "The runtime only recognizes the four enum values above."
+    )
 
     parts.append(
         "# Delivery protocol\n"
-        f"Write the final envelope JSON to `{_OUTPUT_FILENAME}` in your "
-        "current working directory. Do not print it; the runner reads the "
-        "file. If the runner sends follow-up feedback during this session, "
+        f"Write the envelope JSON to `{_OUTPUT_FILENAME}` in your current "
+        "working directory. Do not print it; the runner reads the file. "
+        "If the runner sends follow-up feedback during this session, "
         "treat it as a schema-correction request — update the SAME file "
         "and stop. Once you've written the file, do nothing else; the "
         "runner will close the session."
@@ -1239,7 +1184,7 @@ def _exec_agent(name: str, actx: dict, run: Run, node: dict, attempt_n: int) -> 
             metrics["camc_started_at"] = started
 
         return {
-            "status": env.get("status", "success"),
+            "status": _coerce_envelope_status(env),
             "data": env.get("data", {}) or {},
             "error": env.get("error"),
             "metrics": metrics,
@@ -1741,20 +1686,23 @@ def _result_to_exit_code(result: str) -> int:
 
 
 def _planner_bootstrap_workflow() -> dict:
-    """Two-node scaffold for `camflow plan`. Each node is a single agent
-    (workflow IS multi-agent; agents don't kick off workflows):
+    """Two-node scaffold for `camflow plan`. Each node spawns a single
+    autonomous agent (workflow IS multi-agent; agents don't kick off
+    workflows):
 
-      1. search_skills  (skill.skill_searcher)
-         A one-shot LLM that takes the full skill catalog and goal,
-         returns the relevant subset. Keeps the planner's context lean.
+      1. search_skills  (agent.skill_searcher, autonomous)
+         Walks ~/.skillm/repos and <project>/.claude/skills/ itself,
+         uses Glob/Grep/Read to discover and filter SKILL.md files.
+         Returns relevant subset with descriptions. Keeps Planner's
+         context lean — Planner doesn't read SKILL.md files at all.
       2. plan           (agent.planner, autonomous)
-         Reads only the filtered subset (`relevant_skills`) and the goal,
-         designs the DAG, emits workflow.yaml.
+         Receives only the filtered subset (`relevant_skills`) plus the
+         goal, designs the DAG, emits workflow.yaml. Verified by
+         `type: workflow_yaml` and retries with feedback on failure.
 
     Inputs (via state):
       goal             required, NL description
       state_schema     optional, schema for the produced workflow's state
-      skill_catalog    runtime-injected: full SKILL.md catalog (rich metadata)
     Output (data of `plan` node):
       workflow_yaml    string — the user's runnable DAG.
     """
@@ -1765,17 +1713,18 @@ def _planner_bootstrap_workflow() -> dict:
         "nodes": [
             {
                 "id": "search_skills",
-                "goal": "Filter the skill catalog to those plausibly relevant "
-                        "to the goal. Frees the planner's context.",
-                "uses": "skill.skill_searcher",
+                "goal": "Discover skills relevant to the goal by walking the "
+                        "skillm repository and project skills dirs. Don't "
+                        "read every SKILL.md — Glob/Grep first, Read selectively.",
+                "uses": "agent.skill_searcher",
                 "input": {
                     "goal": "{{state.goal}}",
-                    "catalog": "{{state.skill_catalog}}",
                 },
                 "output_schema": {
                     "relevant_skills": "array",
                     "reasoning": "string",
-                    "excluded_count": "integer",
+                    "examined_count": "integer",
+                    "total_count": "integer",
                 },
                 "verify": [
                     {"type": "rule",
@@ -1866,23 +1815,17 @@ def _plan_command(argv: list[str]) -> int:
     print(f"run_id:  {run_id}", file=sys.stderr)
     print(f"planner: {planner_dir}", file=sys.stderr)
 
-    # Discover skills the Planner is allowed to use (built-in + skillm library).
-    # Make sure built-ins are installed in the project so they're discoverable
-    # both for the planner agent and for downstream validation.
+    # Make sure built-ins (skills + agents) are installed in the project so
+    # both the skill_searcher agent and the planner agent can discover them
+    # via filesystem walks.
     _ensure_builtin_skills_installed(cwd)
     _ensure_builtin_agents_installed(cwd)
 
-    # Build a rich skill catalog (description, tags, requires) once. The
-    # bootstrap's search_skills node uses it to pick a relevant subset
-    # before invoking the Planner agent — keeps Planner's context focused.
-    skill_catalog = _build_skill_catalog(cwd)
-
-    # Step 1: run the 2-node planner bootstrap (search_skills → plan)
+    # Step 1: run the 2-node planner bootstrap (search_skills → plan).
+    # The skill_searcher agent walks ~/.skillm/repos and project skills
+    # directories itself — no catalog injection needed.
     planner_wf = _planner_bootstrap_workflow()
-    planner_state = {
-        "goal": args.goal,
-        "skill_catalog": skill_catalog,
-    }
+    planner_state = {"goal": args.goal}
     if state_schema is not None:
         planner_state["state_schema"] = state_schema
     planner_result = run_workflow(planner_wf, planner_state, planner_dir)
