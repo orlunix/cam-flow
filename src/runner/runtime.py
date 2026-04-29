@@ -1164,7 +1164,8 @@ def _exec_agent(name: str, actx: dict, run: Run, node: dict, attempt_n: int) -> 
 
 # ─── Verify ────────────────────────────────────────────────────────────
 
-def run_verify(run: Run, node: dict, output: dict) -> tuple[bool, str]:
+def run_verify(run: Run, node: dict, output: dict,
+               attempt_n: int = 1) -> tuple[bool, str]:
     """Validate a node's envelope against (a) its declared output_schema —
     automatic, runs whenever schema is declared — and (b) any user-declared
     `verify:` rules (rule / agent / future types like file/command).
@@ -1181,7 +1182,7 @@ def run_verify(run: Run, node: dict, output: dict) -> tuple[bool, str]:
                 return False, f"schema: missing field '{key}' in data"
 
     # ── (b) User-declared rules ──────────────────────────────────────
-    for rule in (node.get("verify") or []):
+    for idx, rule in enumerate(node.get("verify") or []):
         rtype = rule.get("type")
         if rtype == "schema":
             # Already handled above; redundant but accepted for back-compat.
@@ -1196,9 +1197,100 @@ def run_verify(run: Run, node: dict, output: dict) -> tuple[bool, str]:
             if not ok:
                 return False, f"rule failed: {assertion}"
         elif rtype == "agent":
-            return False, "verify type=agent not implemented in v0.7"
+            ok, reason = _run_verify_agent(rule, run, node, output,
+                                           attempt_n, idx)
+            if not ok:
+                return False, reason
         else:
             return False, f"unknown verify type: {rtype}"
+    return True, "ok"
+
+
+def _run_verify_agent(rule: dict, run: Run, node: dict, output: dict,
+                      attempt_n: int, rule_idx: int) -> tuple[bool, str]:
+    """Spawn an evaluator skill (default: skill.evaluator) to judge whether
+    `output.data` meets the rule's `criterion`.
+
+    Rule schema:
+      - type: agent
+        skill: <name>          # optional, default "evaluator"
+        criterion: <string>    # required: what makes the output acceptable
+
+    The evaluator returns an envelope with data.approved (bool); if false,
+    we fail verify with its reasoning. Mock mode is supported via rule.mock
+    for deterministic tests (skips the real camc spawn).
+    """
+    skill_name = rule.get("skill", "evaluator")
+    criterion = rule.get("criterion") or ""
+    if not criterion:
+        return False, "verify type=agent: missing required `criterion`"
+
+    # Mock path: deterministic in tests, no LLM cost. Trigger by setting
+    # rule.mock = {approved: bool, reasoning: string}.
+    if isinstance(rule.get("mock"), dict):
+        m = rule["mock"]
+        if m.get("approved"):
+            return True, "ok (mock)"
+        return False, f"verify agent rejected: {m.get('reasoning', '<no reason>')}"
+
+    # Real path: spawn a sub-skill agent for this rule.
+    # Each verify-agent call is its own attempt-scoped sub-workspace so
+    # prompt + response + output are debuggable alongside the parent attempt.
+    sub_dir = (run.run_dir / "nodes" / node["id"]
+               / f"attempt-{attempt_n}" / f"verify-agent-{rule_idx}")
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    workspace = sub_dir / "workspace"
+    workspace.mkdir(exist_ok=True)
+    inputs = {
+        "output_being_judged": {
+            "status": output.get("status"),
+            "data": output.get("data"),
+            "error": output.get("error"),
+        },
+        "criterion": criterion,
+        "node_id": node["id"],
+        "node_goal": node.get("goal", ""),
+    }
+    (workspace / "input.json").write_text(json.dumps(inputs, indent=2))
+    sub_node = {
+        "id": f"{node['id']}__verify_agent_{rule_idx}",
+        "goal": f"Judge whether the output of node `{node['id']}` "
+                f"meets: {criterion}",
+        "uses": f"skill.{skill_name}",
+        "input": inputs,
+        "output_schema": {
+            "approved": "boolean",
+            "reasoning": "string",
+            "issues": "array",
+        },
+    }
+    prompt = _build_skill_prompt(run.workflow, sub_node, inputs,
+                                 skill_name=skill_name, run=run)
+    (workspace / "prompt.txt").write_text(prompt)
+    actx = {
+        "att_dir": sub_dir,
+        "workspace": workspace,
+        "inputs": inputs,
+        "prompt_text": prompt,
+    }
+    env = _exec_skill(skill_name, actx, run, sub_node, attempt_n=1)
+
+    # Persist the verifier envelope alongside the parent attempt for
+    # post-mortem inspection.
+    (sub_dir / "output.json").write_text(json.dumps(env, indent=2))
+
+    if env.get("status") != "success":
+        return False, (
+            f"verify agent (skill.{skill_name}) failed to run: "
+            f"{(env.get('error') or {}).get('message', 'unknown')}"
+        )
+    data = env.get("data") or {}
+    if not data.get("approved"):
+        reason = data.get("reasoning") or "(no reasoning provided)"
+        issues = data.get("issues") or []
+        if issues:
+            reason += f" Issues: {issues}"
+        return False, f"verify agent rejected: {reason}"
     return True, "ok"
 
 
@@ -1317,7 +1409,7 @@ def _main_loop(run: "Run", workflow: dict) -> str:
             node.get("output_schema") or node.get("verify")
         ):
             run.trace("verify_started", node=nid, attempt=attempt_n)
-            ok, reason = run_verify(run, node, env)
+            ok, reason = run_verify(run, node, env, attempt_n=attempt_n)
             if not ok:
                 env["status"] = "failure"
                 env["error"] = {"code": "VERIFY_FAIL", "message": reason}
