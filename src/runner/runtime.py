@@ -680,62 +680,71 @@ def _builtin_agents_root() -> Path:
 def _list_builtin_agents() -> list[str]:
     """Names of camflow-shipped agents.
 
-    Per Claude Code's subagent spec, agents are flat <name>.md files
-    (NOT subdirectories). Each lives at <repo>/agents/<name>.md.
+    Source-of-truth layout: <repo>/agents/<name>/AGENT.md (subdirectory).
+    The runtime renames to a flat <name>.md when installing into a
+    project's .claude/agents/ (Claude Code's subagent discovery format).
     """
     root = _builtin_agents_root()
     if not root.is_dir():
         return []
     return sorted(
-        p.stem for p in root.iterdir()
-        if p.is_file() and p.suffix == ".md"
+        p.name for p in root.iterdir()
+        if p.is_dir() and (p / "AGENT.md").exists()
     )
 
 
 def _ensure_builtin_agents_installed(project_root: Path) -> None:
-    """Symlink camflow's built-in agents into <project>/.claude/agents/.
+    """Install camflow's built-in agents into <project>/.claude/agents/.
 
-    Per Claude Code's subagent spec, agents are flat <name>.md files
-    (this differs from skills which are <name>/SKILL.md subdirectories).
-    Claude Code auto-discovers agents at .claude/agents/*.md, so once
-    symlinks exist any spawned camc agent in this project sees them as
-    slash-agents (callable via /name) without further setup.
+    Source: <repo>/agents/<name>/AGENT.md (subdirectory + AGENT.md, our
+    canonical layout — same shape as skillm skills).
+    Target: <project>/.claude/agents/<name>.md (flat file — Claude Code's
+    subagent discovery format).
 
-    Idempotent. Respects user overrides (if a real file exists at the
-    target name, leave it).
+    The install is just rename-via-symlink: target_path → AGENT.md.
+    Claude Code natively discovers .claude/agents/*.md and exposes them
+    as slash-agents (callable via /name), so once installed any
+    camc-spawned session in this project can /name-invoke them.
+
+    Idempotent. Respects user overrides (if a real file already exists
+    at the target, leave it).
     """
     src_root = _builtin_agents_root()
     if not src_root.is_dir():
         return
     target_root = project_root / ".claude" / "agents"
     target_root.mkdir(parents=True, exist_ok=True)
-    for src in src_root.iterdir():
-        if not src.is_file() or src.suffix != ".md":
+    for src_dir in src_root.iterdir():
+        if not src_dir.is_dir():
             continue
-        target = target_root / src.name
+        src_md = src_dir / "AGENT.md"
+        if not src_md.exists():
+            continue
+        target = target_root / f"{src_dir.name}.md"   # rename to flat file
         try:
             if target.is_symlink():
-                if target.resolve() == src.resolve():
+                if target.resolve() == src_md.resolve():
                     continue
                 target.unlink()
             elif target.exists():
                 continue  # user override
-            target.symlink_to(src.resolve())
+            target.symlink_to(src_md.resolve())
         except OSError:
             pass
 
 
 def _resolve_agent_md_path(name: str, project_root: Path) -> Path | None:
-    """Find an agent's <name>.md (flat file, Claude Code spec). Lookup order:
+    """Find an agent's definition. Lookup order — covers both target
+    (flat file installed by camflow) and source (subdirectory in repo):
 
-      1. <project>/.claude/agents/<name>.md   (project-installed)
-      2. ~/.claude/agents/<name>.md           (global)
-      3. <camflow-repo>/agents/<name>.md      (built-in fallback)
+      1. <project>/.claude/agents/<name>.md          (project-installed flat)
+      2. ~/.claude/agents/<name>.md                  (user-global flat)
+      3. <camflow-repo>/agents/<name>/AGENT.md       (built-in source)
     """
     for p in [
         project_root / ".claude" / "agents" / f"{name}.md",
         Path.home() / ".claude" / "agents" / f"{name}.md",
-        _builtin_agents_root() / f"{name}.md",
+        _builtin_agents_root() / name / "AGENT.md",
     ]:
         if p.exists():
             return p
