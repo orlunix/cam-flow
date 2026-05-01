@@ -479,16 +479,8 @@ class Run:
     # context for templates / expressions ---------------------------------
     def expr_ctx(self, retry_ctx: dict | None = None,
                  current_output: dict | None = None) -> dict:
-        nodes_view: dict[str, Any] = {}
-        for nid, atts in self.attempts.items():
-            if not atts:
-                continue
-            # 1-indexed attempts: pad index 0 with None per spec App. B
-            attempts_indexed = [None] + [{"output": a} for a in atts]
-            nodes_view[nid] = {
-                "latest": {"output": atts[-1]},
-                "attempts": attempts_indexed,
-            }
+        nodes_view = {nid: {"latest": {"output": atts[-1]}}
+                      for nid, atts in self.attempts.items() if atts}
         ctx = {"state": self.state, "nodes": nodes_view}
         if retry_ctx is not None:
             ctx["retry"] = retry_ctx
@@ -1361,103 +1353,74 @@ def run_verify(run: Run, node: dict, output: dict,
 
 def _run_verify_agent(rule: dict, run: Run, node: dict, output: dict,
                       attempt_n: int, rule_idx: int) -> tuple[bool, str]:
-    """Spawn an evaluator agent (or skill) to judge whether `output.data`
-    meets the rule's `criterion`.
+    """Spawn an evaluator (agent.evaluator or skill.evaluator) to judge
+    whether `output.data` meets `rule.criterion`. Returns (approved, reason).
 
-    Resolution order — prefer agent.evaluator (autonomous, can read context
-    files / run validation commands) over skill.evaluator (one-shot LLM):
-
-      1. rule.agent: <name>     →  use agent.<name> (top-level autonomous)
-      2. rule.skill: <name>     →  use skill.<name> (one-shot)
-      3. agents/evaluator.md exists  →  agent.evaluator (default)
-      4. otherwise              →  skill.evaluator (built-in fallback)
-
-    Mock mode (rule.mock = {approved: bool, reasoning: string}) bypasses
-    the spawn for deterministic tests.
+    Resolution: rule.agent / rule.skill explicit override → else
+    agent.evaluator if AGENT.md exists → else skill.evaluator.
+    rule.mock = {approved, reasoning} bypasses the spawn (tests).
     """
     criterion = rule.get("criterion") or ""
     if not criterion:
         return False, "verify type=agent: missing required `criterion`"
 
-    # Mock path: deterministic, no LLM cost.
     if isinstance(rule.get("mock"), dict):
         m = rule["mock"]
-        if m.get("approved"):
-            return True, "ok (mock)"
-        return False, f"verify agent rejected: {m.get('reasoning', '<no reason>')}"
+        return (True, "ok (mock)") if m.get("approved") else \
+               (False, f"verify agent rejected: {m.get('reasoning', '<no reason>')}")
 
-    # Resolve which evaluator to spawn.
     if rule.get("agent"):
-        verifier_kind, verifier_name = "agent", rule["agent"]
+        kind, name = "agent", rule["agent"]
     elif rule.get("skill"):
-        verifier_kind, verifier_name = "skill", rule["skill"]
-    elif _resolve_agent_md_path("evaluator", run.project_root) is not None:
-        verifier_kind, verifier_name = "agent", "evaluator"
+        kind, name = "skill", rule["skill"]
+    elif _resolve_agent_md_path("evaluator", run.project_root):
+        kind, name = "agent", "evaluator"
     else:
-        verifier_kind, verifier_name = "skill", "evaluator"
+        kind, name = "skill", "evaluator"
 
-    # Per-rule sub-workspace so prompt + response + output are debuggable.
     sub_dir = (run.run_dir / "nodes" / node["id"]
-               / f"attempt-{attempt_n}" / f"verify-{verifier_kind}-{rule_idx}")
+               / f"attempt-{attempt_n}" / f"verify-{kind}-{rule_idx}")
     sub_dir.mkdir(parents=True, exist_ok=True)
-    workspace = sub_dir / "workspace"
-    workspace.mkdir(exist_ok=True)
     inputs = {
-        "output_being_judged": {
-            "status": output.get("status"),
-            "data": output.get("data"),
-            "error": output.get("error"),
-        },
+        "output_being_judged": {k: output.get(k) for k in ("status", "data", "error")},
         "criterion": criterion,
         "node_id": node["id"],
         "node_goal": node.get("goal", ""),
     }
-    (workspace / "input.json").write_text(json.dumps(inputs, indent=2))
+    (sub_dir / "input.json").write_text(json.dumps(inputs, indent=2))
 
     sub_node = {
-        "id": f"{node['id']}__verify_{verifier_kind}_{rule_idx}",
-        "goal": f"Judge whether the output of node `{node['id']}` "
-                f"meets: {criterion}",
-        "uses": f"{verifier_kind}.{verifier_name}",
+        "id": f"{node['id']}__verify_{kind}_{rule_idx}",
+        "goal": f"Judge whether `{node['id']}` output meets: {criterion}",
+        "uses": f"{kind}.{name}",
         "input": inputs,
-        "output_schema": {
-            "approved": "boolean",
-            "reasoning": "string",
-            "issues": "array",
-        },
+        "output_schema": {"approved": "boolean", "reasoning": "string",
+                          "issues": "array"},
     }
 
-    if verifier_kind == "agent":
-        # Autonomous: use _build_agent_prompt + _exec_agent (loads AGENT.md)
-        role_md = _load_agent_md(verifier_name, run) or ""
-        prompt = _build_agent_prompt(role_md, run.workflow, sub_node,
-                                     inputs, run.project_root)
-        (workspace / "prompt.txt").write_text(prompt)
-        actx = {"att_dir": sub_dir, "workspace": workspace,
-                "inputs": inputs, "prompt_text": prompt}
-        env = _exec_agent(verifier_name, actx, run, sub_node, attempt_n=1)
+    if kind == "agent":
+        prompt = _build_agent_prompt(_load_agent_md(name, run) or "",
+                                     run.workflow, sub_node, inputs,
+                                     run.project_root)
     else:
         prompt = _build_skill_prompt(run.workflow, sub_node, inputs,
-                                     skill_name=verifier_name, run=run)
-        (workspace / "prompt.txt").write_text(prompt)
-        actx = {"att_dir": sub_dir, "workspace": workspace,
-                "inputs": inputs, "prompt_text": prompt}
-        env = _exec_skill(verifier_name, actx, run, sub_node, attempt_n=1)
-
+                                     skill_name=name, run=run)
+    (sub_dir / "prompt.txt").write_text(prompt)
+    actx = {"att_dir": sub_dir, "workspace": sub_dir,
+            "inputs": inputs, "prompt_text": prompt}
+    env = (_exec_agent if kind == "agent" else _exec_skill)(
+        name, actx, run, sub_node, attempt_n=1)
     (sub_dir / "output.json").write_text(json.dumps(env, indent=2))
 
     if env.get("status") != "success":
-        return False, (
-            f"verify {verifier_kind}.{verifier_name} failed to run: "
-            f"{(env.get('error') or {}).get('message', 'unknown')}"
-        )
+        return False, (f"verify {kind}.{name} failed to run: "
+                       f"{(env.get('error') or {}).get('message', 'unknown')}")
     data = env.get("data") or {}
     if not data.get("approved"):
         reason = data.get("reasoning") or "(no reasoning provided)"
-        issues = data.get("issues") or []
-        if issues:
-            reason += f" Issues: {issues}"
-        return False, f"verify {verifier_kind}.{verifier_name} rejected: {reason}"
+        if data.get("issues"):
+            reason += f" Issues: {data['issues']}"
+        return False, f"verify {kind}.{name} rejected: {reason}"
     return True, "ok"
 
 
