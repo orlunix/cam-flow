@@ -245,107 +245,89 @@ class TestVerifyAgent:
                    for e in events)
 
 
-class TestVerifyWorkflowYaml:
-    """`verify: [{type: workflow_yaml}]` — runtime parses + validates the
-    produced YAML. Used by the planner bootstrap to gate Planner output."""
+class TestVerifyCommand:
+    """`verify: [{type: command, cmd: ...}]` — bash gate on exit code.
 
-    def test_valid_yaml_passes(self, tmp_path):
-        valid_yaml = (
-            "workflow: foo\n"
-            "version: 0.6\n"
-            "nodes:\n"
-            "  - id: n\n"
-            "    uses: tool.x\n"
-        )
+    The cmd runs in the attempt dir with `agent_output.json` containing
+    the node's full envelope, so cmds can read fields by parsing JSON.
+    """
+
+    def test_command_zero_exit_passes(self, tmp_path):
         wf = {
-            "workflow": "wy_pass", "version": 0.6,
+            "workflow": "cmd_pass", "version": 0.6,
             "nodes": [{
                 "id": "n",
-                "mock": {"status": "success",
-                         "data": {"workflow_yaml": valid_yaml}},
-                "output_schema": {"workflow_yaml": "string"},
-                "verify": [{"type": "workflow_yaml"}],
+                "mock": {"status": "success", "data": {"x": 1}},
+                "output_schema": {"x": "integer"},
+                "verify": [{"type": "command", "cmd": "true"}],
             }],
         }
-        result = run_workflow(wf, {}, tmp_path)
-        assert result == "success"
+        assert run_workflow(wf, {}, tmp_path) == "success"
 
-    def test_empty_yaml_fails_with_clear_message(self, tmp_path):
+    def test_command_nonzero_exit_halts(self, tmp_path):
         wf = {
-            "workflow": "wy_empty", "version": 0.6,
+            "workflow": "cmd_fail", "version": 0.6,
             "nodes": [{
                 "id": "n",
-                "mock": {"status": "success",
-                         "data": {"workflow_yaml": ""}},
-                "output_schema": {"workflow_yaml": "string"},
-                "verify": [{"type": "workflow_yaml"}],
+                "mock": {"status": "success", "data": {"x": 1}},
+                "output_schema": {"x": "integer"},
+                "verify": [{"type": "command", "cmd": "false"}],
             }],
         }
-        result = run_workflow(wf, {}, tmp_path)
-        assert result == "halted"
-
-    def test_invalid_yaml_fails_with_validation_error_in_envelope(self, tmp_path):
-        bad_yaml = "workflow: bar\nversion: 0.6\nnodes:\n  - id: a\n    uses: skill.does_not_exist_anywhere\n"
-        wf = {
-            "workflow": "wy_bad", "version": 0.6,
-            "nodes": [{
-                "id": "n",
-                "mock": {"status": "success",
-                         "data": {"workflow_yaml": bad_yaml}},
-                "output_schema": {"workflow_yaml": "string"},
-                "verify": [{"type": "workflow_yaml"}],
-            }],
-        }
-        result = run_workflow(wf, {}, tmp_path)
-        assert result == "halted"
+        assert run_workflow(wf, {}, tmp_path) == "halted"
         events = [json.loads(line) for line in
                   (tmp_path / "trace.jsonl").read_text().splitlines()]
         verify_failed = [e for e in events if e["event"] == "verify_failed"]
         assert len(verify_failed) == 1
-        # The verify error message should mention the skill resolution failure
-        assert "skill.does_not_exist_anywhere" in verify_failed[0]["reason"]
+        assert "verify command exited" in verify_failed[0]["reason"]
 
-    def test_invalid_yaml_with_retry_recovers(self, tmp_path):
-        """First attempt produces invalid YAML, second produces valid.
-        Demonstrates the planner-bootstrap retry flow at the runtime level."""
-        # Use a tool that flips behavior on attempt 2.
-        proj = tmp_path / "proj"
-        (proj / "tools").mkdir(parents=True)
-        (proj / "tools" / "twoyaml.sh").write_text(
-            '#!/usr/bin/env bash\n'
-            'set -e\n'
-            'attempt="${CAMFLOW_ATTEMPT:-1}"\n'
-            'if [ "$attempt" = "1" ]; then\n'
-            '  yaml="workflow: x\\nversion: 0.6\\nnodes:\\n  - id: a\\n    uses: skill.unknown_xyz\\n"\n'
-            'else\n'
-            '  yaml="workflow: x\\nversion: 0.6\\nnodes:\\n  - id: a\\n    uses: tool.x\\n"\n'
-            'fi\n'
-            'printf "{\\"status\\":\\"success\\",\\"data\\":{\\"workflow_yaml\\":\\"%s\\"},'
-            '\\"error\\":null,\\"metrics\\":{},\\"artifacts\\":[]}" "$yaml"\n'
-        )
-        (proj / "tools" / "twoyaml.sh").chmod(0o755)
+    def test_command_reads_agent_output_json(self, tmp_path):
+        """cmd cwd=attempt-dir, agent_output.json holds the envelope."""
         wf = {
-            "workflow": "wy_retry", "version": 0.6,
+            "workflow": "cmd_read", "version": 0.6,
             "nodes": [{
-                "id": "p",
-                "uses": "tool.twoyaml",
-                "output_schema": {"workflow_yaml": "string"},
-                "verify": [{"type": "workflow_yaml"}],
-                "retry": {
-                    "until": "true",
-                    "max_attempts": 3,
-                    "feedback": "{{nodes.p.latest.output.error.message}}",
-                },
+                "id": "n",
+                "mock": {"status": "success", "data": {"patch": "diff foo bar"}},
+                "output_schema": {"patch": "string"},
+                "verify": [{
+                    "type": "command",
+                    "cmd": ("python3 -c \"import json,sys; "
+                            "sys.exit(0 if json.load(open('agent_output.json'))"
+                            "['data'].get('patch') else 1)\""),
+                }],
             }],
         }
-        rd = proj / ".camflow" / "runs" / "test-run"
-        result = run_workflow(wf, {}, rd)
-        assert result == "success"
+        assert run_workflow(wf, {}, tmp_path) == "success"
+
+    def test_command_template_renders_state(self, tmp_path):
+        """cmd is a template — {{state.x}} interpolates."""
+        wf = {
+            "workflow": "cmd_tmpl", "version": 0.6,
+            "nodes": [{
+                "id": "n",
+                "mock": {"status": "success", "data": {"x": 1}},
+                "output_schema": {"x": "integer"},
+                "verify": [{"type": "command",
+                            "cmd": "test '{{state.expected}}' = 'hello'"}],
+            }],
+        }
+        assert run_workflow(wf, {"expected": "hello"}, tmp_path) == "success"
+
+    def test_command_missing_cmd_fails_loudly(self, tmp_path):
+        wf = {
+            "workflow": "cmd_missing", "version": 0.6,
+            "nodes": [{
+                "id": "n",
+                "mock": {"status": "success", "data": {"x": 1}},
+                "output_schema": {"x": "integer"},
+                "verify": [{"type": "command"}],   # no cmd field
+            }],
+        }
+        assert run_workflow(wf, {}, tmp_path) == "halted"
         events = [json.loads(line) for line in
-                  (rd / "trace.jsonl").read_text().splitlines()]
-        assert any(e["event"] == "retry_triggered" for e in events)
-        assert any(e["event"] == "verify_failed" for e in events)
-        assert any(e["event"] == "workflow_completed" for e in events)
+                  (tmp_path / "trace.jsonl").read_text().splitlines()]
+        assert any("missing required `cmd`" in e.get("reason", "")
+                   for e in events)
 
 
 class TestHaltAndSkipPropagation:

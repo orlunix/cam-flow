@@ -28,8 +28,9 @@ nodes:
       patch: string
       explanation: string
     verify:
-      - type: rule
-        assert: "output.data.patch != ''"
+      - type: command
+        cmd: |
+          python3 -c "import json,sys; sys.exit(0 if json.load(open('agent_output.json'))['data'].get('patch') else 1)"
 
   - id: review
     goal: |

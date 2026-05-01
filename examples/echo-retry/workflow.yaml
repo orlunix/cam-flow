@@ -22,7 +22,6 @@ nodes:
       root_cause: string
       confidence: number
     verify:
-      - type: schema
 
   - id: fix
     goal: Produce a patch.
@@ -39,9 +38,9 @@ nodes:
       patch: string
       explanation: string
     verify:
-      - type: schema
-      - type: rule
-        assert: "output.data.patch != ''"
+      - type: command
+        cmd: |
+          python3 -c "import json,sys; sys.exit(0 if json.load(open('agent_output.json'))['data'].get('patch') else 1)"
 
   - id: test
     goal: Validate the patch.

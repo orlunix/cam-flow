@@ -30,8 +30,9 @@ nodes:
       ok: boolean
       reason: string
     verify:
-      - type: rule
-        assert: "output.data.value >= 0"
+      - type: command
+        cmd: |
+          python3 -c "import json,sys; d=json.load(open('agent_output.json'))['data']; sys.exit(0 if d.get('value', -1) >= 0 else 1)"
     retry:
       until: "nodes.produce.latest.output.data.ok == true"
       max_attempts: "{{state.max_attempts}}"

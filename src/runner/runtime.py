@@ -804,12 +804,16 @@ def _exec_agent(name: str, actx: dict, run: Run, node: dict, attempt_n: int) -> 
 
 def run_verify(run: Run, node: dict, output: dict,
                attempt_n: int = 1) -> tuple[bool, str]:
-    """Validate a node's envelope against (a) its declared output_schema —
-    automatic, runs whenever schema is declared — and (b) any user-declared
-    `verify:` rules (rule / agent / future types like file/command).
+    """Validate a node's envelope against:
+      (a) its declared output_schema — automatic field-presence check;
+      (b) any user-declared `verify:` rules — only two types:
+          - `command`: run a bash command in the attempt dir;
+                       gate on exit code 0.
+          - `agent`:   spawn an LLM evaluator with a `criterion`.
 
-    Schema check is implicit: the user does NOT need to add `{type: schema}`
-    to verify. If they do, it's a no-op (kept for backward compat).
+    Schema check is implicit. No expression-rule type, no workflow_yaml
+    type. If you want a value check beyond field-presence, write a
+    `command` (e.g. `python3 -c '...exit 0/1...'`) or use `agent`.
     """
     # ── (a) Auto schema check ────────────────────────────────────────
     schema = node.get("output_schema") or {}
@@ -822,40 +826,59 @@ def run_verify(run: Run, node: dict, output: dict,
     # ── (b) User-declared rules ──────────────────────────────────────
     for idx, rule in enumerate(node.get("verify") or []):
         rtype = rule.get("type")
-        if rtype == "schema":
-            # Already handled above; redundant but accepted for back-compat.
-            continue
-        elif rtype == "rule":
-            assertion = rule.get("assert", "")
-            ctx = run.expr_ctx(current_output=output)
-            try:
-                ok = eval_expr(assertion, ctx)
-            except ExprError as e:
-                return False, f"rule eval error: {e}"
+        if rtype == "command":
+            ok, reason = _run_verify_command(rule, run, node, output, attempt_n)
             if not ok:
-                return False, f"rule failed: {assertion}"
+                return False, reason
         elif rtype == "agent":
             ok, reason = _run_verify_agent(rule, run, node, output,
                                            attempt_n, idx)
             if not ok:
                 return False, reason
-        elif rtype == "workflow_yaml":
-            # Pure validation: checks the named string field parses as a
-            # well-formed workflow.yaml (incl. skill/agent resolution).
-            # Does NOT modify the workflow — the YAML stays exactly as
-            # the agent wrote it. Used by `camflow plan`'s plan node so
-            # bad YAML triggers retry-with-feedback loops.
-            field = rule.get("field", "workflow_yaml")
-            data = output.get("data") or {}
-            yaml_text = data.get(field, "")
-            if not isinstance(yaml_text, str) or not yaml_text.strip():
-                return False, f"workflow_yaml: field `data.{field}` is empty or not a string"
-            try:
-                parse_workflow_yaml(yaml_text, project_root=run.project_root)
-            except WorkflowParseError as e:
-                return False, f"workflow_yaml verify failed: {e}"
         else:
-            return False, f"unknown verify type: {rtype}"
+            return False, f"unknown verify type: {rtype!r} (only 'command' / 'agent')"
+    return True, "ok"
+
+
+def _run_verify_command(rule: dict, run: Run, node: dict, output: dict,
+                        attempt_n: int) -> tuple[bool, str]:
+    """Run a bash command in the attempt dir; gate on exit code 0.
+
+    The cmd string is rendered as a template (so `{{state.x}}` works).
+    cwd is the attempt dir, where `agent_output.json` (the agent's
+    raw envelope) and `output.json` (runner-validated) both live —
+    so cmds can read fields via:
+        python3 -c "import json,sys; sys.exit(0 if json.load(open('agent_output.json'))['data']['x'] else 1)"
+        test -n "$(jq -r .data.patch agent_output.json)"
+
+    Optional `timeout` (seconds) defaults to 60.
+    """
+    cmd_raw = rule.get("cmd", "")
+    if not cmd_raw:
+        return False, "verify type=command: missing required `cmd`"
+    try:
+        cmd = _render_str(cmd_raw, run.expr_ctx(current_output=output))
+    except ExprError as e:
+        return False, f"verify command template error: {e}"
+    timeout = int(rule.get("timeout", 60))
+    cwd = run.run_dir / "nodes" / node["id"] / f"attempt-{attempt_n}"
+    cwd.mkdir(parents=True, exist_ok=True)
+    # Make the envelope readable by the cmd uniformly across exec types
+    # (mock nodes don't write agent_output.json themselves).
+    (cwd / "agent_output.json").write_text(json.dumps(output, indent=2))
+    try:
+        proc = subprocess.run(
+            ["bash", "-c", cmd],
+            capture_output=True, text=True,
+            timeout=timeout, cwd=str(cwd),
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"verify command timed out after {timeout}s: {cmd[:80]}"
+    if proc.returncode != 0:
+        snippet = (proc.stderr or proc.stdout).strip()[:300]
+        return False, (
+            f"verify command exited {proc.returncode}: {snippet}"
+        )
     return True, "ok"
 
 
@@ -1245,10 +1268,8 @@ def _planner_bootstrap_workflow() -> dict:
                     "examined_count": "integer",
                     "total_count": "integer",
                 },
-                "verify": [
-                    {"type": "rule",
-                     "assert": "output.data.relevant_skills != null"},
-                ],
+                # Schema check (auto) ensures relevant_skills exists; an
+                # empty list is valid (skill_searcher might find nothing).
             },
             {
                 "id": "plan",
@@ -1264,18 +1285,23 @@ def _planner_bootstrap_workflow() -> dict:
                     "previous_validation_error": "{{retry.feedback}}",
                 },
                 "output_schema": {"workflow_yaml": "string"},
+                # Validates the YAML via a one-shot Python: parse via
+                # runner.parse.parse_workflow_yaml, exit non-zero on any
+                # WorkflowParseError. Cwd is the attempt dir so
+                # agent_output.json is right there to read.
                 "verify": [
-                    {"type": "rule",
-                     "assert": "output.data.workflow_yaml != ''"},
-                    # Validates the YAML the planner produced. On failure
-                    # retry kicks in with the error string as feedback.
-                    {"type": "workflow_yaml"},
+                    {"type": "command",
+                     "cmd": (
+                         "python3 -c \""
+                         "import json,sys;"
+                         "from runner.parse import parse_workflow_yaml;"
+                         "y=json.load(open('agent_output.json'))['data']['workflow_yaml'];"
+                         "y or (print('empty workflow_yaml',file=sys.stderr) or sys.exit(1));"
+                         "parse_workflow_yaml(y)"
+                         "\"")},
                 ],
                 "retry": {
                     "max_attempts": 3,
-                    # On verify failure env.error.message contains the
-                    # workflow_yaml verify reason — fed back as feedback
-                    # for the planner agent's next attempt.
                     "feedback": "{{nodes.plan.latest.output.error.message}}",
                 },
             },
