@@ -493,7 +493,12 @@ class TestHaltAndSkipPropagation:
         )
 
     def test_workspace_dir_created_for_tool(self, tmp_path):
-        """Tools see a per-attempt workspace dir as cwd + CAMFLOW_WORKSPACE."""
+        """Tools see the attempt dir as cwd + CAMFLOW_WORKSPACE.
+
+        Layout is flat: attempt-N/ IS the workspace (no nested workspace/
+        subdir). prompt.txt + input.json + agent_output.json + output.json
+        all land directly inside attempt-N/.
+        """
         proj = tmp_path / "proj"
         (proj / "tools").mkdir(parents=True)
         # tool prints CAMFLOW_WORKSPACE in its data; also writes a file there
@@ -511,8 +516,8 @@ class TestHaltAndSkipPropagation:
               "nodes": [{"id": "n", "uses": "tool.ws"}]}
         rd = proj / ".camflow" / "runs" / "test-run"
         run_workflow(wf, {}, rd)
-        # workspace dir exists under attempt-1
-        ws = rd / "nodes" / "n" / "attempt-1" / "workspace"
+        # attempt-N IS the workspace
+        ws = rd / "nodes" / "n" / "attempt-1"
         assert ws.is_dir()
         assert (ws / "input.json").exists()
         assert (ws / "raw_stdout.txt").exists()

@@ -18,3 +18,4 @@ data/
 # Editor / OS noise
 .pytest_cache/
 .DS_Store
+.claude/

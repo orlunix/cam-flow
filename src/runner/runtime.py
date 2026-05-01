@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import argparse
 import ast
+import atexit
 import json
 import os
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import time
@@ -287,6 +289,78 @@ def _gen_run_id() -> str:
     return f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
 
 
+# ─── Run dir layout ─────────────────────────────────────────────────────
+# A camflow project keeps exactly ONE current run on disk plus a rolling
+# archive of past runs:
+#
+#   <project>/.camflow/run/                  ← current run (always here)
+#   <project>/.camflow/archives/<stamp>-<status>/   ← past runs
+#
+# When a new run starts, the previous .camflow/run/ (if any) is moved to
+# archives/. No timestamped run dir per invocation; no nesting noise.
+
+_RUN_DIRNAME = "run"
+_ARCHIVES_DIRNAME = "archives"
+
+
+def _project_camflow_dir(project_root: Path) -> Path:
+    return project_root / ".camflow"
+
+
+def _default_run_dir(project_root: Path) -> Path:
+    """Return <project>/.camflow/run/, archiving any prior run first."""
+    cam = _project_camflow_dir(project_root)
+    run = cam / _RUN_DIRNAME
+    if run.exists() and any(run.iterdir()):
+        _archive_run_dir(run, cam / _ARCHIVES_DIRNAME)
+    run.mkdir(parents=True, exist_ok=True)
+    return run
+
+
+def _archive_run_dir(run_dir: Path, archives_root: Path) -> Path | None:
+    """Move run_dir to archives_root/<stamp>-<status>/. Best-effort.
+
+    The status suffix is derived from the run's halt.json or trace tail —
+    so an archived run dir's name immediately tells you the outcome
+    (success / failure / halted / unknown).
+    """
+    if not run_dir.exists():
+        return None
+    archives_root.mkdir(parents=True, exist_ok=True)
+    status = _peek_run_status(run_dir)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = archives_root / f"{stamp}-{status}"
+    n = 1
+    while target.exists():
+        target = archives_root / f"{stamp}-{status}-{n}"
+        n += 1
+    run_dir.rename(target)
+    return target
+
+
+def _peek_run_status(run_dir: Path) -> str:
+    """Best-effort inspection: success / failure / halted / unknown."""
+    if (run_dir / "halt.json").exists():
+        return "halted"
+    trace = run_dir / "trace.jsonl"
+    if trace.exists():
+        try:
+            lines = trace.read_text().splitlines()
+            if lines:
+                last = json.loads(lines[-1])
+                if last.get("event") == "workflow_completed":
+                    return last.get("status") or "unknown"
+        except Exception:
+            pass
+    # plan-mode parent dir: aggregate over child runs (planner/, main/).
+    for sub in ("main", "planner"):
+        if (run_dir / sub).is_dir():
+            s = _peek_run_status(run_dir / sub)
+            if s != "unknown":
+                return s
+    return "unknown"
+
+
 _VALID_STATUSES = {"success", "failure", "skipped", "halted"}
 
 
@@ -339,10 +413,8 @@ class Run:
                 self.step = sum(1 for _ in self.trace_path.open())
 
         # project_root: the directory that *contains* the .camflow/ holding
-        # this run. Works for both the conventional layout
-        # (<proj>/.camflow/runs/<id>) and the nested plan-command layout
-        # (<proj>/.camflow/runs/<id>/{planner,main}). Falls back to cwd
-        # if run_dir is custom and not under any .camflow/ tree.
+        # this run. Falls back to cwd if run_dir is custom and not under
+        # any .camflow/ tree.
         parts = self.run_dir.resolve().parts
         if ".camflow" in parts:
             idx = parts.index(".camflow")
@@ -359,8 +431,56 @@ class Run:
         # Write our PID so `camflow stop <run_dir>` can SIGTERM us.
         self.pid_path.write_text(str(os.getpid()))
 
+        # Run id + camc tag — generated once per Run so the crash-safety
+        # net (and _exec_skill / _exec_agent) can spawn agents under a
+        # unique tag without recomputing path-based heuristics. Captured
+        # in trace events too for debug correlation.
+        self.run_id = _gen_run_id()
+        self.run_id_for_tag = self.run_id  # kept for backward-compat name
+        self.tag = f"camflow:{self.run_id}"
+
+        # Crash-safety net: ensure spawned agents die even if the runtime
+        # exits abnormally (uncaught exception, SIGTERM, OOM-kill of parent
+        # shell). Normal path already kills via try/finally inside the
+        # node executors — this is just defense in depth.
+        self._installed_handlers = False
+        atexit.register(self._cleanup_orphan_agents)
+        try:
+            self._prev_sigterm = signal.signal(signal.SIGTERM,
+                                               self._signal_cleanup)
+            self._prev_sigint = signal.signal(signal.SIGINT,
+                                              self._signal_cleanup)
+            self._installed_handlers = True
+        except (ValueError, OSError):
+            # signal.signal raises ValueError if not on main thread.
+            # Tests / embedded use is fine without the signal handlers —
+            # atexit alone still catches the common cases.
+            pass
+
+    def _cleanup_orphan_agents(self) -> None:
+        n = _kill_run_tagged_agents(self.run_id_for_tag)
+        if n > 0:
+            print(f"camflow: killed {n} orphan agent(s) on exit",
+                  file=sys.stderr)
+
+    def _signal_cleanup(self, signum, _frame) -> None:
+        # Triggers atexit, which runs _cleanup_orphan_agents.
+        sys.exit(128 + signum)
+
     def cleanup(self) -> None:
-        """Remove the runner.pid file at end of run."""
+        """Remove the runner.pid file at end of run + uninstall the
+        crash-safety net (we exited normally; no orphans to chase)."""
+        try:
+            atexit.unregister(self._cleanup_orphan_agents)
+        except Exception:
+            pass
+        if self._installed_handlers:
+            try:
+                signal.signal(signal.SIGTERM, self._prev_sigterm)
+                signal.signal(signal.SIGINT, self._prev_sigint)
+            except (ValueError, OSError):
+                pass
+            self._installed_handlers = False
         try:
             self.pid_path.unlink()
         except FileNotFoundError:
@@ -431,18 +551,19 @@ def _build_agent_context(run: Run, node: dict, attempt_n: int,
     directory, the rendered inputs as `input.json`, and (for skill/agent)
     the compiled prompt as `prompt.txt`.
 
-    Layout:
+    Layout (flat — attempt dir IS the workspace, no nested subdir):
       <run_dir>/nodes/<id>/attempt-<n>/
-        ├── workspace/           ← the agent's view: prompt + inputs (+ files it produces)
-        │   ├── input.json
-        │   └── prompt.txt       (skill/agent only)
-        └── output.json          ← runner-managed, written after the call returns
+        ├── input.json
+        ├── prompt.txt          (skill/agent only)
+        ├── agent_output.json   (agent-written; appears once it finishes)
+        ├── agent.id            (camc agent ID; for cleanup)
+        └── output.json         (runner-managed; written after the call returns)
 
-    Tools, skills, and (future) agents all share this context-builder so the
+    Tools, skills, and agents all share this context-builder so the
     runtime has one place to wire up materials + workspace.
     """
     att_dir = run.run_dir / "nodes" / node["id"] / f"attempt-{attempt_n}"
-    workspace = att_dir / "workspace"
+    workspace = att_dir
     workspace.mkdir(parents=True, exist_ok=True)
 
     (workspace / "input.json").write_text(
@@ -865,6 +986,38 @@ def _camc_kill(agent_id: str) -> None:
                    capture_output=True, text=True, timeout=10)
 
 
+def _kill_run_tagged_agents(run_id_for_tag: str) -> int:
+    """Best-effort: kill every running camc agent tagged camflow:<run_id>.
+
+    Used as a crash-safety net (atexit + signal handlers). The normal
+    success path already kills agents in _exec_skill / _exec_agent's
+    `finally` blocks; this function catches the cases where those
+    `finally` blocks never ran — runtime exceptions, SIGTERM, SIGKILL
+    of the parent shell, OOM-kill, etc. Returns count of agents killed.
+    Never raises.
+    """
+    tag = f"camflow:{run_id_for_tag}"
+    killed = 0
+    try:
+        proc = subprocess.run(["camc", "--json", "ls"],
+                              capture_output=True, text=True, timeout=10)
+        if proc.returncode != 0:
+            return 0
+        for a in json.loads(proc.stdout):
+            if a.get("status") != "running":
+                continue
+            tags = (a.get("task") or {}).get("tags") or []
+            if tag not in tags:
+                continue
+            aid = a.get("id") or ""
+            if aid:
+                _camc_kill(aid)
+                killed += 1
+    except Exception:
+        pass
+    return killed
+
+
 def _camc_send(agent_id: str, text: str) -> None:
     subprocess.run(["camc", "send", agent_id, "--text", text],
                    capture_output=True, text=True, timeout=10)
@@ -914,19 +1067,10 @@ def _exec_skill(name: str, actx: dict, run: Run, node: dict, attempt_n: int) -> 
     prompt = actx["prompt_text"] + _skill_kickoff_instruction()
     output_path = workspace / _OUTPUT_FILENAME
     agent_name = f"{node['id']}-attempt-{attempt_n}"
-    # Tag with run_id so cleanup / `camflow stop` later can find these agents.
-    # Tag with the unique run_id (the dir name under .camflow/runs/) so
-    # cross-run cleanup / stop can find all agents from this run.
-    parts = run.run_dir.resolve().parts
-    if "runs" in parts:
-        i = parts.index("runs")
-        run_id_for_tag = parts[i + 1] if i + 1 < len(parts) else parts[-1]
-    else:
-        run_id_for_tag = run.run_dir.name
-    tag = f"camflow:{run_id_for_tag}"
 
-    # 1. Spawn
-    agent_id, err = _camc_run(workspace, prompt, agent_name, tag)
+    # 1. Spawn — agent tagged with run.tag so the crash-safety net can
+    # find every agent from this run via `camc list` filtering.
+    agent_id, err = _camc_run(workspace, prompt, agent_name, run.tag)
     if not agent_id:
         return _empty_envelope("failure", error={
             "code": "CAMC_RUN_FAILED", "message": err,
@@ -1105,13 +1249,6 @@ def _exec_agent(name: str, actx: dict, run: Run, node: dict, attempt_n: int) -> 
 
     output_path = workspace / _OUTPUT_FILENAME
     agent_runtime_name = f"{node['id']}-attempt-{attempt_n}"
-    parts = run.run_dir.resolve().parts
-    run_id_for_tag = (
-        parts[parts.index("runs") + 1]
-        if "runs" in parts and parts.index("runs") + 1 < len(parts)
-        else run.run_dir.name
-    )
-    tag = f"camflow:{run_id_for_tag}"
 
     # 1. Spawn — agent is given the project as cwd-ish via --add-dir so it
     # can Read/Write project paths (.claude/skills/, etc.). Workspace is
@@ -1120,7 +1257,7 @@ def _exec_agent(name: str, actx: dict, run: Run, node: dict, attempt_n: int) -> 
         ["camc", "run",
          "--path", str(workspace),
          "--name", agent_runtime_name,
-         "--tag", tag,
+         "--tag", run.tag,
          prompt],
         capture_output=True, text=True, timeout=30,
     )
@@ -1698,10 +1835,14 @@ def _run_command(argv: list[str]) -> int:
         with open(args.state) as f:
             state = json.load(f)
 
-    run_id = _gen_run_id()
-    run_dir = Path(args.run_dir) if args.run_dir else project / ".camflow" / "runs" / run_id
+    if args.run_dir:
+        run_dir = Path(args.run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        # Default layout: <project>/.camflow/run/. Any prior run there
+        # is automatically moved to <project>/.camflow/archives/<stamp>/.
+        run_dir = _default_run_dir(project)
 
-    print(f"run_id:  {run_id}")
     print(f"run_dir: {run_dir}")
     result = run_workflow(wf, state, run_dir)
     print(f"result:  {result}")
@@ -1840,12 +1981,15 @@ def _plan_command(argv: list[str]) -> int:
         state_schema = doc.get("state", doc) if isinstance(doc, dict) else None
 
     cwd = Path.cwd()
-    run_id = _gen_run_id()
-    parent = (Path(args.run_dir) if args.run_dir
-              else cwd / ".camflow" / "runs" / run_id)
+    if args.run_dir:
+        parent = Path(args.run_dir)
+        parent.mkdir(parents=True, exist_ok=True)
+    else:
+        # Default: <cwd>/.camflow/run/ with planner/ + main/ subdirs.
+        # Any prior run is auto-archived to .camflow/archives/<stamp>/.
+        parent = _default_run_dir(cwd)
     planner_dir = parent / "planner"
 
-    print(f"run_id:  {run_id}", file=sys.stderr)
     print(f"planner: {planner_dir}", file=sys.stderr)
 
     # Make sure built-ins (skills + agents) are installed in the project so
