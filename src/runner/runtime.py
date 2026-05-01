@@ -28,6 +28,7 @@ from typing import Any
 
 import yaml
 
+from . import camc
 from .expr import (
     ExprError, eval_expr, render_deep, _render_str,
 )
@@ -142,7 +143,7 @@ class Run:
             pass
 
     def _cleanup_orphan_agents(self) -> None:
-        n = _kill_run_tagged_agents(self.run_id_for_tag)
+        n = camc.kill_by_tag(self.tag)
         if n > 0:
             print(f"camflow: killed {n} orphan agent(s) on exit",
                   file=sys.stderr)
@@ -602,13 +603,9 @@ def _build_skill_prompt(workflow: dict, node: dict, inputs: dict,
     return "\n\n".join(parts)
 
 
-# Default caps for the camc-based skill executor. Overridable via env vars
-# for local debugging — e.g. CAMFLOW_SKILL_TIMEOUT=120 for cheap test runs.
-_SKILL_TIMEOUT_S = int(os.environ.get("CAMFLOW_SKILL_TIMEOUT", "600"))
-_SKILL_POLL_INTERVAL_S = float(os.environ.get("CAMFLOW_SKILL_POLL_INTERVAL", "2"))
-_SKILL_INNER_RETRIES = int(os.environ.get("CAMFLOW_SKILL_INNER_RETRIES", "3"))
-
-_AGENT_ID_RE = re.compile(r"^Starting [a-z]+ agent ([0-9a-f]{6,})", re.MULTILINE)
+# camc constants — keep aliases for any external callers; the canonical
+# values live in camc.py.
+_SKILL_TIMEOUT_S = camc.DEFAULT_SKILL_TIMEOUT_S
 _OUTPUT_FILENAME = "agent_output.json"
 
 
@@ -618,176 +615,59 @@ def _skill_kickoff_instruction() -> str:
         "\n\n# Delivery protocol\n"
         f"Write the final envelope JSON to `{_OUTPUT_FILENAME}` in your "
         "current working directory. Do not print it; the runner reads the file. "
-        "If the runner sends follow-up feedback in this session, treat it as a "
-        "schema-correction request — update the SAME file and stop. "
         "Once you've written the file, do nothing else; the runner will close "
         "the session."
     )
 
 
-def _camc_run(workspace: Path, prompt: str, name: str, tag: str) -> tuple[str | None, str]:
-    """Spawn a camc agent. Returns (agent_id, error_message)."""
-    proc = subprocess.run(
-        ["camc", "run",
-         "--path", str(workspace),
-         "--name", name,
-         "--tag", tag,
-         prompt],
-        capture_output=True, text=True, timeout=30,
-    )
-    if proc.returncode != 0:
-        return None, f"camc run exited {proc.returncode}: {proc.stderr.strip()[:300]}"
-    m = _AGENT_ID_RE.search(proc.stdout)
-    if not m:
-        return None, f"could not parse agent ID from camc run output:\n{proc.stdout[:500]}"
-    return m.group(1), ""
-
-
-def _camc_status(agent_id: str) -> dict:
-    """Get current camc agent status as dict (best-effort; {} on parse fail)."""
-    try:
-        proc = subprocess.run(
-            ["camc", "--json", "status", agent_id],
-            capture_output=True, text=True, timeout=10,
-        )
-        if proc.returncode != 0:
-            return {}
-        return json.loads(proc.stdout)
-    except (subprocess.TimeoutExpired, json.JSONDecodeError):
-        return {}
-
-
-def _camc_kill(agent_id: str) -> None:
-    subprocess.run(["camc", "kill", agent_id],
-                   capture_output=True, text=True, timeout=10)
-
-
-def _kill_run_tagged_agents(run_id_for_tag: str) -> int:
-    """Best-effort: kill every running camc agent tagged camflow:<run_id>.
-
-    Used as a crash-safety net (atexit + signal handlers). The normal
-    success path already kills agents in _exec_skill / _exec_agent's
-    `finally` blocks; this function catches the cases where those
-    `finally` blocks never ran — runtime exceptions, SIGTERM, SIGKILL
-    of the parent shell, OOM-kill, etc. Returns count of agents killed.
-    Never raises.
-    """
-    tag = f"camflow:{run_id_for_tag}"
-    killed = 0
-    try:
-        proc = subprocess.run(["camc", "--json", "ls"],
-                              capture_output=True, text=True, timeout=10)
-        if proc.returncode != 0:
-            return 0
-        for a in json.loads(proc.stdout):
-            if a.get("status") != "running":
-                continue
-            tags = (a.get("task") or {}).get("tags") or []
-            if tag not in tags:
-                continue
-            aid = a.get("id") or ""
-            if aid:
-                _camc_kill(aid)
-                killed += 1
-    except Exception:
-        pass
-    return killed
-
-
-def _camc_send(agent_id: str, text: str) -> None:
-    subprocess.run(["camc", "send", agent_id, "--text", text],
-                   capture_output=True, text=True, timeout=10)
-
-
-def _wait_for_output(output_path: Path, since_mtime: float | None,
-                     timeout_s: int) -> tuple[bool, str]:
-    """Poll until output_path is written/updated (mtime > since_mtime) and
-    contains valid JSON. Returns (ok, error_msg)."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if output_path.exists():
-            try:
-                mt = output_path.stat().st_mtime
-            except OSError:
-                mt = None
-            if mt is not None and (since_mtime is None or mt > since_mtime):
-                # File looks fresh. Sanity-check it parses.
-                try:
-                    json.loads(output_path.read_text())
-                    return True, ""
-                except json.JSONDecodeError:
-                    pass  # still being written; keep polling
-        time.sleep(_SKILL_POLL_INTERVAL_S)
-    return False, f"timed out waiting for {output_path.name} after {timeout_s}s"
-
-
 def _exec_skill(name: str, actx: dict, run: Run, node: dict, attempt_n: int) -> dict:
     """Run a one-shot LLM "skill" via camc.
 
-    Lifecycle:
-      1. Workspace + prompt already prepared by _build_agent_context().
-      2. `camc run` spawns the agent in workspace as cwd.
-      3. Wait for `agent_output.json` to land.
-      4. Parse it. Schema mismatch / bad envelope → fail and let the
-         outer main_loop retry the whole node.
-      5. `camc rm --archive` cleans up tmux + DB record + history.
+    The lifecycle (spawn → wait for agent_output.json → kill) is in
+    `camc.run_and_collect`. Here we just turn the resulting envelope
+    into a node-level result with strict status validation.
     """
     workspace = actx["workspace"]
     prompt = actx["prompt_text"] + _skill_kickoff_instruction()
-    output_path = workspace / _OUTPUT_FILENAME
     agent_name = f"{node['id']}-attempt-{attempt_n}"
-
-    agent_id, err = _camc_run(workspace, prompt, agent_name, run.tag)
-    if not agent_id:
-        return _empty_envelope("failure", error={
-            "code": "CAMC_RUN_FAILED", "message": err,
-        })
-    (workspace / "agent.id").write_text(agent_id)
-
     try:
-        ok, err = _wait_for_output(output_path, None, _SKILL_TIMEOUT_S)
-        if not ok:
-            return _empty_envelope("failure", error={
-                "code": "AGENT_TIMEOUT", "message": err,
-                "details": {"agent_id": agent_id},
-            })
-        try:
-            env = json.loads(output_path.read_text())
-        except json.JSONDecodeError as e:
-            return _empty_envelope("failure", error={
-                "code": "AGENT_BAD_OUTPUT",
-                "message": f"agent_output.json not JSON: {e}",
-                "details": {"agent_id": agent_id},
-            })
+        _agent_id, env = camc.run_and_collect(
+            prompt=prompt,
+            workspace=workspace,
+            name=agent_name,
+            tag=run.tag,
+            output_file=_OUTPUT_FILENAME,
+            timeout_s=_SKILL_TIMEOUT_S,
+            write_id_to=workspace / "agent.id",
+        )
+    except camc.CamcTimeout as e:
+        return _empty_envelope("failure",
+                               error={"code": "AGENT_TIMEOUT", "message": str(e)})
+    except camc.CamcError as e:
+        return _empty_envelope("failure",
+                               error={"code": "CAMC_RUN_FAILED", "message": str(e)})
+    except json.JSONDecodeError as e:
+        return _empty_envelope("failure", error={
+            "code": "AGENT_BAD_OUTPUT",
+            "message": f"agent_output.json not JSON: {e}",
+        })
 
-        # Pull metrics if camc tracks them
-        status = _camc_status(agent_id)
-        metrics = dict(env.get("metrics") or {})
-        if cost := status.get("cost_estimate"):
-            metrics["camc_cost_usd"] = cost
-        if started := status.get("started_at"):
-            metrics["camc_started_at"] = started
-
-        # Strict status: agent must return one of the two valid values.
-        # Any other string (ok / done / completed / unknown) is a bug we
-        # surface as an explicit failure, not a silent coerce.
-        out_status = env.get("status")
-        if out_status not in _VALID_STATUSES:
-            return _empty_envelope("failure", error={
-                "code": "BAD_STATUS",
-                "message": f"agent returned status={out_status!r}, "
-                           f"expected one of {sorted(_VALID_STATUSES)}",
-            })
-        return {
-            "status": out_status,
-            "data": env.get("data", {}) or {},
-            "error": env.get("error"),
-            "metrics": metrics,
-            "artifacts": env.get("artifacts", []) or [],
-        }
-    finally:
-        # 5. Always kill the agent — no leaked tmux sessions.
-        _camc_kill(agent_id)
+    # Strict status: agent must return one of the valid values. Any other
+    # string is a bug we surface explicitly, not silently coerce.
+    out_status = env.get("status")
+    if out_status not in _VALID_STATUSES:
+        return _empty_envelope("failure", error={
+            "code": "BAD_STATUS",
+            "message": f"agent returned status={out_status!r}, "
+                       f"expected one of {sorted(_VALID_STATUSES)}",
+        })
+    return {
+        "status": out_status,
+        "data": env.get("data", {}) or {},
+        "error": env.get("error"),
+        "metrics": env.get("metrics", {}) or {},
+        "artifacts": env.get("artifacts", []) or [],
+    }
 
 
 # ─── Agent execution (autonomous mode) ─────────────────────────────────
@@ -863,10 +743,11 @@ def _build_agent_prompt(role_md: str, workflow: dict, node: dict,
 def _exec_agent(name: str, actx: dict, run: Run, node: dict, attempt_n: int) -> dict:
     """Run an autonomous camc agent loaded with agents/<name>.md.
 
-    Differs from _exec_skill in that the agent is autonomous: it can use
-    Claude Code tools (Read/Write/Bash/Glob/Grep), read multiple skills,
-    and decide its own multi-step path. Same envelope contract though —
-    writes agent_output.json when done, runner picks up.
+    Differs from _exec_skill in:
+      - prompt assembled from AGENT.md (autonomous role spec) instead of
+        a single-turn skill template;
+      - longer default timeout (autonomous agents do multi-step tool use).
+    The lifecycle (spawn → wait → kill) is shared via camc.run_and_collect.
     """
     workspace = actx["workspace"]
     role_md = _load_agent_md(name, run)
@@ -879,118 +760,44 @@ def _exec_agent(name: str, actx: dict, run: Run, node: dict, attempt_n: int) -> 
     prompt = _build_agent_prompt(role_md, run.workflow, node,
                                  actx["inputs"], run.project_root)
     (workspace / "prompt.txt").write_text(prompt)
-
-    output_path = workspace / _OUTPUT_FILENAME
     agent_runtime_name = f"{node['id']}-attempt-{attempt_n}"
 
-    # 1. Spawn — agent is given the project as cwd-ish via --add-dir so it
-    # can Read/Write project paths (.claude/skills/, etc.). Workspace is
-    # the agent's main working dir.
-    proc = subprocess.run(
-        ["camc", "run",
-         "--path", str(workspace),
-         "--name", agent_runtime_name,
-         "--tag", run.tag,
-         prompt],
-        capture_output=True, text=True, timeout=30,
-    )
-    if proc.returncode != 0:
-        return _empty_envelope("failure", error={
-            "code": "CAMC_RUN_FAILED",
-            "message": f"camc run exited {proc.returncode}: {proc.stderr.strip()[:300]}",
-        })
-    m = _AGENT_ID_RE.search(proc.stdout)
-    if not m:
-        return _empty_envelope("failure", error={
-            "code": "CAMC_RUN_BAD_OUTPUT",
-            "message": f"could not parse agent ID from camc run output:\n{proc.stdout[:500]}",
-        })
-    agent_id = m.group(1)
-    (workspace / "agent.id").write_text(agent_id)
-
-    # Autonomous agents get a longer timeout — they're doing multi-step
-    # tool use, not a single LLM turn.
-    agent_timeout_s = int(os.environ.get("CAMFLOW_AGENT_TIMEOUT", "1800"))
-
-    last_mtime: float | None = None
-    schema = node.get("output_schema") or {}
-
     try:
-        # 2. Wait for first output
-        ok, err = _wait_for_output(output_path, last_mtime, agent_timeout_s)
-        if not ok:
-            return _empty_envelope("failure", error={
-                "code": "AGENT_TIMEOUT", "message": err,
-                "details": {"agent_id": agent_id},
-            })
-        last_mtime = output_path.stat().st_mtime
+        _agent_id, env = camc.run_and_collect(
+            prompt=prompt,
+            workspace=workspace,
+            name=agent_runtime_name,
+            tag=run.tag,
+            output_file=_OUTPUT_FILENAME,
+            timeout_s=camc.DEFAULT_AGENT_TIMEOUT_S,
+            write_id_to=workspace / "agent.id",
+        )
+    except camc.CamcTimeout as e:
+        return _empty_envelope("failure",
+                               error={"code": "AGENT_TIMEOUT", "message": str(e)})
+    except camc.CamcError as e:
+        return _empty_envelope("failure",
+                               error={"code": "CAMC_RUN_FAILED", "message": str(e)})
+    except json.JSONDecodeError as e:
+        return _empty_envelope("failure", error={
+            "code": "AGENT_BAD_OUTPUT",
+            "message": f"agent_output.json not JSON: {e}",
+        })
 
-        # 3. Self-correction loop on schema mismatch (same as skills)
-        for inner_attempt in range(_SKILL_INNER_RETRIES + 1):
-            try:
-                env = json.loads(output_path.read_text())
-            except json.JSONDecodeError as e:
-                return _empty_envelope("failure", error={
-                    "code": "AGENT_BAD_OUTPUT",
-                    "message": f"agent_output.json not JSON: {e}",
-                    "details": {"agent_id": agent_id},
-                })
-
-            if schema:
-                data = env.get("data") or {}
-                missing = [k for k in schema if k not in data]
-            else:
-                missing = []
-            if not missing:
-                break
-            if inner_attempt >= _SKILL_INNER_RETRIES:
-                run.trace("agent_self_correct_exhausted",
-                          node=node["id"], attempt=attempt_n,
-                          extra={"missing": missing,
-                                 "inner_attempts": inner_attempt + 1})
-                break
-            feedback = (
-                f"Schema check failed. Missing required field(s) in `data`: "
-                f"{missing}. Update {_OUTPUT_FILENAME} with all required "
-                f"fields, then stop."
-            )
-            run.trace("agent_self_correct", node=node["id"], attempt=attempt_n,
-                      extra={"inner_attempt": inner_attempt + 1, "missing": missing})
-            _camc_send(agent_id, feedback)
-            ok, err = _wait_for_output(output_path, last_mtime, agent_timeout_s)
-            if not ok:
-                return _empty_envelope("failure", error={
-                    "code": "AGENT_TIMEOUT_SELF_CORRECT",
-                    "message": err, "details": {"agent_id": agent_id},
-                })
-            last_mtime = output_path.stat().st_mtime
-
-        status = _camc_status(agent_id)
-        metrics = dict(env.get("metrics") or {})
-        if cost := status.get("cost_estimate"):
-            metrics["camc_cost_usd"] = cost
-        if started := status.get("started_at"):
-            metrics["camc_started_at"] = started
-
-        # Strict status: agent must return one of the two valid values.
-        # Any other string (ok / done / completed / unknown) is a bug we
-        # surface as an explicit failure, not a silent coerce.
-        out_status = env.get("status")
-        if out_status not in _VALID_STATUSES:
-            return _empty_envelope("failure", error={
-                "code": "BAD_STATUS",
-                "message": f"agent returned status={out_status!r}, "
-                           f"expected one of {sorted(_VALID_STATUSES)}",
-            })
-        return {
-            "status": out_status,
-            "data": env.get("data", {}) or {},
-            "error": env.get("error"),
-            "metrics": metrics,
-            "artifacts": env.get("artifacts", []) or [],
-        }
-    finally:
-        _camc_kill(agent_id)
+    out_status = env.get("status")
+    if out_status not in _VALID_STATUSES:
+        return _empty_envelope("failure", error={
+            "code": "BAD_STATUS",
+            "message": f"agent returned status={out_status!r}, "
+                       f"expected one of {sorted(_VALID_STATUSES)}",
+        })
+    return {
+        "status": out_status,
+        "data": env.get("data", {}) or {},
+        "error": env.get("error"),
+        "metrics": env.get("metrics", {}) or {},
+        "artifacts": env.get("artifacts", []) or [],
+    }
 
 
 # ─── Verify ────────────────────────────────────────────────────────────
