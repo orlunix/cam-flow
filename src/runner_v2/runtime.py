@@ -1,0 +1,1295 @@
+"""camflow v1.0 runtime — single-file workflow engine.
+
+Implements docs/spec-v1.md:
+- Workflow state machine: running / done / halted
+- Node state machine:     waiting / running / done (+ result success/fail)
+- Halt is workflow-level only; nodes have no halted state.
+- Run + Verify are paired (design + QA), share the same `steps` checklist.
+- Verify defaults to LLM agent; opt-in `command` for mechanical gating.
+- Skill / tool registry is strict (load fails on unresolved reference).
+- Retry is internal counter; previous envelope auto-injected as input.previous.
+
+Non-LLM execution goes through the standard library; every LLM
+invocation goes through camc_lib.run_and_collect().
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import atexit
+import json
+import os
+import re
+import secrets
+import signal
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+import yaml
+
+from . import camc_lib as camc
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════
+
+VALID_STATUSES = frozenset({"success", "fail"})
+VALID_TYPES = frozenset({"string", "integer", "number", "boolean", "array"})
+
+OUTPUT_FILENAME = "agent_output.json"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  EXPRESSIONS + TEMPLATES
+# ═══════════════════════════════════════════════════════════════════════
+
+class ExprError(Exception):
+    pass
+
+
+_ALLOWED_AST = (
+    ast.Expression, ast.Constant, ast.Name, ast.Attribute, ast.Subscript,
+    ast.Compare, ast.BoolOp, ast.UnaryOp, ast.Load,
+    ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+    ast.And, ast.Or, ast.Not,
+)
+
+
+def _expr_walk(node, ctx):
+    if isinstance(node, ast.Expression):
+        return _expr_walk(node.body, ctx)
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        if node.id == "true":  return True
+        if node.id == "false": return False
+        if node.id == "null":  return None
+        if node.id not in ctx:
+            raise ExprError(f"undefined name: {node.id}")
+        return ctx[node.id]
+    if isinstance(node, ast.Attribute):
+        obj = _expr_walk(node.value, ctx)
+        if isinstance(obj, dict):
+            if node.attr not in obj:
+                raise ExprError(f"missing key: .{node.attr}")
+            return obj[node.attr]
+        if obj is None:
+            raise ExprError(f"None has no attr {node.attr}")
+        raise ExprError(f"can't access .{node.attr} on {type(obj).__name__}")
+    if isinstance(node, ast.Subscript):
+        obj = _expr_walk(node.value, ctx)
+        idx = _expr_walk(node.slice, ctx)
+        if isinstance(obj, list):
+            try:
+                return obj[idx]
+            except (IndexError, TypeError) as e:
+                raise ExprError(f"subscript: {e}")
+        if isinstance(obj, dict):
+            return obj.get(idx)
+        raise ExprError(f"can't subscript {type(obj).__name__}")
+    if isinstance(node, ast.Compare):
+        left = _expr_walk(node.left, ctx)
+        for op, right_node in zip(node.ops, node.comparators):
+            right = _expr_walk(right_node, ctx)
+            ok = (
+                (isinstance(op, ast.Eq) and left == right) or
+                (isinstance(op, ast.NotEq) and left != right) or
+                (isinstance(op, ast.Lt) and left < right) or
+                (isinstance(op, ast.LtE) and left <= right) or
+                (isinstance(op, ast.Gt) and left > right) or
+                (isinstance(op, ast.GtE) and left >= right)
+            )
+            if not ok:
+                return False
+            left = right
+        return True
+    if isinstance(node, ast.BoolOp):
+        if isinstance(node.op, ast.And):
+            return all(_expr_walk(v, ctx) for v in node.values)
+        if isinstance(node.op, ast.Or):
+            return any(_expr_walk(v, ctx) for v in node.values)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return not _expr_walk(node.operand, ctx)
+    raise ExprError(f"unsupported syntax: {type(node).__name__}")
+
+
+def eval_expr(s: str, ctx: dict):
+    try:
+        tree = ast.parse(s, mode="eval")
+    except SyntaxError as e:
+        raise ExprError(f"parse error: {e}")
+    for n in ast.walk(tree):
+        if not isinstance(n, _ALLOWED_AST):
+            raise ExprError(f"forbidden syntax: {type(n).__name__}")
+    return _expr_walk(tree, ctx)
+
+
+_TEMPLATE_RE = re.compile(r"\{\{\s*(.+?)\s*\}\}")
+
+
+def render_str(s: str, ctx: dict) -> str:
+    """Substitute `{{expr}}` in s with eval_expr(expr, ctx).
+    Strict — missing fields raise ExprError. Workflow author must supply
+    state defaults rather than rely on optional markers.
+    """
+    def repl(m):
+        v = eval_expr(m.group(1).strip(), ctx)
+        if v is None:
+            return "null"
+        if isinstance(v, (dict, list)):
+            return json.dumps(v)
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        return str(v)
+    return _TEMPLATE_RE.sub(repl, s)
+
+
+def render_deep(obj, ctx: dict):
+    if isinstance(obj, str):
+        return render_str(obj, ctx)
+    if isinstance(obj, dict):
+        return {k: render_deep(v, ctx) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [render_deep(v, ctx) for v in obj]
+    return obj
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  YAML LOADING + STRUCTURAL VALIDATION
+# ═══════════════════════════════════════════════════════════════════════
+
+class WorkflowParseError(Exception):
+    pass
+
+
+_FENCE_RE = re.compile(r"^```(?:yaml|yml)?\s*\n?|\n?```\s*$",
+                       re.IGNORECASE | re.MULTILINE)
+
+
+def load_workflow(path: str) -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def parse_workflow_yaml(text: str, project_root: Path | None = None) -> dict:
+    """Parse + validate a YAML string. Raises WorkflowParseError on any
+    problem. Strips ```yaml fences if present (Planner output)."""
+    cleaned = _FENCE_RE.sub("", text.strip()).strip()
+    if not cleaned:
+        raise WorkflowParseError("empty input")
+    try:
+        wf = yaml.safe_load(cleaned)
+    except yaml.YAMLError as e:
+        raise WorkflowParseError(f"invalid YAML: {e}") from e
+    if not isinstance(wf, dict):
+        raise WorkflowParseError(
+            f"top level is not a dict (got {type(wf).__name__})"
+        )
+    errors = validate_workflow(wf, project_root=project_root)
+    if errors:
+        raise WorkflowParseError(
+            "validation failed:\n  " + "\n  ".join(errors)
+        )
+    return wf
+
+
+def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
+    """Return list of validation error strings. Empty list = OK.
+
+    With project_root, also resolves skill/tool references to disk —
+    workflow load FAILS if any referenced skill or tool is missing.
+    """
+    errors = []
+    if not isinstance(wf, dict):
+        return ["workflow is not a dict"]
+    nodes = wf.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        return ["workflow.nodes is missing or empty"]
+
+    ids = [n.get("id") for n in nodes]
+    if any(not i for i in ids):
+        errors.append("a node is missing 'id'")
+    if len(ids) != len(set(ids)):
+        errors.append(f"duplicate node ids: {ids}")
+    id_set = set(filter(None, ids))
+
+    for n in nodes:
+        nid = n.get("id", "<?>")
+        # Required fields
+        for k in ("goal", "steps", "run"):
+            if k not in n:
+                errors.append(f"{nid}: missing required field '{k}'")
+        if not isinstance(n.get("steps"), list) or not n.get("steps"):
+            errors.append(f"{nid}.steps: must be a non-empty list of strings")
+        # Run mutex
+        run = n.get("run") or {}
+        if not isinstance(run, dict):
+            errors.append(f"{nid}.run: must be a dict")
+            continue
+        has_skill = "skill" in run
+        has_tool = "tool" in run
+        if not (has_skill ^ has_tool):
+            errors.append(f"{nid}.run: must have exactly one of `skill` or `tool`")
+        # Verify mutex
+        verify = n.get("verify")
+        if verify is not None:
+            if not isinstance(verify, dict):
+                errors.append(f"{nid}.verify: must be a dict")
+            else:
+                has_crit = "criterion" in verify
+                has_cmd = "command" in verify
+                if has_crit and has_cmd:
+                    errors.append(
+                        f"{nid}.verify: cannot have both `criterion` and `command`"
+                    )
+        # needs references valid ids
+        for dep in n.get("needs", []) or []:
+            if dep not in id_set:
+                errors.append(f"{nid}.needs: unknown node '{dep}'")
+        # output_schema types
+        schema = n.get("output_schema") or {}
+        if not isinstance(schema, dict):
+            errors.append(f"{nid}.output_schema: must be a dict")
+        else:
+            for fk, ft in schema.items():
+                if ft not in VALID_TYPES:
+                    errors.append(
+                        f"{nid}.output_schema.{fk}: unknown type {ft!r}; "
+                        f"allowed: {sorted(VALID_TYPES)}"
+                    )
+        # skill / tool existence (only with project_root)
+        if project_root is not None:
+            if has_skill:
+                if not _resolve_skill_path(run["skill"], project_root):
+                    errors.append(
+                        f"{nid}.run.skill: '{run['skill']}' not found "
+                        f"(no skills/{run['skill']}/SKILL.md in project or repo)"
+                    )
+            if has_tool:
+                if not _resolve_tool_path(run["tool"], project_root):
+                    errors.append(
+                        f"{nid}.run.tool: '{run['tool']}' not found or not "
+                        f"executable (relative to {project_root})"
+                    )
+
+    # cycle detection on `needs` graph
+    needs_map = {n["id"]: list(n.get("needs", []) or [])
+                 for n in nodes if "id" in n}
+    visited, stack = set(), set()
+
+    def dfs(u):
+        if u in stack:
+            errors.append(f"cycle through node '{u}'")
+            return
+        if u in visited:
+            return
+        stack.add(u)
+        for v in needs_map.get(u, []):
+            if v in id_set:
+                dfs(v)
+        stack.discard(u)
+        visited.add(u)
+
+    for nid in id_set:
+        dfs(nid)
+    return errors
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  SKILL / TOOL RESOLUTION
+# ═══════════════════════════════════════════════════════════════════════
+
+def _camflow_repo_root() -> Path:
+    """Where this runtime ships from — has builtin skills/."""
+    return Path(__file__).resolve().parents[2]
+
+
+def _resolve_skill_path(name: str, project_root: Path) -> Path | None:
+    for root in (project_root, _camflow_repo_root()):
+        p = root / "skills" / name / "SKILL.md"
+        if p.exists():
+            return p
+    return None
+
+
+def _resolve_tool_path(rel: str, project_root: Path) -> Path | None:
+    p = (project_root / rel).resolve()
+    return p if p.is_file() and os.access(p, os.X_OK) else None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  RUN DIR + ID
+# ═══════════════════════════════════════════════════════════════════════
+
+RUN_DIRNAME = "run"
+ARCHIVES_DIRNAME = "archives"
+
+
+def utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def gen_run_id() -> str:
+    return f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
+
+
+def default_run_dir(project_root: Path) -> Path:
+    """Return <project>/.camflow/run/, archiving any prior run first."""
+    cam = project_root / ".camflow"
+    run = cam / RUN_DIRNAME
+    if run.exists() and any(run.iterdir()):
+        archive_run_dir(run, cam / ARCHIVES_DIRNAME)
+    run.mkdir(parents=True, exist_ok=True)
+    return run
+
+
+def archive_run_dir(run_dir: Path, archives_root: Path) -> Path | None:
+    """Move run_dir to archives_root/<stamp>-<status>[-<suffix>]/."""
+    if not run_dir.exists():
+        return None
+    archives_root.mkdir(parents=True, exist_ok=True)
+    status = _peek_run_status(run_dir)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    extra = os.environ.get("CAMFLOW_ARCHIVE_SUFFIX", "").strip()
+    suffix = f"-{extra}" if extra else ""
+    target = archives_root / f"{stamp}-{status}{suffix}"
+    n = 1
+    while target.exists():
+        target = archives_root / f"{stamp}-{status}{suffix}-{n}"
+        n += 1
+    run_dir.rename(target)
+    return target
+
+
+def _peek_run_status(run_dir: Path) -> str:
+    if (run_dir / "halt.json").exists():
+        return "halted"
+    trace = run_dir / "trace.jsonl"
+    if trace.exists():
+        try:
+            lines = trace.read_text().splitlines()
+            if lines:
+                last = json.loads(lines[-1])
+                if last.get("event") == "workflow_completed":
+                    return last.get("status") or "unknown"
+        except Exception:
+            pass
+    return "unknown"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  ENVELOPE HELPERS
+# ═══════════════════════════════════════════════════════════════════════
+
+def empty_envelope(status: str = "fail",
+                   error: dict | None = None,
+                   feedback: str | None = None,
+                   data: dict | None = None) -> dict:
+    """Build a v1.0 envelope. status is required; rest auto-fill."""
+    return {
+        "status": status,
+        "data": data if data is not None else {},
+        "error": error,
+        "feedback": feedback,
+        "request_human": False,
+    }
+
+
+def normalize_envelope(raw: dict) -> dict:
+    """Coerce arbitrary dict into a v1.0 envelope shape, validating
+    status. Returns either a clean envelope or a failure envelope with
+    BAD_STATUS if status is invalid.
+    """
+    status = raw.get("status")
+    if status not in VALID_STATUSES:
+        return empty_envelope(
+            "fail",
+            error={"code": "BAD_STATUS",
+                   "message": f"agent returned status={status!r}, "
+                              f"expected one of {sorted(VALID_STATUSES)}"},
+        )
+    return {
+        "status": status,
+        "data": raw.get("data") or {},
+        "error": raw.get("error"),
+        "feedback": raw.get("feedback"),
+        "request_human": bool(raw.get("request_human", False)),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PROMPT BUILDERS
+# ═══════════════════════════════════════════════════════════════════════
+
+def _format_schema_for_prompt(schema: dict) -> str:
+    """Render output_schema dict as human-readable list."""
+    if not schema:
+        return "(no specific fields required; data may be any object)"
+    lines = []
+    for k, t in schema.items():
+        lines.append(f"  - {k}: {t}")
+    return "\n".join(lines)
+
+
+def _format_steps_for_prompt(steps: list[str]) -> str:
+    return "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
+
+
+def build_run_prompt(node: "Node", input_dict: dict,
+                     skill_md: str | None = None) -> str:
+    """Compose the prompt for a run agent (skill mode).
+
+    Layout:
+      [skill template]
+      [Goal]
+      [Steps]
+      [Inputs]
+      [Output schema + delivery protocol]
+    """
+    parts = []
+    if skill_md:
+        parts.append(skill_md.strip())
+    parts.append(f"# Goal\n{node.goal}")
+    parts.append(
+        "# Steps (you MUST do these, in order)\n"
+        + _format_steps_for_prompt(node.steps)
+    )
+    parts.append(
+        "# Inputs\n```json\n"
+        + json.dumps(input_dict, indent=2, ensure_ascii=False)
+        + "\n```"
+    )
+    schema_section = _format_schema_for_prompt(node.output_schema)
+    parts.append(
+        f"# Output\n"
+        f"Write a single JSON envelope to `{OUTPUT_FILENAME}` in your "
+        f"current working directory:\n\n"
+        f"```json\n"
+        f"{{\n"
+        f'  "status": "success" | "fail",\n'
+        f'  "data": {{ ... }},\n'
+        f'  "error": null | {{"code": "...", "message": "..."}},\n'
+        f'  "feedback": null,\n'
+        f'  "request_human": false\n'
+        f"}}\n"
+        f"```\n\n"
+        f"## data shape (required when status=success)\n"
+        f"{schema_section}\n\n"
+        f"## Rules\n"
+        f"- status MUST be exactly \"success\" or \"fail\" (not \"ok\", "
+        f"not \"done\", not \"completed\").\n"
+        f"- success → data MUST contain ALL fields above with matching types.\n"
+        f"- fail → error MUST be `{{code: <short>, message: <human readable>}}`.\n"
+        f"- Set request_human=true if the input is so unclear/ambiguous that "
+        f"only a human can resolve it (skips retry, halts workflow).\n"
+        f"- Don't print to stdout. Don't use markdown code fences in the file.\n"
+        f"- Once written, do nothing else. The runner will close the session."
+    )
+    if "previous" in input_dict:
+        parts.append(
+            "# Note: previous attempt failed\n"
+            "Inputs include a `previous` key with the last attempt's envelope. "
+            "Read `previous.feedback` to know what went wrong; address it this time."
+        )
+    return "\n\n".join(parts)
+
+
+def build_verify_prompt(node: "Node", run_envelope: dict) -> str:
+    """Compose the prompt for the verify-agent (default verify path).
+
+    Verify-agent's data shape is fixed: {approved, step_results, reasoning}.
+    """
+    criterion = (node.verify_config or {}).get("criterion") or ""
+    parts = [
+        f"You are evaluating whether the previous node `{node.id}` did its job.",
+    ]
+    if criterion:
+        parts.append(f"# Criterion\n{criterion}")
+    parts.append(f"# Goal (same as run's)\n{node.goal}")
+    parts.append(
+        "# Steps that should have been done (your checklist — verify each)\n"
+        + _format_steps_for_prompt(node.steps)
+    )
+    parts.append(
+        "# Envelope produced by run\n```json\n"
+        + json.dumps(run_envelope, indent=2, ensure_ascii=False)
+        + "\n```"
+    )
+    parts.append(
+        "# Your job\n"
+        "For EACH step above, decide whether it was done correctly based on "
+        "the envelope and any files in this directory.\n"
+        "approved = true ONLY if ALL steps pass.\n"
+        "On reject: be specific about what failed — your text becomes the "
+        "feedback the run agent sees on its next attempt."
+    )
+    parts.append(
+        f"# Output\n"
+        f"Write to `{OUTPUT_FILENAME}`:\n\n"
+        f"```json\n"
+        f"{{\n"
+        f'  "status": "success",\n'
+        f'  "data": {{\n'
+        f'    "approved": true | false,\n'
+        f'    "step_results": [\n'
+        f'      {{"step": 1, "passed": true|false, "reasoning": "..."}}\n'
+        f"      , ...\n"
+        f"    ],\n"
+        f'    "reasoning": "<one-sentence overall>"\n'
+        f"  }},\n"
+        f'  "error": null,\n'
+        f'  "feedback": null,\n'
+        f'  "request_human": false\n'
+        f"}}\n"
+        f"```\n\n"
+        f"step_results MUST have exactly {len(node.steps)} entries, one per step."
+    )
+    return "\n\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  RUN EXECUTORS
+# ═══════════════════════════════════════════════════════════════════════
+
+def exec_tool(tool_path: Path, input_dict: dict, workspace: Path) -> dict:
+    """Run a shell tool. stdin = input.json, stdout = envelope JSON."""
+    proc = subprocess.run(
+        [str(tool_path)],
+        input=json.dumps(input_dict),
+        capture_output=True, text=True,
+        cwd=str(workspace),
+        env={**os.environ, "CAMFLOW_WORKSPACE": str(workspace)},
+        timeout=600,
+    )
+    (workspace / "raw_stdout.txt").write_text(proc.stdout or "")
+    if proc.returncode != 0:
+        return empty_envelope(
+            "fail",
+            error={"code": "TOOL_NONZERO_EXIT",
+                   "message": f"tool exited {proc.returncode}: "
+                              f"{(proc.stderr or '').strip()[:200]}"},
+        )
+    try:
+        raw = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        return empty_envelope(
+            "fail",
+            error={"code": "TOOL_BAD_OUTPUT",
+                   "message": f"tool stdout not JSON: {e}"},
+        )
+    return normalize_envelope(raw)
+
+
+def exec_skill(skill_md: str, node: "Node", input_dict: dict,
+               workspace: Path, attempt_n: int, run_id_tag: str) -> dict:
+    """Spawn a camc agent loaded with the skill template + run prompt."""
+    prompt = build_run_prompt(node, input_dict, skill_md=skill_md)
+    (workspace / "prompt.txt").write_text(prompt)
+    agent_name = f"{node.id}-attempt-{attempt_n}"
+    try:
+        _aid, raw = camc.run_and_collect(
+            prompt=prompt,
+            workspace=workspace,
+            name=agent_name,
+            tag=run_id_tag,
+            output_file=OUTPUT_FILENAME,
+            timeout_s=camc.DEFAULT_SKILL_TIMEOUT_S,
+            write_id_to=workspace / "agent.id",
+        )
+    except camc.CamcTimeout as e:
+        return empty_envelope(
+            "fail", error={"code": "AGENT_TIMEOUT", "message": str(e)})
+    except camc.CamcError as e:
+        return empty_envelope(
+            "fail", error={"code": "CAMC_RUN_FAILED", "message": str(e)})
+    except json.JSONDecodeError as e:
+        return empty_envelope(
+            "fail",
+            error={"code": "AGENT_BAD_OUTPUT",
+                   "message": f"{OUTPUT_FILENAME} not JSON: {e}"})
+    return normalize_envelope(raw)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  VERIFIERS
+# ═══════════════════════════════════════════════════════════════════════
+
+def auto_schema_check(envelope: dict, schema: dict) -> tuple[bool, str]:
+    """Field-presence + type check against output_schema."""
+    if not schema:
+        return True, ""
+    data = envelope.get("data") or {}
+    type_check = {
+        "string":  lambda v: isinstance(v, str),
+        "integer": lambda v: isinstance(v, bool) is False and isinstance(v, int),
+        "number":  lambda v: isinstance(v, bool) is False and isinstance(v, (int, float)),
+        "boolean": lambda v: isinstance(v, bool),
+        "array":   lambda v: isinstance(v, list),
+    }
+    for key, ftype in schema.items():
+        if key not in data:
+            return False, f"schema: missing field '{key}' in data"
+        check = type_check.get(ftype)
+        if check and not check(data[key]):
+            return False, (
+                f"schema: field '{key}' has wrong type "
+                f"(expected {ftype}, got {type(data[key]).__name__})"
+            )
+    return True, ""
+
+
+def verify_with_command(cmd_template: str, run: "Run", node: "Node",
+                        envelope: dict, attempt_n: int,
+                        timeout: int = 60) -> tuple[bool, str]:
+    """Render cmd template, run bash, gate on exit code."""
+    ctx = run.expr_ctx(current_output=envelope)
+    try:
+        cmd = render_str(cmd_template, ctx)
+    except ExprError as e:
+        return False, f"verify command template error: {e}"
+    cwd = run.run_dir / "nodes" / node.id / f"attempt-{attempt_n}"
+    cwd.mkdir(parents=True, exist_ok=True)
+    # Always write agent_output.json so cmds can read uniformly across
+    # mock / tool / skill paths.
+    (cwd / OUTPUT_FILENAME).write_text(json.dumps(envelope, indent=2))
+    try:
+        proc = subprocess.run(
+            ["bash", "-c", cmd],
+            capture_output=True, text=True,
+            timeout=timeout, cwd=str(cwd),
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"verify command timed out after {timeout}s: {cmd[:80]}"
+    if proc.returncode != 0:
+        snippet = (proc.stderr or proc.stdout).strip()[:300]
+        return False, f"verify command exited {proc.returncode}: {snippet}"
+    return True, "ok"
+
+
+def verify_with_agent(node: "Node", run: "Run", envelope: dict,
+                      attempt_n: int) -> tuple[bool, str]:
+    """Spawn a verify-agent (using built-in evaluator skill or override).
+
+    Returns (approved, feedback). Feedback comes from the agent's
+    `data.reasoning` (and step_results details on reject).
+    """
+    sub_dir = run.run_dir / "nodes" / node.id / f"attempt-{attempt_n}" / "verify"
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    prompt = build_verify_prompt(node, envelope)
+    (sub_dir / "prompt.txt").write_text(prompt)
+    try:
+        _aid, raw = camc.run_and_collect(
+            prompt=prompt,
+            workspace=sub_dir,
+            name=f"{node.id}-verify-{attempt_n}",
+            tag=run.tag,
+            output_file=OUTPUT_FILENAME,
+            timeout_s=camc.DEFAULT_SKILL_TIMEOUT_S,
+        )
+    except camc.CamcTimeout as e:
+        return False, f"verify-agent timeout: {e}"
+    except camc.CamcError as e:
+        return False, f"verify-agent failed to run: {e}"
+    except json.JSONDecodeError as e:
+        return False, f"verify-agent bad output: {e}"
+    if raw.get("status") != "success":
+        return False, (
+            f"verify-agent did not return success: "
+            f"{(raw.get('error') or {}).get('message', '?')}"
+        )
+    data = raw.get("data") or {}
+    approved = bool(data.get("approved"))
+    reasoning = data.get("reasoning") or "(no reasoning provided)"
+    if not approved:
+        # Append step-level details so feedback is actionable.
+        bad_steps = [
+            sr for sr in (data.get("step_results") or [])
+            if not sr.get("passed")
+        ]
+        if bad_steps:
+            reasoning += "\nFailed steps: " + json.dumps(bad_steps,
+                                                         ensure_ascii=False)
+    return approved, reasoning
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  NODE
+# ═══════════════════════════════════════════════════════════════════════
+
+class Node:
+    """A single workflow node — data + lifecycle + run/verify behavior.
+
+    Public attrs (everything you'd want from outside):
+      static (set at load):
+        id, goal, steps, needs, input_template, output_schema, retry_max
+      runtime (mutated during execution):
+        lifecycle, result, retry_count, output, history
+      config (used by behaviors):
+        run_config    {skill: ...} or {tool: ...}
+        verify_config None (default agent) | {criterion: ...} | {command: ...}
+
+    Behavior is via methods: execute_attempt(), do_verify().
+    """
+
+    def __init__(self, *, id: str, goal: str, steps: list[str],
+                 needs: list[str], input_template: dict,
+                 output_schema: dict, retry_max: int,
+                 run_config: dict, verify_config: Optional[dict]):
+        # ── static ──
+        self.id = id
+        self.goal = goal
+        self.steps = steps
+        self.needs = needs
+        self.input_template = input_template
+        self.output_schema = output_schema
+        self.retry_max = retry_max
+        self.run_config = run_config
+        self.verify_config = verify_config
+        # ── runtime ──
+        self.lifecycle = "waiting"
+        self.result: Optional[str] = None
+        self.retry_count = 0
+        self.output: Optional[dict] = None
+        self.history: list[dict] = []
+
+    # ─── Loading ──────────────────────────────────────────────────────
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Node":
+        run = d.get("run") or {}
+        return cls(
+            id=d["id"],
+            goal=d["goal"],
+            steps=list(d["steps"]),
+            needs=list(d.get("needs") or []),
+            input_template=dict(run.get("input") or {}),
+            output_schema=dict(d.get("output_schema") or {}),
+            retry_max=int(d.get("retry", 1)),
+            run_config={k: run[k] for k in ("skill", "tool") if k in run},
+            verify_config=(dict(d["verify"]) if d.get("verify") else None),
+        )
+
+    # ─── Lifecycle helpers ────────────────────────────────────────────
+
+    def is_done(self) -> bool:
+        return self.lifecycle == "done"
+
+    def is_ready(self, all_nodes: dict[str, "Node"]) -> bool:
+        if self.lifecycle == "done":
+            return False
+        for dep in self.needs:
+            up = all_nodes.get(dep)
+            if up is None or up.lifecycle != "done" or up.result != "success":
+                return False
+        return True
+
+    def public_view(self) -> dict:
+        """What templates see as `nodes.<id>`."""
+        return {"output": self.output or {}}
+
+    # ─── Execute one attempt (run + verify) ───────────────────────────
+
+    def execute_attempt(self, run: "Run", attempt_n: int) -> dict:
+        """Run + verify one full attempt. Returns final envelope.
+
+        Side effects:
+          - writes input.json + output.json to the attempt dir
+          - emits trace events
+          - mutates self.history / self.output (caller does state moves)
+        """
+        att_dir = run.run_dir / "nodes" / self.id / f"attempt-{attempt_n}"
+        att_dir.mkdir(parents=True, exist_ok=True)
+
+        # Render input. Auto-inject `previous` on retries.
+        ctx = run.expr_ctx()
+        rendered = render_deep(self.input_template, ctx)
+        if attempt_n > 1 and self.history:
+            rendered = {**rendered, "previous": self.history[-1]}
+        (att_dir / "input.json").write_text(
+            json.dumps(rendered, indent=2, ensure_ascii=False)
+        )
+
+        run.trace("node_started", node=self.id, attempt=attempt_n,
+                  reason=("retry" if attempt_n > 1 else "needs satisfied"))
+
+        # Run.
+        envelope = self._do_run(run, rendered, att_dir, attempt_n)
+
+        # Verify (only when run reported success).
+        if envelope["status"] == "success":
+            run.trace("verify_started", node=self.id, attempt=attempt_n)
+            ok, feedback = self._do_verify(run, envelope, attempt_n)
+            if not ok:
+                envelope["status"] = "fail"
+                envelope["error"] = {"code": "VERIFY_FAIL", "message": feedback}
+                envelope["feedback"] = feedback
+                run.trace("verify_failed", node=self.id, attempt=attempt_n,
+                          reason=feedback)
+            else:
+                envelope["feedback"] = feedback
+                run.trace("verify_completed", node=self.id, attempt=attempt_n)
+
+        # Persist final envelope + record on node.
+        (att_dir / "output.json").write_text(
+            json.dumps(envelope, indent=2, ensure_ascii=False)
+        )
+        self.history.append(envelope)
+        self.output = envelope
+
+        if envelope["status"] == "success":
+            run.trace("node_completed", node=self.id, attempt=attempt_n,
+                      status="success")
+        else:
+            run.trace("node_failed", node=self.id, attempt=attempt_n,
+                      reason=(envelope.get("error") or {}).get("message", "?"))
+        return envelope
+
+    def _do_run(self, run: "Run", input_dict: dict, att_dir: Path,
+                attempt_n: int) -> dict:
+        """Dispatch to skill or tool executor."""
+        if "skill" in self.run_config:
+            skill_name = self.run_config["skill"]
+            skill_path = _resolve_skill_path(skill_name, run.project_root)
+            skill_md = skill_path.read_text() if skill_path else ""
+            return exec_skill(skill_md, self, input_dict, att_dir,
+                              attempt_n, run.tag)
+        if "tool" in self.run_config:
+            tool_path = _resolve_tool_path(self.run_config["tool"],
+                                           run.project_root)
+            if not tool_path:
+                return empty_envelope(
+                    "fail",
+                    error={"code": "TOOL_NOT_FOUND",
+                           "message": f"tool not found or not -x: "
+                                      f"{self.run_config['tool']}"},
+                )
+            return exec_tool(tool_path, input_dict, att_dir)
+        # validation should have caught this; defensive:
+        return empty_envelope(
+            "fail",
+            error={"code": "BAD_RUN_CONFIG",
+                   "message": f"node {self.id} run has neither skill nor tool"},
+        )
+
+    def _do_verify(self, run: "Run", envelope: dict,
+                   attempt_n: int) -> tuple[bool, str]:
+        """Run schema check, then user-declared verify (or default agent)."""
+        # 1. auto schema
+        ok, reason = auto_schema_check(envelope, self.output_schema)
+        if not ok:
+            return False, reason
+        # 2. configured verify
+        cfg = self.verify_config
+        if cfg is None:
+            # Default: agent verify with steps as criterion.
+            return verify_with_agent(self, run, envelope, attempt_n)
+        if "command" in cfg:
+            return verify_with_command(
+                cfg["command"], run, self, envelope, attempt_n,
+                timeout=int(cfg.get("timeout", 60)),
+            )
+        # criterion (default agent path with explicit override criterion)
+        return verify_with_agent(self, run, envelope, attempt_n)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  RUN (workflow execution context)
+# ═══════════════════════════════════════════════════════════════════════
+
+class Run:
+    """One execution of a workflow.
+
+    Owns:
+      - the run dir + persistence (trace.jsonl, halt.json, runner.pid)
+      - the node graph + their lifecycle state
+      - the camc run tag (for crash-safety net)
+      - the workflow-level state machine (running/done/halted)
+    """
+
+    def __init__(self, workflow: dict, state: dict, run_dir: Path,
+                 *, resume: bool = False):
+        self.workflow = workflow
+        self.state = state
+        self.run_dir = run_dir
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.nodes_by_id: dict[str, Node] = {
+            n["id"]: Node.from_dict(n) for n in workflow["nodes"]
+        }
+        self.workflow_state = "running"
+        self.step_n = 0
+        self.run_id = gen_run_id()
+        self.tag = f"camflow:{self.run_id}"
+
+        self.trace_path = run_dir / "trace.jsonl"
+        self.pid_path = run_dir / "runner.pid"
+
+        if not resume:
+            (run_dir / "workflow.yaml").write_text(
+                yaml.safe_dump(workflow, sort_keys=False)
+            )
+            (run_dir / "state.json").write_text(json.dumps(state, indent=2))
+        else:
+            if self.trace_path.exists():
+                self.step_n = sum(1 for _ in self.trace_path.open())
+
+        # project_root: the dir holding .camflow/.
+        parts = run_dir.resolve().parts
+        if ".camflow" in parts:
+            idx = parts.index(".camflow")
+            self.project_root = Path(*parts[:idx]) if idx > 0 else Path("/")
+        else:
+            self.project_root = Path.cwd().resolve()
+
+        self.pid_path.write_text(str(os.getpid()))
+
+        # Crash-safety net.
+        self._installed = False
+        atexit.register(self._on_exit_cleanup)
+        try:
+            self._prev_term = signal.signal(signal.SIGTERM, self._on_signal)
+            self._prev_int = signal.signal(signal.SIGINT, self._on_signal)
+            self._installed = True
+        except (ValueError, OSError):
+            pass
+
+    # ─── Persistence + tracing ────────────────────────────────────────
+
+    def trace(self, event: str, **fields):
+        self.step_n += 1
+        rec = {"step": self.step_n, "ts": utcnow_iso(),
+               "event": event, **fields}
+        with self.trace_path.open("a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    # ─── Template context ─────────────────────────────────────────────
+
+    def expr_ctx(self, current_output: dict | None = None) -> dict:
+        nodes_view = {nid: n.public_view() for nid, n in self.nodes_by_id.items()
+                      if n.output is not None}
+        ctx = {"state": self.state, "nodes": nodes_view}
+        if current_output is not None:
+            ctx["output"] = current_output
+        return ctx
+
+    # ─── DAG scheduling ───────────────────────────────────────────────
+
+    def ready_nodes(self) -> list[Node]:
+        return [n for n in self.nodes_by_id.values()
+                if n.is_ready(self.nodes_by_id)]
+
+    def all_done(self) -> bool:
+        return all(n.is_done() for n in self.nodes_by_id.values())
+
+    # ─── Halt + cleanup ───────────────────────────────────────────────
+
+    def halt(self, halted_node: Node, reason: str, envelope: dict) -> None:
+        """Trip the workflow-level halted state + write halt.json."""
+        halt_info = {
+            "halted_node": halted_node.id,
+            "retry_count": halted_node.retry_count,
+            "reason": reason,
+            "envelope": envelope,
+            "trace_step": self.step_n + 1,
+        }
+        (self.run_dir / "halt.json").write_text(
+            json.dumps(halt_info, indent=2, ensure_ascii=False)
+        )
+        # Mark all not-yet-run nodes as done+fail (so trace is consistent;
+        # downstream "skipped" is implicit — they just never executed).
+        for n in self.nodes_by_id.values():
+            if not n.is_done():
+                n.lifecycle = "done"
+                n.result = "fail"
+                n.output = empty_envelope(
+                    "fail",
+                    error={"code": "UPSTREAM_HALTED",
+                           "message": f"halted by '{halted_node.id}'"},
+                )
+        self.trace("workflow_halted", node=halted_node.id, reason=reason)
+        self.workflow_state = "halted"
+
+    def cleanup(self) -> None:
+        """End-of-run: remove pid file + uninstall safety net."""
+        try:
+            atexit.unregister(self._on_exit_cleanup)
+        except Exception:
+            pass
+        if self._installed:
+            try:
+                signal.signal(signal.SIGTERM, self._prev_term)
+                signal.signal(signal.SIGINT, self._prev_int)
+            except (ValueError, OSError):
+                pass
+            self._installed = False
+        try:
+            self.pid_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _on_exit_cleanup(self):
+        n = camc.kill_by_tag(self.tag)
+        if n > 0:
+            print(f"camflow: killed {n} orphan agent(s) on exit",
+                  file=sys.stderr)
+
+    def _on_signal(self, signum, _frame):
+        sys.exit(128 + signum)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MAIN LOOP
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_workflow(workflow: dict, state: dict, run_dir: Path,
+                 *, resume_with_run: Optional["Run"] = None) -> str:
+    """Execute a workflow → return final state ('done' or 'halted').
+
+    `resume_with_run` is for the resume command — caller pre-builds a
+    Run with prior attempts replayed.
+    """
+    run = resume_with_run if resume_with_run is not None else \
+        Run(workflow, state, run_dir)
+    if resume_with_run is None:
+        run.trace("workflow_started", run_id=run.run_id)
+    try:
+        return _main_loop(run)
+    finally:
+        run.cleanup()
+
+
+def _main_loop(run: Run) -> str:
+    while run.workflow_state == "running":
+        ready = run.ready_nodes()
+        if not ready:
+            if run.all_done():
+                run.trace("workflow_completed", status="success")
+                run.workflow_state = "done"
+                return "done"
+            # Deadlock (shouldn't happen on valid DAG with success-only deps,
+            # but be defensive). Halt the first not-done node.
+            for n in run.nodes_by_id.values():
+                if not n.is_done():
+                    run.halt(n, "deadlock: no ready nodes",
+                             empty_envelope(
+                                 "fail",
+                                 error={"code": "DEADLOCK",
+                                        "message": "no ready nodes"}))
+                    return "halted"
+            run.workflow_state = "done"
+            return "done"
+
+        # Pick first ready by declaration order in YAML.
+        node_ids_in_order = list(run.nodes_by_id.keys())
+        ready_set = {n.id for n in ready}
+        node = next(run.nodes_by_id[nid] for nid in node_ids_in_order
+                    if nid in ready_set)
+        node.lifecycle = "running"
+
+        attempt_n = node.retry_count + 1
+        envelope = node.execute_attempt(run, attempt_n)
+
+        # Explicit human-handoff request → halt immediately, skip retry.
+        if envelope.get("request_human"):
+            run.trace("node_requested_human", node=node.id,
+                      reason=(envelope.get("error") or {}).get("message", ""))
+            node.lifecycle = "done"
+            node.result = "fail"
+            run.halt(node, "node requested human", envelope)
+            return "halted"
+
+        if envelope["status"] == "success":
+            node.lifecycle = "done"
+            node.result = "success"
+            continue
+
+        # status = fail. Decide: retry or halt.
+        if node.retry_count < node.retry_max:
+            node.retry_count += 1
+            run.trace("retry_triggered", node=node.id,
+                      retry_count=node.retry_count, retry_max=node.retry_max,
+                      reason=(envelope.get("error") or {}).get("message", "?"))
+            # node.lifecycle stays "running"; loop picks it again next iter.
+            continue
+
+        # Out of retries.
+        run.trace("retry_exhausted", node=node.id,
+                  retry_max=node.retry_max)
+        node.lifecycle = "done"
+        node.result = "fail"
+        run.halt(node, f"retry exhausted (retry_max={node.retry_max})",
+                 envelope)
+        return "halted"
+
+    # Loop exited because workflow_state != "running".
+    return run.workflow_state
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  RESUME
+# ═══════════════════════════════════════════════════════════════════════
+
+def _summarize_run(run_dir: Path) -> dict:
+    """Read run dir → list of node attempts (used by resume)."""
+    if not run_dir.exists():
+        raise FileNotFoundError(f"run dir not found: {run_dir}")
+    summary = {"workflow": None, "nodes": []}
+    wf_path = run_dir / "workflow.yaml"
+    if wf_path.exists():
+        wf = yaml.safe_load(wf_path.read_text())
+        summary["workflow"] = wf
+        for n in wf.get("nodes") or []:
+            nid = n["id"]
+            attempt_dir = run_dir / "nodes" / nid
+            attempts = []
+            if attempt_dir.exists():
+                for ad in sorted(attempt_dir.glob("attempt-*"),
+                                 key=lambda p: int(p.name.split("-")[1])):
+                    op = ad / "output.json"
+                    if op.exists():
+                        attempts.append(json.loads(op.read_text()))
+            summary["nodes"].append({"id": nid, "attempts": attempts})
+    return summary
+
+
+def _cmd_resume(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="camflow resume",
+                                description="Resume a halted workflow.")
+    p.add_argument("run_dir")
+    p.add_argument("--feedback", default="",
+                   help="extra feedback injected into halted node's input.previous.feedback")
+    args = p.parse_args(argv)
+
+    rd = Path(args.run_dir)
+    halt_path = rd / "halt.json"
+    if not halt_path.exists():
+        print(f"ERROR: not halted (no halt.json at {halt_path})",
+              file=sys.stderr)
+        return 1
+    halt_info = json.loads(halt_path.read_text())
+    workflow = yaml.safe_load((rd / "workflow.yaml").read_text())
+    state = json.loads((rd / "state.json").read_text())
+
+    run = Run(workflow, state, rd, resume=True)
+    # Replay history.
+    summary = _summarize_run(rd)
+    for nrec in summary["nodes"]:
+        node = run.nodes_by_id.get(nrec["id"])
+        if node is None or not nrec["attempts"]:
+            continue
+        node.history = list(nrec["attempts"])
+        last = node.history[-1]
+        node.output = last
+        node.retry_count = len(nrec["attempts"]) - 1
+        # Resumed-from node will reset to running below; others stay done.
+        if last.get("status") == "success":
+            node.lifecycle = "done"
+            node.result = "success"
+        else:
+            node.lifecycle = "done"
+            node.result = "fail"
+
+    # Reset the halted node so it gets re-executed; bump retry budget by 1
+    # so resume actually has a try.
+    halted_id = halt_info["halted_node"]
+    node = run.nodes_by_id[halted_id]
+    node.lifecycle = "waiting"
+    node.result = None
+    if args.feedback:
+        # Splice user-provided feedback into the last envelope so it
+        # appears in input.previous.feedback on next attempt.
+        if node.history:
+            node.history[-1] = {**node.history[-1], "feedback": args.feedback}
+            node.output = node.history[-1]
+    # Allow at least one more attempt past retry_max from before.
+    node.retry_max = max(node.retry_max + 1, node.retry_count + 1)
+    run.workflow_state = "running"
+
+    halt_path.unlink()  # clear; if it halts again, we'll write fresh
+    run.trace("workflow_resumed", node=halted_id,
+              retry_count=node.retry_count,
+              feedback_len=len(args.feedback))
+
+    print(f"resuming {halted_id}", file=sys.stderr)
+    result = run_workflow(workflow, state, rd, resume_with_run=run)
+    print(f"result:  {result}", file=sys.stderr)
+    return _result_to_exit(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  CLI
+# ═══════════════════════════════════════════════════════════════════════
+
+def _result_to_exit(result: str) -> int:
+    return {"done": 0, "halted": 2}.get(result, 1)
+
+
+def _cmd_run(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(
+        prog="camflow",
+        description="Run a workflow YAML (camflow v1.0).",
+    )
+    p.add_argument("workflow", help="path to workflow YAML")
+    p.add_argument("--state", default=None,
+                   help="JSON file with initial state")
+    p.add_argument("--run-dir", default=None,
+                   help="run directory (default: <project>/.camflow/run/)")
+    p.add_argument("--validate", action="store_true",
+                   help="validate the workflow and exit")
+    args = p.parse_args(argv)
+
+    wf = load_workflow(args.workflow)
+    project = Path(args.workflow).resolve().parent
+    errors = validate_workflow(wf, project_root=project)
+    if errors:
+        for e in errors:
+            print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    if args.validate:
+        print("workflow is valid")
+        return 0
+
+    state = {}
+    if args.state:
+        with open(args.state) as f:
+            state = json.load(f)
+
+    if args.run_dir:
+        run_dir = Path(args.run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        run_dir = default_run_dir(project)
+
+    print(f"run_dir: {run_dir}")
+    result = run_workflow(wf, state, run_dir)
+    print(f"result:  {result}")
+    return _result_to_exit(result)
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(argv) if argv is not None else sys.argv[1:]
+    if not argv:
+        print(
+            "Usage:\n"
+            "  camflow <workflow.yaml> [--state STATE] [--run-dir DIR] [--validate]\n"
+            "  camflow resume <run_dir> [--feedback TEXT]\n"
+            "\n"
+            "Inspect a run:  cat .camflow/run/trace.jsonl\n"
+            "Stop a run:     kill $(cat .camflow/run/runner.pid)\n",
+            file=sys.stderr,
+        )
+        return 2
+    cmd = argv[0]
+    if cmd == "resume":
+        return _cmd_resume(argv[1:])
+    if cmd in ("-h", "--help"):
+        return _cmd_run(argv)
+    return _cmd_run(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
