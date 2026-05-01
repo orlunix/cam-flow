@@ -30,7 +30,7 @@ nodes:
     needs: [analyze]
     input:
       root_cause: "{{nodes.analyze.latest.output.data.root_cause}}"
-      feedback: "{{retry.feedback?}}"
+      feedback: "{{retry.feedback}}"
     uses: tool.fixer
     output_schema:
       patch: string

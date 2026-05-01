@@ -125,19 +125,14 @@ _TEMPLATE_RE = re.compile(r"\{\{\s*(.+?)\s*\}\}")
 
 
 def _render_str(s: str, ctx: dict) -> str:
+    """Substitute every `{{expr}}` in s with its evaluated value.
+    Strict — missing fields raise ExprError. (Workflow author must
+    supply state defaults instead of relying on optional markers.)
+    """
     def repl(m):
-        expr = m.group(1).strip()
-        optional = expr.endswith("?")
-        if optional:
-            expr = expr[:-1].rstrip()
-        try:
-            v = eval_expr(expr, ctx)
-        except ExprError:
-            if optional:
-                return ""
-            raise
+        v = eval_expr(m.group(1).strip(), ctx)
         if v is None:
-            return "" if optional else "null"
+            return "null"
         if isinstance(v, (dict, list)):
             return json.dumps(v)
         if isinstance(v, bool):
@@ -361,19 +356,7 @@ def _peek_run_status(run_dir: Path) -> str:
     return "unknown"
 
 
-_VALID_STATUSES = {"success", "failure", "skipped", "halted"}
-
-
-def _coerce_envelope_status(env: dict) -> str:
-    """Be strict about envelope.status. The runtime only recognizes four
-    values. If an agent returns 'ok' / 'done' / 'completed' / etc., fail
-    LOUDLY rather than letting it deadlock.
-    """
-    s = env.get("status")
-    if s in _VALID_STATUSES:
-        return s
-    # Translate intuitive but invalid values to failure with clear error.
-    return "failure"
+_VALID_STATUSES = {"success", "failure", "skipped"}
 
 
 def _empty_envelope(status: str, error: dict | None = None) -> dict:
@@ -520,13 +503,13 @@ class Run:
             return False
         if nid in self.retry_pending:
             return False
-        return a[-1]["status"] in ("success", "skipped", "failure")
+        return a[-1]["status"] in _VALID_STATUSES
 
     def ready_nodes(self) -> list[dict]:
         """A node is ready iff:
           - it has no terminal attempt yet, OR it is marked retry-pending; AND
           - none of its `needs` are themselves retry-pending; AND
-          - all `needs` have a success/skipped attempt.
+          - all `needs` have a success attempt.
         """
         ready = []
         for n in self.nodes:
@@ -1048,28 +1031,19 @@ def _wait_for_output(output_path: Path, since_mtime: float | None,
 def _exec_skill(name: str, actx: dict, run: Run, node: dict, attempt_n: int) -> dict:
     """Run a one-shot LLM "skill" via camc.
 
-    Lifecycle (per the design principle: runner does as much as possible;
-    only LLM reasoning happens in the agent):
+    Lifecycle:
       1. Workspace + prompt already prepared by _build_agent_context().
-      2. `camc run` spawns the agent in workspace as cwd. Agent ID parsed
-         from camc run stdout.
-      3. Wait for the agent to write `agent_output.json` to workspace
-         (or for a follow-up update to its mtime).
-      4. Auto-schema check: if the produced data does not match output_schema,
-         `camc send` a feedback message asking the agent to fix it; loop up
-         to CAMFLOW_SKILL_INNER_RETRIES times.
-      5. `camc kill` to clean up the tmux session.
-
-    All of this is BEFORE the user-declared `verify:` rules run — those happen
-    later in the main loop after _exec_skill returns.
+      2. `camc run` spawns the agent in workspace as cwd.
+      3. Wait for `agent_output.json` to land.
+      4. Parse it. Schema mismatch / bad envelope → fail and let the
+         outer main_loop retry the whole node.
+      5. `camc rm --archive` cleans up tmux + DB record + history.
     """
     workspace = actx["workspace"]
     prompt = actx["prompt_text"] + _skill_kickoff_instruction()
     output_path = workspace / _OUTPUT_FILENAME
     agent_name = f"{node['id']}-attempt-{attempt_n}"
 
-    # 1. Spawn — agent tagged with run.tag so the crash-safety net can
-    # find every agent from this run via `camc list` filtering.
     agent_id, err = _camc_run(workspace, prompt, agent_name, run.tag)
     if not agent_id:
         return _empty_envelope("failure", error={
@@ -1077,67 +1051,23 @@ def _exec_skill(name: str, actx: dict, run: Run, node: dict, attempt_n: int) -> 
         })
     (workspace / "agent.id").write_text(agent_id)
 
-    last_mtime: float | None = None
-    schema = node.get("output_schema") or {}
-
     try:
-        # 2. Wait for first output
-        ok, err = _wait_for_output(output_path, last_mtime, _SKILL_TIMEOUT_S)
+        ok, err = _wait_for_output(output_path, None, _SKILL_TIMEOUT_S)
         if not ok:
             return _empty_envelope("failure", error={
-                "code": "AGENT_TIMEOUT", "message": err, "details": {"agent_id": agent_id},
+                "code": "AGENT_TIMEOUT", "message": err,
+                "details": {"agent_id": agent_id},
             })
-        last_mtime = output_path.stat().st_mtime
+        try:
+            env = json.loads(output_path.read_text())
+        except json.JSONDecodeError as e:
+            return _empty_envelope("failure", error={
+                "code": "AGENT_BAD_OUTPUT",
+                "message": f"agent_output.json not JSON: {e}",
+                "details": {"agent_id": agent_id},
+            })
 
-        # 3. Inner self-correction loop on schema mismatch
-        for inner_attempt in range(_SKILL_INNER_RETRIES + 1):
-            try:
-                env = json.loads(output_path.read_text())
-            except json.JSONDecodeError as e:
-                return _empty_envelope("failure", error={
-                    "code": "AGENT_BAD_OUTPUT",
-                    "message": f"agent_output.json not JSON: {e}",
-                    "details": {"agent_id": agent_id},
-                })
-
-            # Pre-emptive schema check (don't wait for run_verify).
-            if schema:
-                data = env.get("data") or {}
-                missing = [k for k in schema if k not in data]
-            else:
-                missing = []
-
-            if not missing:
-                break  # success
-
-            if inner_attempt >= _SKILL_INNER_RETRIES:
-                # Out of inner retries — let run_verify catch it the same way.
-                # Returning the bad envelope; main loop will mark failure.
-                run.trace("skill_self_correct_exhausted", node=node["id"],
-                          attempt=attempt_n,
-                          extra={"missing": missing,
-                                 "inner_attempts": inner_attempt + 1})
-                break
-
-            # Send schema-fail feedback to the still-running agent
-            feedback = (
-                f"Schema check failed. Missing required field(s) in `data`: "
-                f"{missing}. Please update {_OUTPUT_FILENAME} with all "
-                f"required fields, then stop."
-            )
-            run.trace("skill_self_correct", node=node["id"], attempt=attempt_n,
-                      extra={"inner_attempt": inner_attempt + 1, "missing": missing})
-            _camc_send(agent_id, feedback)
-
-            ok, err = _wait_for_output(output_path, last_mtime, _SKILL_TIMEOUT_S)
-            if not ok:
-                return _empty_envelope("failure", error={
-                    "code": "AGENT_TIMEOUT_SELF_CORRECT",
-                    "message": err, "details": {"agent_id": agent_id},
-                })
-            last_mtime = output_path.stat().st_mtime
-
-        # 4. Pull metrics if camc tracks them
+        # Pull metrics if camc tracks them
         status = _camc_status(agent_id)
         metrics = dict(env.get("metrics") or {})
         if cost := status.get("cost_estimate"):
@@ -1145,8 +1075,18 @@ def _exec_skill(name: str, actx: dict, run: Run, node: dict, attempt_n: int) -> 
         if started := status.get("started_at"):
             metrics["camc_started_at"] = started
 
+        # Strict status: agent must return one of the two valid values.
+        # Any other string (ok / done / completed / unknown) is a bug we
+        # surface as an explicit failure, not a silent coerce.
+        out_status = env.get("status")
+        if out_status not in _VALID_STATUSES:
+            return _empty_envelope("failure", error={
+                "code": "BAD_STATUS",
+                "message": f"agent returned status={out_status!r}, "
+                           f"expected one of {sorted(_VALID_STATUSES)}",
+            })
         return {
-            "status": _coerce_envelope_status(env),
+            "status": out_status,
             "data": env.get("data", {}) or {},
             "error": env.get("error"),
             "metrics": metrics,
@@ -1339,8 +1279,18 @@ def _exec_agent(name: str, actx: dict, run: Run, node: dict, attempt_n: int) -> 
         if started := status.get("started_at"):
             metrics["camc_started_at"] = started
 
+        # Strict status: agent must return one of the two valid values.
+        # Any other string (ok / done / completed / unknown) is a bug we
+        # surface as an explicit failure, not a silent coerce.
+        out_status = env.get("status")
+        if out_status not in _VALID_STATUSES:
+            return _empty_envelope("failure", error={
+                "code": "BAD_STATUS",
+                "message": f"agent returned status={out_status!r}, "
+                           f"expected one of {sorted(_VALID_STATUSES)}",
+            })
         return {
-            "status": _coerce_envelope_status(env),
+            "status": out_status,
             "data": env.get("data", {}) or {},
             "error": env.get("error"),
             "metrics": metrics,
@@ -1390,9 +1340,11 @@ def run_verify(run: Run, node: dict, output: dict,
             if not ok:
                 return False, reason
         elif rtype == "workflow_yaml":
-            # Validate that a string field in `data` parses as a valid
-            # camflow workflow.yaml (full structural + skill validation).
-            # Used by the planner bootstrap to gate the Planner's output.
+            # Pure validation: checks the named string field parses as a
+            # well-formed workflow.yaml (incl. skill/agent resolution).
+            # Does NOT modify the workflow — the YAML stays exactly as
+            # the agent wrote it. Used by `camflow plan`'s plan node so
+            # bad YAML triggers retry-with-feedback loops.
             field = rule.get("field", "workflow_yaml")
             data = output.get("data") or {}
             yaml_text = data.get(field, "")
@@ -1401,8 +1353,6 @@ def run_verify(run: Run, node: dict, output: dict,
             try:
                 parse_workflow_yaml(yaml_text, project_root=run.project_root)
             except WorkflowParseError as e:
-                # Surface the validation message verbatim so retry feedback
-                # can hand it back to the agent that wrote the YAML.
                 return False, f"workflow_yaml verify failed: {e}"
         else:
             return False, f"unknown verify type: {rtype}"
@@ -1519,119 +1469,6 @@ def _persist_attempt(run: Run, nid: str, attempt_n: int, env: dict) -> None:
     (d / "output.json").write_text(json.dumps(env, indent=2))
 
 
-def _propagate_skip(run: Run, halting_node: str,
-                    code: str = "UPSTREAM_HALTED") -> None:
-    for nid in run.nodes_by_id:
-        if not run.attempts[nid]:
-            run.attempts[nid].append(_empty_envelope("skipped", error={
-                "code": code,
-                "message": f"halted by '{halting_node}'",
-            }))
-            run.trace("node_skipped", node=nid, attempt=1,
-                      reason=f"{code.lower()}")
-
-
-def _workflow_library_root() -> Path:
-    """Where successful workflows get backed up. Override via env var
-    CAMFLOW_LIBRARY_ROOT for tests / non-default locations."""
-    override = os.environ.get("CAMFLOW_LIBRARY_ROOT")
-    if override:
-        return Path(override)
-    return Path.home() / ".camflow" / "workflows"
-
-
-def _archive_successful_workflow(run: "Run", workflow: dict) -> None:
-    """After workflow_completed, copy the workflow.yaml to the library
-    and append metadata to index.json. Idempotent (safe to call multiple
-    times for the same run).
-
-    Skips internal/bootstrap workflows so the library stays user-meaningful:
-      - workflow name starts with 'planner-bootstrap' (camflow internal)
-      - workflow has top-level `archive: false`
-    """
-    name = workflow.get("workflow", "unnamed")
-    if name.startswith("planner-bootstrap"):
-        return
-    if workflow.get("archive") is False:
-        return
-
-    library = _workflow_library_root()
-    try:
-        library.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return  # silent; archiving is best-effort
-
-    # Use the run_id (the dir under .camflow/runs/) for the filename.
-    parts = run.run_dir.resolve().parts
-    if "runs" in parts:
-        i = parts.index("runs")
-        run_id = parts[i + 1] if i + 1 < len(parts) else parts[-1]
-    else:
-        run_id = run.run_dir.name
-    safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", name)
-    archive_name = f"{safe_name}-{run_id}.yaml"
-    archive_path = library / archive_name
-
-    # Copy the workflow.yaml snapshot. If the run_dir snapshot is missing
-    # (resume mode etc), serialize the in-memory workflow.
-    src = run.run_dir / "workflow.yaml"
-    try:
-        if src.exists():
-            archive_path.write_text(src.read_text())
-        else:
-            archive_path.write_text(yaml.safe_dump(workflow, sort_keys=False))
-    except OSError:
-        return
-
-    # Append to index.json with metadata so a future skill can search.
-    index_path = library / "index.json"
-    try:
-        index = json.loads(index_path.read_text()) if index_path.exists() else []
-    except (OSError, json.JSONDecodeError):
-        index = []
-    used = sorted({
-        n.get("uses") for n in (workflow.get("nodes") or [])
-        if isinstance(n.get("uses"), str)
-    })
-    entry = {
-        "name": name,
-        "run_id": run_id,
-        "archive": archive_name,
-        "goal": (workflow.get("goal") or "").strip(),
-        "node_count": len(workflow.get("nodes") or []),
-        "uses": used,
-        "completed_at": _utcnow_iso(),
-    }
-    # De-duplicate by archive filename (idempotent re-archive overwrites entry).
-    index = [e for e in index if e.get("archive") != archive_name]
-    index.append(entry)
-    try:
-        index_path.write_text(json.dumps(index, indent=2))
-    except OSError:
-        pass
-
-
-def _halt_workflow(run: Run, halted_node: str, halted_attempt: int,
-                   reason: str, envelope: dict) -> None:
-    """Pause execution for human/orchestrator handoff.
-
-    Writes halt.json next to trace.jsonl with a summary, marks all
-    not-yet-run nodes as skipped (with reason=upstream_halted), and
-    emits workflow_halted.
-    """
-    halt_info = {
-        "halted_node": halted_node,
-        "halted_attempt": halted_attempt,
-        "reason": reason,
-        "envelope": envelope,
-        "trace_step": run.step + 1,  # the next event written below
-    }
-    (run.run_dir / "halt.json").write_text(json.dumps(halt_info, indent=2))
-    _propagate_skip(run, halted_node)
-    run.trace("workflow_halted",
-              node=halted_node, attempt=halted_attempt, reason=reason)
-
-
 def run_workflow(workflow: dict, state: dict, run_dir: Path,
                  _existing_run: "Run | None" = None) -> str:
     """Run a workflow. Returns 'success' / 'halted' / 'failure'.
@@ -1665,7 +1502,6 @@ def _main_loop(run: "Run", workflow: dict) -> str:
                     run.trace("workflow_failed", reason="node failure terminal")
                     return "failure"
                 run.trace("workflow_completed", status="success")
-                _archive_successful_workflow(run, workflow)
                 return "success"
             run.trace("workflow_failed", reason="deadlock: no ready nodes")
             return "failure"
@@ -1675,7 +1511,8 @@ def _main_loop(run: "Run", workflow: dict) -> str:
         node = next(n for n in run.nodes if n["id"] in ready_ids)
         nid = node["id"]
 
-        # `when` evaluation
+        # `when` evaluation — false → skip (no propagation; downstream
+        # treats `skipped` like `success` for needs-resolution).
         when_expr = node.get("when")
         if when_expr and nid not in run.retry_pending:
             try:
@@ -1684,16 +1521,19 @@ def _main_loop(run: "Run", workflow: dict) -> str:
                 run.attempts[nid].append(_empty_envelope("skipped", error={
                     "code": "WHEN_ERROR", "message": str(e),
                 }))
-                run.trace("node_skipped", node=nid, attempt=1, reason=f"when error: {e}")
+                run.trace("node_skipped", node=nid, attempt=1,
+                          reason=f"when error: {e}")
                 continue
             if not when_ok:
                 run.attempts[nid].append(_empty_envelope("skipped"))
                 _persist_attempt(run, nid, 1, run.attempts[nid][-1])
-                run.trace("node_skipped", node=nid, attempt=1, reason=f"when=false: {when_expr}")
+                run.trace("node_skipped", node=nid, attempt=1,
+                          reason=f"when=false: {when_expr}")
                 continue
 
-        # retry context (only injected for the target node of an active retry)
-        retry_ctx = run.retry_pending.pop(nid, None) if nid in run.retry_pending else None
+        # Always pass a dict (never None) so templates like {{retry.feedback}}
+        # remain renderable on the first attempt (feedback="" by default).
+        retry_ctx = run.retry_pending.pop(nid, {"feedback": "", "attempt": 1})
         attempt_n = len(run.attempts[nid]) + 1
         run.trace(
             "node_started", node=nid, attempt=attempt_n,
@@ -1724,80 +1564,67 @@ def _main_loop(run: "Run", workflow: dict) -> str:
             run.trace("node_failed", node=nid, attempt=attempt_n,
                       reason=(env.get("error") or {}).get("message", "unknown"))
 
-        # node-initiated halt: skill/tool returned status=halted explicitly
-        if env["status"] == "halted":
-            run.trace("node_halted", node=nid, attempt=attempt_n,
-                      reason=(env.get("error") or {}).get("message",
-                                                          "node returned halted"))
-            _halt_workflow(run, nid, attempt_n,
-                           reason="node returned status=halted",
-                           envelope=env)
-            return "halted"
-
-        # retry: simplified semantics — re-run THIS node only
-        # Trigger condition:
-        #   * env.success and retry.until is false        → retry self
-        #   * env.failure and retry is configured         → retry self
+        # retry decision: re-run THIS node only.
+        #   * success + retry.until is false  → retry self
+        #   * failure + retry policy present  → retry self
+        # Otherwise: nothing to do; outer loop's terminal check decides
+        # workflow-level success vs failure (failure is terminal, no halt).
         retry_policy = node.get("retry")
-        if retry_policy:
-            ctx = run.expr_ctx()
-            should_retry = False
-            retry_reason = ""
+        if not retry_policy:
+            continue
 
-            if env["status"] == "success":
-                try:
-                    until_ok = bool(eval_expr(retry_policy["until"], ctx))
-                except ExprError as e:
-                    run.trace("workflow_failed",
-                              reason=f"retry.until eval error: {e}")
-                    _propagate_skip(run, nid, "expression_error")
-                    return "failure"
-                if not until_ok:
-                    should_retry = True
-                    retry_reason = f"until=false: {retry_policy['until']}"
-            elif env["status"] == "failure":
+        ctx = run.expr_ctx()
+        should_retry = False
+        retry_reason = ""
+
+        if env["status"] == "success" and "until" in retry_policy:
+            try:
+                until_ok = bool(eval_expr(retry_policy["until"], ctx))
+            except ExprError as e:
+                run.trace("workflow_failed",
+                          reason=f"retry.until eval error: {e}")
+                return "failure"
+            if not until_ok:
                 should_retry = True
-                retry_reason = (
-                    "node failed: "
-                    + (env.get("error") or {}).get("message", "unknown")
-                )
+                retry_reason = f"until=false: {retry_policy['until']}"
+        elif env["status"] == "failure":
+            should_retry = True
+            retry_reason = (
+                "node failed: "
+                + (env.get("error") or {}).get("message", "unknown")
+            )
 
-            if should_retry:
-                max_n_raw = retry_policy["max_attempts"]
-                if isinstance(max_n_raw, str):
-                    max_n_raw = _render_str(max_n_raw, ctx)
-                try:
-                    max_n = int(max_n_raw)
-                except (TypeError, ValueError):
-                    max_n = 3
-                if len(run.attempts[nid]) >= max_n:
-                    # Out of attempts → halt for human/orchestrator help
-                    run.trace("retry_exhausted", node=nid,
-                              reason=f"max_attempts={max_n} reached")
-                    _halt_workflow(run, nid, attempt_n,
-                                   reason=f"retry exhausted (max_attempts={max_n})",
-                                   envelope=env)
-                    return "halted"
-                # Schedule a self-retry
-                feedback_raw = retry_policy.get("feedback", "")
-                feedback = (_render_str(feedback_raw, ctx)
-                            if isinstance(feedback_raw, str) else feedback_raw)
-                run.retry_pending[nid] = {
-                    "feedback": feedback,
-                    "attempt": len(run.attempts[nid]) + 1,
-                }
-                run.trace("retry_triggered", node=nid,
-                          reason=retry_reason, feedback=feedback)
-                continue
+        if not should_retry:
+            continue
 
-        # node failed and no retry → halt (was: workflow_failed)
-        if env["status"] == "failure" and not retry_policy:
-            run.trace("node_halted", node=nid, attempt=attempt_n,
-                      reason="node failed and has no retry policy")
-            _halt_workflow(run, nid, attempt_n,
-                           reason="node failed, no retry configured",
-                           envelope=env)
-            return "halted"
+        max_n_raw = retry_policy.get("max_attempts", 3)
+        if isinstance(max_n_raw, str):
+            max_n_raw = _render_str(max_n_raw, ctx)
+        try:
+            max_n = int(max_n_raw)
+        except (TypeError, ValueError):
+            max_n = 3
+        if len(run.attempts[nid]) >= max_n:
+            run.trace("retry_exhausted", node=nid,
+                      reason=f"max_attempts={max_n} reached")
+            # Force this node terminal as failure so the outer terminal
+            # check picks it up next iteration.
+            if env["status"] == "success":
+                run.attempts[nid][-1] = dict(env, status="failure",
+                                             error={"code": "RETRY_EXHAUSTED",
+                                                    "message": f"until never satisfied "
+                                                               f"after {max_n} attempts"})
+            continue
+
+        feedback_raw = retry_policy.get("feedback", "")
+        feedback = (_render_str(feedback_raw, ctx)
+                    if isinstance(feedback_raw, str) else feedback_raw)
+        run.retry_pending[nid] = {
+            "feedback": feedback,
+            "attempt": len(run.attempts[nid]) + 1,
+        }
+        run.trace("retry_triggered", node=nid,
+                  reason=retry_reason, feedback=feedback)
 
 
 # ─── CLI ───────────────────────────────────────────────────────────────
@@ -1850,13 +1677,11 @@ def _run_command(argv: list[str]) -> int:
 
 
 def _result_to_exit_code(result: str) -> int:
-    """Map workflow result strings to standard exit codes.
-
+    """Map workflow result to standard exit codes:
       success → 0
-      halted  → 2  (resume possible; orchestrator/human should pick up)
-      failure → 1  (irrecoverable)
+      anything else (failure, deadlock) → 1
     """
-    return {"success": 0, "halted": 2}.get(result, 1)
+    return 0 if result == "success" else 1
 
 
 def _planner_bootstrap_workflow() -> dict:
@@ -1913,28 +1738,25 @@ def _planner_bootstrap_workflow() -> dict:
                 "uses": "agent.planner",
                 "input": {
                     "goal": "{{state.goal}}",
-                    "state_schema": "{{state.state_schema?}}",
+                    "state_schema": "{{state.state_schema}}",
                     "relevant_skills": "{{nodes.search_skills.latest.output.data.relevant_skills}}",
                     "search_reasoning": "{{nodes.search_skills.latest.output.data.reasoning}}",
-                    "previous_validation_error": "{{retry.feedback?}}",
+                    "previous_validation_error": "{{retry.feedback}}",
                 },
                 "output_schema": {"workflow_yaml": "string"},
                 "verify": [
                     {"type": "rule",
                      "assert": "output.data.workflow_yaml != ''"},
-                    # Real validation — parses + skill-resolves the YAML.
-                    # If it fails, retry kicks in with the error as feedback.
+                    # Validates the YAML the planner produced. On failure
+                    # retry kicks in with the error string as feedback.
                     {"type": "workflow_yaml"},
                 ],
                 "retry": {
-                    # `until` is meaningless here (workflow_yaml verify is
-                    # the actual gate); set true to never retry on success.
-                    "until": "true",
                     "max_attempts": 3,
-                    # On verify failure, env.error.message contains the
-                    # workflow_yaml verify reason — feed it back to the
-                    # planner agent so it can self-correct.
-                    "feedback": "{{nodes.plan.latest.output.error.message?}}",
+                    # On verify failure env.error.message contains the
+                    # workflow_yaml verify reason — fed back as feedback
+                    # for the planner agent's next attempt.
+                    "feedback": "{{nodes.plan.latest.output.error.message}}",
                 },
             },
         ],
@@ -1974,11 +1796,11 @@ def _plan_command(argv: list[str]) -> int:
                         "produced workflow runs as run_dir/main")
     args = p.parse_args(argv)
 
-    state_schema = None
+    state_schema = ""
     if args.state_schema:
         with open(args.state_schema) as f:
             doc = yaml.safe_load(f)
-        state_schema = doc.get("state", doc) if isinstance(doc, dict) else None
+        state_schema = doc.get("state", doc) if isinstance(doc, dict) else ""
 
     cwd = Path.cwd()
     if args.run_dir:
@@ -2002,9 +1824,7 @@ def _plan_command(argv: list[str]) -> int:
     # The skill_searcher agent walks ~/.skillm/repos and project skills
     # directories itself — no catalog injection needed.
     planner_wf = _planner_bootstrap_workflow()
-    planner_state = {"goal": args.goal}
-    if state_schema is not None:
-        planner_state["state_schema"] = state_schema
+    planner_state = {"goal": args.goal, "state_schema": state_schema}
     planner_result = run_workflow(planner_wf, planner_state, planner_dir)
     if planner_result != "success":
         print(f"PLANNER {planner_result}: see {planner_dir}/trace.jsonl",
@@ -2049,242 +1869,6 @@ def _plan_command(argv: list[str]) -> int:
     return 0
 
 
-def _summarize_run(run_dir: Path) -> dict:
-    """Read run dir → structured summary. Used by status (and resume)."""
-    if not run_dir.exists():
-        raise FileNotFoundError(f"run dir not found: {run_dir}")
-
-    summary: dict = {
-        "run_dir": str(run_dir),
-        "running": (run_dir / "runner.pid").exists(),
-        "halted": (run_dir / "halt.json").exists(),
-        "workflow": None,
-        "nodes": [],
-        "last_event": None,
-    }
-
-    wf_path = run_dir / "workflow.yaml"
-    if wf_path.exists():
-        wf = yaml.safe_load(wf_path.read_text())
-        summary["workflow"] = wf.get("workflow")
-        for n in wf.get("nodes") or []:
-            nid = n["id"]
-            attempt_dir = run_dir / "nodes" / nid
-            attempts = []
-            if attempt_dir.exists():
-                for ad in sorted(attempt_dir.glob("attempt-*")):
-                    out = ad / "output.json"
-                    if out.exists():
-                        env = json.loads(out.read_text())
-                        attempts.append({
-                            "n": int(ad.name.split("-")[1]),
-                            "status": env.get("status"),
-                        })
-            summary["nodes"].append({
-                "id": nid,
-                "attempts": attempts,
-                "latest_status": attempts[-1]["status"] if attempts else None,
-            })
-
-    trace_path = run_dir / "trace.jsonl"
-    if trace_path.exists():
-        lines = trace_path.read_text().splitlines()
-        if lines:
-            summary["last_event"] = json.loads(lines[-1])
-
-    halt_path = run_dir / "halt.json"
-    if halt_path.exists():
-        summary["halt"] = json.loads(halt_path.read_text())
-
-    return summary
-
-
-def _status_command(argv: list[str]) -> int:
-    p = argparse.ArgumentParser(
-        prog="camflow status",
-        description="Show progress of a run dir.",
-    )
-    p.add_argument("run_dir")
-    p.add_argument("--json", action="store_true",
-                   help="machine-callable JSON output")
-    args = p.parse_args(argv)
-
-    rd = Path(args.run_dir)
-    try:
-        summary = _summarize_run(rd)
-    except FileNotFoundError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 1
-
-    if args.json:
-        print(json.dumps(summary, indent=2))
-        return 0
-
-    state = (
-        "halted" if summary["halted"] else
-        "running" if summary["running"] else
-        "done"
-    )
-    last = summary["last_event"] or {}
-    print(f"workflow: {summary['workflow']}")
-    print(f"run_dir:  {summary['run_dir']}")
-    print(f"state:    {state}")
-    print(f"last:     {last.get('event','-')} (step {last.get('step','?')})")
-    print()
-    for n in summary["nodes"]:
-        latest = n["latest_status"] or "pending"
-        n_att = len(n["attempts"])
-        att_str = f" ({n_att} attempts)" if n_att != 1 else ""
-        print(f"  {n['id']:<25}  {latest}{att_str}")
-    if summary.get("halt"):
-        h = summary["halt"]
-        print()
-        print(f"HALTED at: {h['halted_node']}#{h['halted_attempt']}")
-        print(f"reason:    {h['reason']}")
-    return 0
-
-
-def _trace_command(argv: list[str]) -> int:
-    p = argparse.ArgumentParser(
-        prog="camflow trace",
-        description="Pretty-print or dump trace.jsonl from a run dir.",
-    )
-    p.add_argument("run_dir")
-    p.add_argument("--tail", type=int, default=None,
-                   help="show only the last N events")
-    p.add_argument("--json", action="store_true",
-                   help="raw JSON lines (just cats trace.jsonl)")
-    args = p.parse_args(argv)
-
-    trace_path = Path(args.run_dir) / "trace.jsonl"
-    if not trace_path.exists():
-        print(f"ERROR: {trace_path} not found", file=sys.stderr)
-        return 1
-    lines = trace_path.read_text().splitlines()
-    if args.tail is not None:
-        lines = lines[-args.tail:]
-    if args.json:
-        for line in lines:
-            print(line)
-        return 0
-    for line in lines:
-        e = json.loads(line)
-        extra = " ".join(
-            f"{k}={v}" for k, v in e.items()
-            if k not in ("step", "ts", "event", "reason")
-        )
-        reason = e.get("reason", "")
-        if reason and len(reason) > 60:
-            reason = reason[:60] + "…"
-        print(f"  step{e['step']:>3}  {e['event']:<20}  {extra:<35}  {reason}")
-    return 0
-
-
-def _stop_command(argv: list[str]) -> int:
-    """Stop a running camflow workflow.
-
-    v0.7: SIGTERMs the runner process via runner.pid.
-    v0.8 (later): also `camc stop` agents tagged with this run_id.
-    """
-    p = argparse.ArgumentParser(
-        prog="camflow stop",
-        description="Stop a running workflow (SIGTERM the runner process).",
-    )
-    p.add_argument("run_dir")
-    p.add_argument("--force", action="store_true",
-                   help="SIGKILL instead of SIGTERM")
-    args = p.parse_args(argv)
-
-    pid_path = Path(args.run_dir) / "runner.pid"
-    if not pid_path.exists():
-        print(f"ERROR: no runner.pid at {pid_path} (is it running?)",
-              file=sys.stderr)
-        return 1
-
-    try:
-        pid = int(pid_path.read_text().strip())
-    except ValueError as e:
-        print(f"ERROR: bad runner.pid: {e}", file=sys.stderr)
-        return 1
-
-    import signal
-    sig = signal.SIGKILL if args.force else signal.SIGTERM
-    try:
-        os.kill(pid, sig)
-    except ProcessLookupError:
-        print(f"runner pid {pid} not running (cleaning up stale runner.pid)",
-              file=sys.stderr)
-        pid_path.unlink(missing_ok=True)
-        return 1
-
-    print(f"sent {sig.name} to pid {pid}")
-    # TODO v0.8: also `camc stop` any agents tagged with run_id
-    return 0
-
-
-def _resume_command(argv: list[str]) -> int:
-    """Continue a halted workflow from where it stopped.
-
-    Reads halt.json + workflow.yaml + state.json from <run_dir>, replays the
-    completed attempts into a fresh Run, marks the halted node retry-pending,
-    and continues the main loop. The user/orchestrator may have edited
-    state.json or workflow.yaml between halt and resume — current files win.
-    """
-    p = argparse.ArgumentParser(
-        prog="camflow resume",
-        description="Resume a halted workflow.",
-    )
-    p.add_argument("run_dir")
-    p.add_argument("--feedback", default="",
-                   help="extra feedback text injected as {{retry.feedback}} "
-                        "for the halted node's next attempt")
-    args = p.parse_args(argv)
-
-    rd = Path(args.run_dir)
-    halt_path = rd / "halt.json"
-    if not halt_path.exists():
-        print(f"ERROR: not halted (no halt.json at {halt_path})",
-              file=sys.stderr)
-        return 1
-
-    halt_info = json.loads(halt_path.read_text())
-    workflow = yaml.safe_load((rd / "workflow.yaml").read_text())
-    state = json.loads((rd / "state.json").read_text())
-
-    # Build a Run in resume mode (don't overwrite workflow.yaml / state.json)
-    run = Run(workflow, state, rd, resume=True)
-
-    # Replay existing attempts from disk so cross-node references still work.
-    summary = _summarize_run(rd)
-    for n in summary["nodes"]:
-        nid = n["id"]
-        for att in n["attempts"]:
-            out = (rd / "nodes" / nid / f"attempt-{att['n']}" / "output.json")
-            run.attempts[nid].append(json.loads(out.read_text()))
-
-    # Mark the halted node for re-execution. Use --feedback if provided,
-    # otherwise pull from the halt.json envelope's data.feedback (if any).
-    halted = halt_info["halted_node"]
-    fb = args.feedback or (
-        (halt_info.get("envelope") or {})
-        .get("data", {})
-        .get("feedback", "")
-    )
-    run.retry_pending[halted] = {
-        "feedback": fb,
-        "attempt": len(run.attempts[halted]) + 1,
-    }
-    halt_path.unlink()  # consume halt.json — fresh halt will rewrite
-    run.trace("workflow_resumed", node=halted,
-              attempt=len(run.attempts[halted]) + 1,
-              reason=f"resume from halt.json (feedback len={len(fb)})")
-
-    print(f"resuming {halted} (attempt {len(run.attempts[halted]) + 1})",
-          file=sys.stderr)
-    result = run_workflow(workflow, state, rd, _existing_run=run)
-    print(f"result:  {result}", file=sys.stderr)
-    return _result_to_exit_code(result)
-
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(argv) if argv is not None else sys.argv[1:]
@@ -2294,10 +1878,9 @@ def main(argv: list[str] | None = None) -> int:
             "Usage:\n"
             "  camflow <workflow.yaml> [--state STATE] [--run-dir DIR] [--validate]\n"
             "  camflow plan \"<goal>\" [--out FILE] [--run --state FILE]\n"
-            "  camflow status <run_dir> [--json]\n"
-            "  camflow trace  <run_dir> [--tail N] [--json]\n"
-            "  camflow resume <run_dir>\n"
-            "  camflow stop   <run_dir>\n",
+            "\n"
+            "Inspect a run:  cat .camflow/run/trace.jsonl\n"
+            "Stop a run:     kill $(cat .camflow/run/runner.pid)\n",
             file=sys.stderr,
         )
         return 2
@@ -2305,17 +1888,8 @@ def main(argv: list[str] | None = None) -> int:
     cmd = argv[0]
     if cmd == "plan":
         return _plan_command(argv[1:])
-    if cmd == "status":
-        return _status_command(argv[1:])
-    if cmd == "trace":
-        return _trace_command(argv[1:])
-    if cmd == "resume":
-        return _resume_command(argv[1:])
-    if cmd == "stop":
-        return _stop_command(argv[1:])
     if cmd in ("-h", "--help"):
-        return _run_command(argv)  # delegates to argparse help
-    # Default mode: argv[0] is a workflow path
+        return _run_command(argv)
     return _run_command(argv)
 
 

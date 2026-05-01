@@ -72,14 +72,6 @@ class TestRender:
         ctx = {"state": {"err": "boom"}}
         assert render_deep("err: {{state.err}}", ctx) == "err: boom"
 
-    def test_optional_missing_returns_empty(self):
-        ctx = {"state": {}}
-        assert render_deep("{{state.missing?}}", ctx) == ""
-
-    def test_optional_present_returns_value(self):
-        ctx = {"state": {"x": "yes"}}
-        assert render_deep("{{state.x?}}", ctx) == "yes"
-
     def test_required_missing_raises(self):
         ctx = {"state": {}}
         with pytest.raises(ExprError):
@@ -215,7 +207,7 @@ class TestVerifyAgent:
             }],
         }
         result = run_workflow(wf, {}, tmp_path)
-        assert result == "halted"
+        assert result == "failure"
         events = [json.loads(line) for line in
                   (tmp_path / "trace.jsonl").read_text().splitlines()]
         verify_failed = [e for e in events if e["event"] == "verify_failed"]
@@ -246,78 +238,11 @@ class TestVerifyAgent:
             }],
         }
         result = run_workflow(wf, {}, tmp_path)
-        assert result == "halted"
+        assert result == "failure"
         events = [json.loads(line) for line in
                   (tmp_path / "trace.jsonl").read_text().splitlines()]
         assert any("missing required `criterion`" in e.get("reason", "")
                    for e in events)
-
-
-class TestWorkflowLibraryArchive:
-    """Successful workflows get backed up to the library so they can be
-    surfaced as templates next time. Bootstrap / internal workflows skip."""
-
-    def test_archive_on_success(self, tmp_path, monkeypatch):
-        lib = tmp_path / "lib"
-        monkeypatch.setenv("CAMFLOW_LIBRARY_ROOT", str(lib))
-        wf = {
-            "workflow": "my_archived_demo", "version": 0.6,
-            "goal": "smoke",
-            "nodes": [
-                {"id": "a", "mock": {"status": "success"}},
-                {"id": "b", "needs": ["a"], "mock": {"status": "success"}},
-            ],
-        }
-        run_dir = tmp_path / ".camflow" / "runs" / "fake-id"
-        result = run_workflow(wf, {}, run_dir)
-        assert result == "success"
-        # Archive landed under the library root
-        archived = list(lib.glob("my_archived_demo-*.yaml"))
-        assert len(archived) == 1
-        # Index has one entry
-        idx = json.loads((lib / "index.json").read_text())
-        assert len(idx) == 1
-        assert idx[0]["name"] == "my_archived_demo"
-        assert idx[0]["node_count"] == 2
-
-    def test_bootstrap_skipped(self, tmp_path, monkeypatch):
-        lib = tmp_path / "lib"
-        monkeypatch.setenv("CAMFLOW_LIBRARY_ROOT", str(lib))
-        wf = {
-            "workflow": "planner-bootstrap-x", "version": 0.6,
-            "nodes": [{"id": "a", "mock": {"status": "success"}}],
-        }
-        run_dir = tmp_path / ".camflow" / "runs" / "fake-id"
-        result = run_workflow(wf, {}, run_dir)
-        assert result == "success"
-        # Library should not have been created at all (or have no archives)
-        assert not lib.exists() or not list(lib.glob("*.yaml"))
-
-    def test_archive_false_skipped(self, tmp_path, monkeypatch):
-        lib = tmp_path / "lib"
-        monkeypatch.setenv("CAMFLOW_LIBRARY_ROOT", str(lib))
-        wf = {
-            "workflow": "secret_wf", "version": 0.6,
-            "archive": False,
-            "nodes": [{"id": "a", "mock": {"status": "success"}}],
-        }
-        run_dir = tmp_path / ".camflow" / "runs" / "fake-id"
-        run_workflow(wf, {}, run_dir)
-        assert not lib.exists() or not list(lib.glob("*.yaml"))
-
-    def test_failed_workflow_not_archived(self, tmp_path, monkeypatch):
-        lib = tmp_path / "lib"
-        monkeypatch.setenv("CAMFLOW_LIBRARY_ROOT", str(lib))
-        wf = {
-            "workflow": "fails_to_archive", "version": 0.6,
-            "nodes": [{"id": "a",
-                       "mock": {"status": "failure",
-                                "error": {"code": "X", "message": "boom"}}}],
-        }
-        run_dir = tmp_path / ".camflow" / "runs" / "fake-id"
-        result = run_workflow(wf, {}, run_dir)
-        assert result == "halted"
-        assert not lib.exists() or not list(lib.glob("*.yaml"))
 
 
 class TestVerifyWorkflowYaml:
@@ -357,7 +282,7 @@ class TestVerifyWorkflowYaml:
             }],
         }
         result = run_workflow(wf, {}, tmp_path)
-        assert result == "halted"
+        assert result == "failure"
 
     def test_invalid_yaml_fails_with_validation_error_in_envelope(self, tmp_path):
         bad_yaml = "workflow: bar\nversion: 0.6\nnodes:\n  - id: a\n    uses: skill.does_not_exist_anywhere\n"
@@ -372,7 +297,7 @@ class TestVerifyWorkflowYaml:
             }],
         }
         result = run_workflow(wf, {}, tmp_path)
-        assert result == "halted"
+        assert result == "failure"
         events = [json.loads(line) for line in
                   (tmp_path / "trace.jsonl").read_text().splitlines()]
         verify_failed = [e for e in events if e["event"] == "verify_failed"]
@@ -409,7 +334,7 @@ class TestVerifyWorkflowYaml:
                 "retry": {
                     "until": "true",
                     "max_attempts": 3,
-                    "feedback": "{{nodes.p.latest.output.error.message?}}",
+                    "feedback": "{{nodes.p.latest.output.error.message}}",
                 },
             }],
         }
@@ -424,52 +349,6 @@ class TestVerifyWorkflowYaml:
 
 
 class TestHaltAndSkipPropagation:
-    def test_failure_without_retry_halts(self, tmp_path):
-        """Node fails + no retry → workflow_halted (was workflow_failed in v<=0.6
-        path-retry semantics). Downstream nodes get status=skipped."""
-        wf = {
-            "workflow": "fail_demo",
-            "version": 0.6,
-            "nodes": [
-                {"id": "a", "mock": {"status": "failure",
-                                     "error": {"code": "BOOM", "message": "x"}}},
-                {"id": "b", "needs": ["a"], "mock": {"status": "success"}},
-            ],
-        }
-        result = run_workflow(wf, {}, tmp_path)
-        assert result == "halted"
-        events = [
-            json.loads(line) for line in (tmp_path / "trace.jsonl").read_text().splitlines()
-        ]
-        # workflow_halted recorded
-        assert any(e["event"] == "workflow_halted" for e in events)
-        # halt.json sidecar written
-        halt = json.loads((tmp_path / "halt.json").read_text())
-        assert halt["halted_node"] == "a"
-        # b should be marked skipped (upstream halted)
-        skipped = [e for e in events if e["event"] == "node_skipped"]
-        assert any(e["node"] == "b" for e in skipped)
-
-    def test_explicit_halted_status_from_node(self, tmp_path):
-        """Skill/tool envelope returning status=halted halts the workflow."""
-        wf = {
-            "workflow": "explicit_halt",
-            "version": 0.6,
-            "nodes": [
-                {"id": "a", "mock": {
-                    "status": "halted",
-                    "error": {"code": "NEED_HELP",
-                              "message": "ambiguous instruction; need clarification"},
-                }},
-                {"id": "b", "needs": ["a"], "mock": {"status": "success"}},
-            ],
-        }
-        result = run_workflow(wf, {}, tmp_path)
-        assert result == "halted"
-        halt = json.loads((tmp_path / "halt.json").read_text())
-        assert halt["halted_node"] == "a"
-        assert halt["envelope"]["error"]["code"] == "NEED_HELP"
-
     def test_auto_schema_check_without_verify_list(self, tmp_path):
         """Schema is checked automatically — user need not declare {type: schema}."""
         wf = {
@@ -483,7 +362,7 @@ class TestHaltAndSkipPropagation:
             ],
         }
         result = run_workflow(wf, {}, tmp_path)
-        assert result == "halted"   # schema fail → no retry → halt
+        assert result == "failure"   # schema fail → no retry → halt
         events = [json.loads(line) for line in
                   (tmp_path / "trace.jsonl").read_text().splitlines()]
         assert any(e["event"] == "verify_failed" for e in events)
@@ -524,104 +403,6 @@ class TestHaltAndSkipPropagation:
         # tool's cwd was the workspace — file landed inside
         assert (ws / "written-by-tool.txt").read_text().strip() == "from-tool"
 
-    def test_retry_exhausted_halts(self, tmp_path):
-        """retry max_attempts reached without satisfying `until` → halt."""
-        wf = {
-            "workflow": "exhaust_demo",
-            "version": 0.6,
-            "nodes": [
-                {"id": "n", "mock": {"status": "success",
-                                     "data": {"ok": False}},
-                 "output_schema": {"ok": "boolean"},
-                 "retry": {"until": "nodes.n.latest.output.data.ok == true",
-                           "max_attempts": 2}},
-            ],
-        }
-        result = run_workflow(wf, {}, tmp_path)
-        assert result == "halted"
-        events = [json.loads(line) for line in
-                  (tmp_path / "trace.jsonl").read_text().splitlines()]
-        assert any(e["event"] == "retry_exhausted" for e in events)
-        assert any(e["event"] == "workflow_halted" for e in events)
-
-
-# ─── CLI subcommands: status / trace / resume / stop ────────────────────
-
-class TestCLISubcommands:
-    def _seed_halted_run(self, tmp_path):
-        """Helper: seed a tmp run dir by running halt-demo into it."""
-        from runner.runtime import main as cli_main
-        wf = {
-            "workflow": "exhaust_demo",
-            "version": 0.6,
-            "nodes": [
-                {"id": "n", "mock": {"status": "success",
-                                     "data": {"ok": False, "feedback": "bad"}},
-                 "output_schema": {"ok": "boolean", "feedback": "string"},
-                 "retry": {"until": "nodes.n.latest.output.data.ok == true",
-                           "max_attempts": 2}},
-            ],
-        }
-        rd = tmp_path / "run"
-        run_workflow(wf, {}, rd)
-        return rd
-
-    def test_runner_pid_cleaned_after_run(self, tmp_path):
-        rd = self._seed_halted_run(tmp_path)
-        assert not (rd / "runner.pid").exists()
-
-    def test_status_shows_halt(self, tmp_path, capsys):
-        from runner.runtime import main as cli_main
-        rd = self._seed_halted_run(tmp_path)
-        rc = cli_main(["status", str(rd)])
-        out = capsys.readouterr().out
-        assert rc == 0
-        assert "state:    halted" in out
-        assert "HALTED at: n#2" in out
-
-    def test_status_json(self, tmp_path, capsys):
-        from runner.runtime import main as cli_main
-        rd = self._seed_halted_run(tmp_path)
-        rc = cli_main(["status", str(rd), "--json"])
-        out = capsys.readouterr().out
-        assert rc == 0
-        s = json.loads(out)
-        assert s["halted"] is True
-        assert s["halt"]["halted_node"] == "n"
-
-    def test_trace_tail(self, tmp_path, capsys):
-        from runner.runtime import main as cli_main
-        rd = self._seed_halted_run(tmp_path)
-        rc = cli_main(["trace", str(rd), "--tail", "3"])
-        out = capsys.readouterr().out
-        assert rc == 0
-        assert "workflow_halted" in out
-        # Should be 3 lines
-        assert len([ln for ln in out.splitlines() if ln.strip()]) == 3
-
-    def test_resume_continues_step_numbering(self, tmp_path):
-        from runner.runtime import main as cli_main
-        rd = self._seed_halted_run(tmp_path)
-        before = (rd / "trace.jsonl").read_text().splitlines()
-        cli_main(["resume", str(rd), "--feedback", "force"])
-        after = (rd / "trace.jsonl").read_text().splitlines()
-        # Resume should append, not overwrite
-        assert len(after) > len(before)
-        # Step numbers should be globally monotonic
-        steps = [json.loads(line)["step"] for line in after]
-        assert steps == sorted(steps)
-
-    def test_stop_no_pid_returns_error(self, tmp_path, capsys):
-        from runner.runtime import main as cli_main
-        rd = self._seed_halted_run(tmp_path)
-        # halt-demo has terminated; runner.pid should not exist
-        rc = cli_main(["stop", str(rd)])
-        err = capsys.readouterr().err
-        assert rc == 1
-        assert "no runner.pid" in err
-
-
-# ─── Retry demo (end-to-end retry / feedback / multi-step) ─────────────
 
 class TestRetryDemo:
     def test_multi_step_retry_to_success(self, tmp_path):
