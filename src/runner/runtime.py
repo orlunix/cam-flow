@@ -28,7 +28,7 @@ from typing import Any
 
 import yaml
 
-from . import camc
+from . import camc_lib as camc
 from .expr import (
     ExprError, eval_expr, render_deep, _render_str,
 )
@@ -604,7 +604,7 @@ def _build_skill_prompt(workflow: dict, node: dict, inputs: dict,
 
 
 # camc constants — keep aliases for any external callers; the canonical
-# values live in camc.py.
+# values live in camc_lib.py.
 _SKILL_TIMEOUT_S = camc.DEFAULT_SKILL_TIMEOUT_S
 _OUTPUT_FILENAME = "agent_output.json"
 
