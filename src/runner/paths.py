@@ -21,6 +21,7 @@ Public API:
 from __future__ import annotations
 
 import json
+import os
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,10 +64,14 @@ def archive_run_dir(run_dir: Path, archives_root: Path) -> Path | None:
     archives_root.mkdir(parents=True, exist_ok=True)
     status = _peek_run_status(run_dir)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    target = archives_root / f"{stamp}-{status}"
+    # Optional CAMFLOW_ARCHIVE_SUFFIX lets a regression / batch run tag
+    # all its archives with an identifier (e.g. "regression-20260501").
+    extra = os.environ.get("CAMFLOW_ARCHIVE_SUFFIX", "").strip()
+    suffix = f"-{extra}" if extra else ""
+    target = archives_root / f"{stamp}-{status}{suffix}"
     n = 1
     while target.exists():
-        target = archives_root / f"{stamp}-{status}-{n}"
+        target = archives_root / f"{stamp}-{status}{suffix}-{n}"
         n += 1
     run_dir.rename(target)
     return target
