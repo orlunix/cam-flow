@@ -207,7 +207,7 @@ class TestVerifyAgent:
             }],
         }
         result = run_workflow(wf, {}, tmp_path)
-        assert result == "failure"
+        assert result == "halted"
         events = [json.loads(line) for line in
                   (tmp_path / "trace.jsonl").read_text().splitlines()]
         verify_failed = [e for e in events if e["event"] == "verify_failed"]
@@ -238,7 +238,7 @@ class TestVerifyAgent:
             }],
         }
         result = run_workflow(wf, {}, tmp_path)
-        assert result == "failure"
+        assert result == "halted"
         events = [json.loads(line) for line in
                   (tmp_path / "trace.jsonl").read_text().splitlines()]
         assert any("missing required `criterion`" in e.get("reason", "")
@@ -282,7 +282,7 @@ class TestVerifyWorkflowYaml:
             }],
         }
         result = run_workflow(wf, {}, tmp_path)
-        assert result == "failure"
+        assert result == "halted"
 
     def test_invalid_yaml_fails_with_validation_error_in_envelope(self, tmp_path):
         bad_yaml = "workflow: bar\nversion: 0.6\nnodes:\n  - id: a\n    uses: skill.does_not_exist_anywhere\n"
@@ -297,7 +297,7 @@ class TestVerifyWorkflowYaml:
             }],
         }
         result = run_workflow(wf, {}, tmp_path)
-        assert result == "failure"
+        assert result == "halted"
         events = [json.loads(line) for line in
                   (tmp_path / "trace.jsonl").read_text().splitlines()]
         verify_failed = [e for e in events if e["event"] == "verify_failed"]
@@ -349,6 +349,94 @@ class TestVerifyWorkflowYaml:
 
 
 class TestHaltAndSkipPropagation:
+    def test_failure_without_retry_halts(self, tmp_path):
+        """Node fails + no retry → workflow_halted. Downstream nodes
+        get status=skipped (upstream halted)."""
+        wf = {
+            "workflow": "fail_demo",
+            "version": 0.6,
+            "nodes": [
+                {"id": "a", "mock": {"status": "failure",
+                                     "error": {"code": "BOOM", "message": "x"}}},
+                {"id": "b", "needs": ["a"], "mock": {"status": "success"}},
+            ],
+        }
+        result = run_workflow(wf, {}, tmp_path)
+        assert result == "halted"
+        events = [
+            json.loads(line) for line in (tmp_path / "trace.jsonl").read_text().splitlines()
+        ]
+        assert any(e["event"] == "workflow_halted" for e in events)
+        halt = json.loads((tmp_path / "halt.json").read_text())
+        assert halt["halted_node"] == "a"
+        skipped = [e for e in events if e["event"] == "node_skipped"]
+        assert any(e["node"] == "b" for e in skipped)
+
+    def test_explicit_halted_status_from_node(self, tmp_path):
+        """Skill/tool envelope returning status=halted halts the workflow."""
+        wf = {
+            "workflow": "explicit_halt",
+            "version": 0.6,
+            "nodes": [
+                {"id": "a", "mock": {
+                    "status": "halted",
+                    "error": {"code": "NEED_HELP",
+                              "message": "ambiguous instruction"},
+                }},
+                {"id": "b", "needs": ["a"], "mock": {"status": "success"}},
+            ],
+        }
+        result = run_workflow(wf, {}, tmp_path)
+        assert result == "halted"
+        halt = json.loads((tmp_path / "halt.json").read_text())
+        assert halt["halted_node"] == "a"
+        assert halt["envelope"]["error"]["code"] == "NEED_HELP"
+
+    def test_retry_exhausted_halts(self, tmp_path):
+        """retry max_attempts reached without satisfying `until` → halt."""
+        wf = {
+            "workflow": "exhaust_demo",
+            "version": 0.6,
+            "nodes": [
+                {"id": "n", "mock": {"status": "success",
+                                     "data": {"ok": False}},
+                 "output_schema": {"ok": "boolean"},
+                 "retry": {"until": "nodes.n.latest.output.data.ok == true",
+                           "max_attempts": 2}},
+            ],
+        }
+        result = run_workflow(wf, {}, tmp_path)
+        assert result == "halted"
+        events = [json.loads(line) for line in
+                  (tmp_path / "trace.jsonl").read_text().splitlines()]
+        assert any(e["event"] == "retry_exhausted" for e in events)
+        assert any(e["event"] == "workflow_halted" for e in events)
+
+    def test_resume_continues_step_numbering(self, tmp_path):
+        """`camflow resume` appends to trace.jsonl and continues the run."""
+        from runner.runtime import main as cli_main
+        wf = {
+            "workflow": "exhaust_demo",
+            "version": 0.6,
+            "nodes": [
+                {"id": "n", "mock": {"status": "success",
+                                     "data": {"ok": False, "feedback": "bad"}},
+                 "output_schema": {"ok": "boolean", "feedback": "string"},
+                 "retry": {"until": "nodes.n.latest.output.data.ok == true",
+                           "max_attempts": 2}},
+            ],
+        }
+        rd = tmp_path / "run"
+        run_workflow(wf, {}, rd)
+        before = (rd / "trace.jsonl").read_text().splitlines()
+        cli_main(["resume", str(rd), "--feedback", "force"])
+        after = (rd / "trace.jsonl").read_text().splitlines()
+        # Resume appends; doesn't overwrite.
+        assert len(after) > len(before)
+        # Step numbers globally monotonic across the resume boundary.
+        steps = [json.loads(line)["step"] for line in after]
+        assert steps == sorted(steps)
+
     def test_auto_schema_check_without_verify_list(self, tmp_path):
         """Schema is checked automatically — user need not declare {type: schema}."""
         wf = {
@@ -362,7 +450,7 @@ class TestHaltAndSkipPropagation:
             ],
         }
         result = run_workflow(wf, {}, tmp_path)
-        assert result == "failure"   # schema fail → no retry → halt
+        assert result == "halted"   # schema fail → no retry → halt
         events = [json.loads(line) for line in
                   (tmp_path / "trace.jsonl").read_text().splitlines()]
         assert any(e["event"] == "verify_failed" for e in events)

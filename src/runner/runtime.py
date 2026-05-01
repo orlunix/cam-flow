@@ -57,7 +57,7 @@ _default_run_dir = default_run_dir
 _archive_run_dir = archive_run_dir
 
 
-_VALID_STATUSES = {"success", "failure", "skipped"}
+_VALID_STATUSES = {"success", "failure", "skipped", "halted"}
 
 
 def _empty_envelope(status: str, error: dict | None = None) -> dict:
@@ -1133,6 +1133,44 @@ def _persist_attempt(run: Run, nid: str, attempt_n: int, env: dict) -> None:
     (d / "output.json").write_text(json.dumps(env, indent=2))
 
 
+def _propagate_skip(run: Run, halting_node: str,
+                    code: str = "UPSTREAM_HALTED") -> None:
+    """Mark every not-yet-attempted node as skipped (with reason).
+
+    Called when the workflow halts so downstream nodes have a clear
+    terminal status instead of silently being un-run.
+    """
+    for nid in run.nodes_by_id:
+        if not run.attempts[nid]:
+            run.attempts[nid].append(_empty_envelope("skipped", error={
+                "code": code,
+                "message": f"halted by '{halting_node}'",
+            }))
+            run.trace("node_skipped", node=nid, attempt=1,
+                      reason=f"{code.lower()}")
+
+
+def _halt_workflow(run: Run, halted_node: str, halted_attempt: int,
+                   reason: str, envelope: dict) -> None:
+    """Pause execution for human/orchestrator handoff.
+
+    Writes halt.json next to trace.jsonl, marks not-yet-run nodes as
+    skipped, and emits workflow_halted. The user can later run
+    `camflow resume <run_dir>` to continue from the halted node.
+    """
+    halt_info = {
+        "halted_node": halted_node,
+        "halted_attempt": halted_attempt,
+        "reason": reason,
+        "envelope": envelope,
+        "trace_step": run.step + 1,  # the next event written below
+    }
+    (run.run_dir / "halt.json").write_text(json.dumps(halt_info, indent=2))
+    _propagate_skip(run, halted_node)
+    run.trace("workflow_halted",
+              node=halted_node, attempt=halted_attempt, reason=reason)
+
+
 def run_workflow(workflow: dict, state: dict, run_dir: Path,
                  _existing_run: "Run | None" = None) -> str:
     """Run a workflow. Returns 'success' / 'halted' / 'failure'.
@@ -1228,12 +1266,26 @@ def _main_loop(run: "Run", workflow: dict) -> str:
             run.trace("node_failed", node=nid, attempt=attempt_n,
                       reason=(env.get("error") or {}).get("message", "unknown"))
 
+        # Node-initiated halt: skill/tool/agent envelope set status=halted.
+        if env["status"] == "halted":
+            run.trace("node_halted", node=nid, attempt=attempt_n,
+                      reason=(env.get("error") or {}).get("message",
+                                                          "node returned halted"))
+            _halt_workflow(run, nid, attempt_n,
+                           reason="node returned status=halted",
+                           envelope=env)
+            return "halted"
+
         # retry decision: re-run THIS node only.
         #   * success + retry.until is false  → retry self
         #   * failure + retry policy present  → retry self
-        # Otherwise: nothing to do; outer loop's terminal check decides
-        # workflow-level success vs failure (failure is terminal, no halt).
         retry_policy = node.get("retry")
+        if env["status"] == "failure" and not retry_policy:
+            # No retry configured — halt for human/orchestrator handoff.
+            _halt_workflow(run, nid, attempt_n,
+                           reason="node failed, no retry configured",
+                           envelope=env)
+            return "halted"
         if not retry_policy:
             continue
 
@@ -1271,14 +1323,10 @@ def _main_loop(run: "Run", workflow: dict) -> str:
         if len(run.attempts[nid]) >= max_n:
             run.trace("retry_exhausted", node=nid,
                       reason=f"max_attempts={max_n} reached")
-            # Force this node terminal as failure so the outer terminal
-            # check picks it up next iteration.
-            if env["status"] == "success":
-                run.attempts[nid][-1] = dict(env, status="failure",
-                                             error={"code": "RETRY_EXHAUSTED",
-                                                    "message": f"until never satisfied "
-                                                               f"after {max_n} attempts"})
-            continue
+            _halt_workflow(run, nid, attempt_n,
+                           reason=f"retry exhausted (max_attempts={max_n})",
+                           envelope=env)
+            return "halted"
 
         feedback_raw = retry_policy.get("feedback", "")
         feedback = (_render_str(feedback_raw, ctx)
@@ -1343,9 +1391,10 @@ def _run_command(argv: list[str]) -> int:
 def _result_to_exit_code(result: str) -> int:
     """Map workflow result to standard exit codes:
       success → 0
-      anything else (failure, deadlock) → 1
+      halted  → 2  (resume possible via `camflow resume <run_dir>`)
+      failure → 1  (irrecoverable / no halt sidecar)
     """
-    return 0 if result == "success" else 1
+    return {"success": 0, "halted": 2}.get(result, 1)
 
 
 def _planner_bootstrap_workflow() -> dict:
@@ -1534,6 +1583,122 @@ def _plan_command(argv: list[str]) -> int:
 
 
 
+def _summarize_run(run_dir: Path) -> dict:
+    """Read run dir → structured summary. Used by `camflow resume`
+    to replay completed attempts before continuing.
+    """
+    if not run_dir.exists():
+        raise FileNotFoundError(f"run dir not found: {run_dir}")
+
+    summary: dict = {
+        "run_dir": str(run_dir),
+        "running": (run_dir / "runner.pid").exists(),
+        "halted": (run_dir / "halt.json").exists(),
+        "workflow": None,
+        "nodes": [],
+        "last_event": None,
+    }
+
+    wf_path = run_dir / "workflow.yaml"
+    if wf_path.exists():
+        wf = yaml.safe_load(wf_path.read_text())
+        summary["workflow"] = wf.get("workflow")
+        for n in wf.get("nodes") or []:
+            nid = n["id"]
+            attempt_dir = run_dir / "nodes" / nid
+            attempts = []
+            if attempt_dir.exists():
+                for ad in sorted(attempt_dir.glob("attempt-*")):
+                    out = ad / "output.json"
+                    if out.exists():
+                        env = json.loads(out.read_text())
+                        attempts.append({
+                            "n": int(ad.name.split("-")[1]),
+                            "status": env.get("status"),
+                        })
+            summary["nodes"].append({
+                "id": nid,
+                "attempts": attempts,
+                "latest_status": attempts[-1]["status"] if attempts else None,
+            })
+
+    trace_path = run_dir / "trace.jsonl"
+    if trace_path.exists():
+        lines = trace_path.read_text().splitlines()
+        if lines:
+            summary["last_event"] = json.loads(lines[-1])
+
+    halt_path = run_dir / "halt.json"
+    if halt_path.exists():
+        summary["halt"] = json.loads(halt_path.read_text())
+
+    return summary
+
+
+def _resume_command(argv: list[str]) -> int:
+    """Continue a halted workflow from where it stopped.
+
+    Reads halt.json + workflow.yaml + state.json from <run_dir>, replays
+    completed attempts into a fresh Run, marks the halted node retry-pending,
+    and continues the main loop. The user/orchestrator may have edited
+    state.json or workflow.yaml between halt and resume — current files win.
+    """
+    p = argparse.ArgumentParser(
+        prog="camflow resume",
+        description="Resume a halted workflow.",
+    )
+    p.add_argument("run_dir")
+    p.add_argument("--feedback", default="",
+                   help="extra feedback text injected as {{retry.feedback}} "
+                        "for the halted node's next attempt")
+    args = p.parse_args(argv)
+
+    rd = Path(args.run_dir)
+    halt_path = rd / "halt.json"
+    if not halt_path.exists():
+        print(f"ERROR: not halted (no halt.json at {halt_path})",
+              file=sys.stderr)
+        return 1
+
+    halt_info = json.loads(halt_path.read_text())
+    workflow = yaml.safe_load((rd / "workflow.yaml").read_text())
+    state = json.loads((rd / "state.json").read_text())
+
+    # Build a Run in resume mode (don't overwrite workflow.yaml / state.json)
+    run = Run(workflow, state, rd, resume=True)
+
+    # Replay existing attempts from disk so cross-node references still work.
+    summary = _summarize_run(rd)
+    for n in summary["nodes"]:
+        nid = n["id"]
+        for att in n["attempts"]:
+            out = (rd / "nodes" / nid / f"attempt-{att['n']}" / "output.json")
+            run.attempts[nid].append(json.loads(out.read_text()))
+
+    # Mark the halted node for re-execution. --feedback wins over the
+    # halt envelope's data.feedback (if any).
+    halted = halt_info["halted_node"]
+    fb = args.feedback or (
+        (halt_info.get("envelope") or {})
+        .get("data", {})
+        .get("feedback", "")
+    )
+    run.retry_pending[halted] = {
+        "feedback": fb,
+        "attempt": len(run.attempts[halted]) + 1,
+    }
+    halt_path.unlink()  # consume halt.json — fresh halt will rewrite
+    run.trace("workflow_resumed", node=halted,
+              attempt=len(run.attempts[halted]) + 1,
+              reason=f"resume from halt.json (feedback len={len(fb)})")
+
+    print(f"resuming {halted} (attempt {len(run.attempts[halted]) + 1})",
+          file=sys.stderr)
+    result = run_workflow(workflow, state, rd, _existing_run=run)
+    print(f"result:  {result}", file=sys.stderr)
+    return _result_to_exit_code(result)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(argv) if argv is not None else sys.argv[1:]
 
@@ -1542,6 +1707,7 @@ def main(argv: list[str] | None = None) -> int:
             "Usage:\n"
             "  camflow <workflow.yaml> [--state STATE] [--run-dir DIR] [--validate]\n"
             "  camflow plan \"<goal>\" [--out FILE] [--run --state FILE]\n"
+            "  camflow resume <run_dir> [--feedback TEXT]\n"
             "\n"
             "Inspect a run:  cat .camflow/run/trace.jsonl\n"
             "Stop a run:     kill $(cat .camflow/run/runner.pid)\n",
@@ -1552,6 +1718,8 @@ def main(argv: list[str] | None = None) -> int:
     cmd = argv[0]
     if cmd == "plan":
         return _plan_command(argv[1:])
+    if cmd == "resume":
+        return _resume_command(argv[1:])
     if cmd in ("-h", "--help"):
         return _run_command(argv)
     return _run_command(argv)
