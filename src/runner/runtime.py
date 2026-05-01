@@ -15,345 +15,46 @@ CLI:
 from __future__ import annotations
 
 import argparse
-import ast
 import atexit
 import json
 import os
 import re
-import secrets
 import signal
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-
-# ─── Expression evaluator (spec App. A) ────────────────────────────────
-
-_ALLOWED_AST = (
-    ast.Expression, ast.Constant, ast.Name, ast.Attribute, ast.Subscript,
-    ast.Compare, ast.BoolOp, ast.UnaryOp, ast.Load,
-    ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
-    ast.And, ast.Or, ast.Not,
+from .expr import (
+    ExprError, eval_expr, render_deep, _render_str,
+)
+from .parse import (
+    WorkflowParseError, load_workflow, parse_workflow_yaml,
+    validate_workflow,
+)
+from .paths import (
+    archive_run_dir, default_run_dir, gen_run_id, utcnow_iso,
 )
 
 
-class ExprError(Exception):
-    pass
+# Public re-exports for legacy callers (tests, examples) that still
+# import these names from `runner.runtime`.
+__all_helpers__ = [
+    "ExprError", "eval_expr", "render_deep",
+    "WorkflowParseError", "load_workflow", "parse_workflow_yaml",
+    "validate_workflow",
+    "default_run_dir", "gen_run_id", "utcnow_iso", "archive_run_dir",
+]
 
 
-def _walk(node, ctx):
-    if isinstance(node, ast.Expression):
-        return _walk(node.body, ctx)
-    if isinstance(node, ast.Constant):
-        return node.value
-    if isinstance(node, ast.Name):
-        # YAML-style boolean / null literals
-        if node.id == "true":
-            return True
-        if node.id == "false":
-            return False
-        if node.id == "null":
-            return None
-        if node.id not in ctx:
-            raise ExprError(f"undefined name: {node.id}")
-        return ctx[node.id]
-    if isinstance(node, ast.Attribute):
-        obj = _walk(node.value, ctx)
-        if isinstance(obj, dict):
-            if node.attr not in obj:
-                raise ExprError(f"missing key: .{node.attr}")
-            return obj[node.attr]
-        if obj is None:
-            raise ExprError(f"None has no attr {node.attr}")
-        raise ExprError(f"can't access .{node.attr} on {type(obj).__name__}")
-    if isinstance(node, ast.Subscript):
-        obj = _walk(node.value, ctx)
-        idx = _walk(node.slice, ctx)
-        if isinstance(obj, list):
-            try:
-                return obj[idx]
-            except (IndexError, TypeError) as e:
-                raise ExprError(f"subscript: {e}")
-        if isinstance(obj, dict):
-            return obj.get(idx)
-        raise ExprError(f"can't subscript {type(obj).__name__}")
-    if isinstance(node, ast.Compare):
-        left = _walk(node.left, ctx)
-        for op, right_node in zip(node.ops, node.comparators):
-            right = _walk(right_node, ctx)
-            ok = (
-                (isinstance(op, ast.Eq) and left == right) or
-                (isinstance(op, ast.NotEq) and left != right) or
-                (isinstance(op, ast.Lt) and left < right) or
-                (isinstance(op, ast.LtE) and left <= right) or
-                (isinstance(op, ast.Gt) and left > right) or
-                (isinstance(op, ast.GtE) and left >= right)
-            )
-            if not ok:
-                return False
-            left = right
-        return True
-    if isinstance(node, ast.BoolOp):
-        if isinstance(node.op, ast.And):
-            return all(_walk(v, ctx) for v in node.values)
-        if isinstance(node.op, ast.Or):
-            return any(_walk(v, ctx) for v in node.values)
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
-        return not _walk(node.operand, ctx)
-    raise ExprError(f"unsupported syntax: {type(node).__name__}")
-
-
-def eval_expr(s: str, ctx: dict):
-    try:
-        tree = ast.parse(s, mode="eval")
-    except SyntaxError as e:
-        raise ExprError(f"parse error: {e}")
-    for n in ast.walk(tree):
-        if not isinstance(n, _ALLOWED_AST):
-            raise ExprError(f"forbidden syntax: {type(n).__name__}")
-    return _walk(tree, ctx)
-
-
-# ─── Template renderer (spec App. B) ───────────────────────────────────
-
-_TEMPLATE_RE = re.compile(r"\{\{\s*(.+?)\s*\}\}")
-
-
-def _render_str(s: str, ctx: dict) -> str:
-    """Substitute every `{{expr}}` in s with its evaluated value.
-    Strict — missing fields raise ExprError. (Workflow author must
-    supply state defaults instead of relying on optional markers.)
-    """
-    def repl(m):
-        v = eval_expr(m.group(1).strip(), ctx)
-        if v is None:
-            return "null"
-        if isinstance(v, (dict, list)):
-            return json.dumps(v)
-        if isinstance(v, bool):
-            return "true" if v else "false"
-        return str(v)
-    return _TEMPLATE_RE.sub(repl, s)
-
-
-def render_deep(obj, ctx: dict):
-    if isinstance(obj, str):
-        return _render_str(obj, ctx)
-    if isinstance(obj, dict):
-        return {k: render_deep(v, ctx) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [render_deep(v, ctx) for v in obj]
-    return obj
-
-
-# ─── Workflow loading & validation ────────────────────────────────────
-
-def load_workflow(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
-
-
-def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
-    """Validate a workflow's structure.
-
-    If `project_root` is given, also validate that every `uses: skill.X`
-    resolves to a real SKILL.md (built-in or skillm). Pass None to skip
-    skill-resolution checks (useful for unit tests with mocks-only workflows).
-    """
-    errors = []
-    if not isinstance(wf, dict):
-        return ["workflow is not a dict"]
-    nodes = wf.get("nodes")
-    if not isinstance(nodes, list) or not nodes:
-        return ["workflow.nodes is missing or empty"]
-
-    ids = [n.get("id") for n in nodes]
-    if any(not i for i in ids):
-        errors.append("a node is missing 'id'")
-    if len(ids) != len(set(ids)):
-        errors.append("duplicate node ids")
-    id_set = set(ids)
-
-    for n in nodes:
-        nid = n.get("id", "<?>")
-        if "uses" not in n and "mock" not in n:
-            errors.append(f"{nid}: must have 'uses' or 'mock'")
-        for dep in n.get("needs", []) or []:
-            if dep not in id_set:
-                errors.append(f"{nid}.needs: unknown node '{dep}'")
-        retry = n.get("retry")
-        if retry:
-            if "until" not in retry or "max_attempts" not in retry:
-                errors.append(f"{nid}.retry: requires until / max_attempts")
-            if "target" in retry:
-                errors.append(
-                    f"{nid}.retry.target: unsupported in v0.6 — retry only "
-                    f"re-runs the current node; remove the target field"
-                )
-        # Skill / agent existence check (only if project_root provided)
-        uses = n.get("uses", "")
-        if project_root and uses.startswith("skill."):
-            skill_name = uses[len("skill."):]
-            if _resolve_skill_md_path(skill_name, project_root) is None:
-                errors.append(
-                    f"{nid}.uses: skill.{skill_name} not found "
-                    f"(not in built-ins, not in <project>/.claude/skills, "
-                    f"not in skillm library)"
-                )
-        if project_root and uses.startswith("agent."):
-            agent_name = uses[len("agent."):]
-            if _resolve_agent_md_path(agent_name, project_root) is None:
-                errors.append(
-                    f"{nid}.uses: agent.{agent_name} not found "
-                    f"(no AGENT.md in built-ins or <project>/.claude/agents)"
-                )
-
-    # cycle detection on `needs` graph
-    needs_map = {n["id"]: list(n.get("needs", []) or []) for n in nodes if "id" in n}
-    visited, stack = set(), set()
-
-    def dfs(u):
-        if u in stack:
-            errors.append(f"cycle through node '{u}'")
-            return
-        if u in visited:
-            return
-        stack.add(u)
-        for v in needs_map.get(u, []):
-            if v in id_set:
-                dfs(v)
-        stack.discard(u)
-        visited.add(u)
-
-    for nid in id_set:
-        dfs(nid)
-    return errors
-
-
-class WorkflowParseError(Exception):
-    """Raised when text → workflow dict conversion or validation fails."""
-
-
-_FENCE_RE = re.compile(r"^```(?:yaml|yml)?\s*\n?|\n?```\s*$",
-                       re.IGNORECASE | re.MULTILINE)
-
-
-def parse_workflow_yaml(text: str, project_root: Path | None = None) -> dict:
-    """Parse a YAML string into a workflow dict and validate it.
-
-    Strips optional ```yaml fences. Raises WorkflowParseError on:
-      - empty / whitespace-only input
-      - invalid YAML
-      - non-dict top level
-      - any validate_workflow error (incl. skill.X existence if project_root given).
-    """
-    cleaned = text.strip()
-    cleaned = re.sub(r"^```(?:yaml|yml)?\s*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```\s*$", "", cleaned)
-    cleaned = cleaned.strip()
-    if not cleaned:
-        raise WorkflowParseError("empty input")
-    try:
-        wf = yaml.safe_load(cleaned)
-    except yaml.YAMLError as e:
-        raise WorkflowParseError(f"invalid YAML: {e}") from e
-    if not isinstance(wf, dict):
-        raise WorkflowParseError(
-            f"top level is not a dict (got {type(wf).__name__})"
-        )
-    errors = validate_workflow(wf, project_root=project_root)
-    if errors:
-        raise WorkflowParseError(
-            "validation failed:\n  " + "\n  ".join(errors)
-        )
-    return wf
-
-
-# ─── Run state ──────────────────────────────────────────────────────────
-
-def _utcnow_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _gen_run_id() -> str:
-    return f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
-
-
-# ─── Run dir layout ─────────────────────────────────────────────────────
-# A camflow project keeps exactly ONE current run on disk plus a rolling
-# archive of past runs:
-#
-#   <project>/.camflow/run/                  ← current run (always here)
-#   <project>/.camflow/archives/<stamp>-<status>/   ← past runs
-#
-# When a new run starts, the previous .camflow/run/ (if any) is moved to
-# archives/. No timestamped run dir per invocation; no nesting noise.
-
-_RUN_DIRNAME = "run"
-_ARCHIVES_DIRNAME = "archives"
-
-
-def _project_camflow_dir(project_root: Path) -> Path:
-    return project_root / ".camflow"
-
-
-def _default_run_dir(project_root: Path) -> Path:
-    """Return <project>/.camflow/run/, archiving any prior run first."""
-    cam = _project_camflow_dir(project_root)
-    run = cam / _RUN_DIRNAME
-    if run.exists() and any(run.iterdir()):
-        _archive_run_dir(run, cam / _ARCHIVES_DIRNAME)
-    run.mkdir(parents=True, exist_ok=True)
-    return run
-
-
-def _archive_run_dir(run_dir: Path, archives_root: Path) -> Path | None:
-    """Move run_dir to archives_root/<stamp>-<status>/. Best-effort.
-
-    The status suffix is derived from the run's halt.json or trace tail —
-    so an archived run dir's name immediately tells you the outcome
-    (success / failure / halted / unknown).
-    """
-    if not run_dir.exists():
-        return None
-    archives_root.mkdir(parents=True, exist_ok=True)
-    status = _peek_run_status(run_dir)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    target = archives_root / f"{stamp}-{status}"
-    n = 1
-    while target.exists():
-        target = archives_root / f"{stamp}-{status}-{n}"
-        n += 1
-    run_dir.rename(target)
-    return target
-
-
-def _peek_run_status(run_dir: Path) -> str:
-    """Best-effort inspection: success / failure / halted / unknown."""
-    if (run_dir / "halt.json").exists():
-        return "halted"
-    trace = run_dir / "trace.jsonl"
-    if trace.exists():
-        try:
-            lines = trace.read_text().splitlines()
-            if lines:
-                last = json.loads(lines[-1])
-                if last.get("event") == "workflow_completed":
-                    return last.get("status") or "unknown"
-        except Exception:
-            pass
-    # plan-mode parent dir: aggregate over child runs (planner/, main/).
-    for sub in ("main", "planner"):
-        if (run_dir / sub).is_dir():
-            s = _peek_run_status(run_dir / sub)
-            if s != "unknown":
-                return s
-    return "unknown"
+# Internal aliases — historical names used inside this module.
+_utcnow_iso = utcnow_iso
+_gen_run_id = gen_run_id
+_default_run_dir = default_run_dir
+_archive_run_dir = archive_run_dir
 
 
 _VALID_STATUSES = {"success", "failure", "skipped"}
