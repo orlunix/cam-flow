@@ -27,7 +27,7 @@ from runner_v2 import camc_lib  # noqa
 from runner_v2.runtime import (
     ExprError,
     Node,
-    Run,
+    Workflow,
     WorkflowParseError,
     auto_schema_check,
     build_run_prompt,
@@ -42,6 +42,7 @@ from runner_v2.runtime import (
     run_workflow,
     validate_workflow,
     verify_with_command,
+    verify_with_human,
 )
 
 
@@ -74,16 +75,20 @@ def envelope_tool_body(data: dict, status: str = "success") -> str:
 # ───────────────────────────────────────────────────────────────────────
 
 class TestExpressions:
+    """eval_expr / render_str / render_deep are namespace-agnostic.
+    These tests use `nodes` since that's the only namespace the runtime
+    exposes in v1.1; expression engine itself doesn't care about names."""
+
     def test_simple_attr(self):
-        assert eval_expr("state.x", {"state": {"x": 1}}) == 1
+        assert eval_expr("nodes.a", {"nodes": {"a": 1}}) == 1
 
     def test_chained_attr(self):
         assert eval_expr("nodes.a.output.data.y",
                          {"nodes": {"a": {"output": {"data": {"y": "hi"}}}}}) == "hi"
 
     def test_compare(self):
-        assert eval_expr("state.x == 1", {"state": {"x": 1}}) is True
-        assert eval_expr("state.x != 1", {"state": {"x": 1}}) is False
+        assert eval_expr("nodes.x == 1", {"nodes": {"x": 1}}) is True
+        assert eval_expr("nodes.x != 1", {"nodes": {"x": 1}}) is False
 
     def test_bool_ops(self):
         ctx = {"a": True, "b": False}
@@ -95,7 +100,7 @@ class TestExpressions:
 
     def test_missing_attr_raises(self):
         with pytest.raises(ExprError):
-            eval_expr("state.missing", {"state": {}})
+            eval_expr("nodes.missing", {"nodes": {}})
 
     def test_unsupported_arithmetic(self):
         with pytest.raises(ExprError):
@@ -106,22 +111,22 @@ class TestExpressions:
             eval_expr("__import__('os')", {})
 
     def test_render_simple(self):
-        assert render_str("hello {{state.name}}",
-                          {"state": {"name": "world"}}) == "hello world"
+        assert render_str("hello {{nodes.name}}",
+                          {"nodes": {"name": "world"}}) == "hello world"
 
     def test_render_strict_missing(self):
-        """v1.0 has NO `?` optional marker; missing → ExprError."""
+        """v1.1 has NO `?` optional marker; missing → ExprError."""
         with pytest.raises(ExprError):
-            render_str("{{state.missing}}", {"state": {}})
+            render_str("{{nodes.missing}}", {"nodes": {}})
 
     def test_render_dict_serialized(self):
-        assert render_str("{{state.x}}",
-                          {"state": {"x": {"a": 1}}}) == '{"a": 1}'
+        assert render_str("{{nodes.x}}",
+                          {"nodes": {"x": {"a": 1}}}) == '{"a": 1}'
 
     def test_render_deep(self):
-        ctx = {"state": {"x": "hi", "n": 5}}
+        ctx = {"nodes": {"x": "hi", "n": 5}}
         out = render_deep(
-            {"a": "{{state.x}}", "b": [{"c": "{{state.n}}"}]},
+            {"a": "{{nodes.x}}", "b": [{"c": "{{nodes.n}}"}]},
             ctx,
         )
         assert out == {"a": "hi", "b": [{"c": "5"}]}
@@ -176,7 +181,7 @@ class TestValidate:
     def test_verify_criterion_xor_command(self):
         wf = self._wf(verify={"criterion": "x", "command": "y"})
         errs = validate_workflow(wf)
-        assert any("cannot have both" in e for e in errs)
+        assert any("at most one" in e for e in errs)
 
     def test_unknown_needs(self):
         wf = self._wf(needs=["nonexistent"])
@@ -257,15 +262,16 @@ class TestNode:
             "goal": "do",
             "steps": ["a", "b"],
             "needs": ["upstream"],
-            "run": {"skill": "analyzer", "input": {"k": "v"}},
+            "run": {"skill": "analyzer"},
             "output_schema": {"f": "string"},
             "verify": {"command": "test 1"},
             "retry": 3,
         })
-        assert n.input_template == {"k": "v"}
+        assert n.run_config == {"skill": "analyzer"}
         assert n.output_schema == {"f": "string"}
         assert n.verify_config == {"command": "test 1"}
         assert n.retry_max == 3
+        assert n.needs == ["upstream"]
 
     def test_is_ready_no_needs(self):
         n = Node.from_dict({"id": "x", "goal": "g", "steps": ["s"],
@@ -374,7 +380,7 @@ class TestVerify:
                 "run": {"tool": "scripts/x.sh"},
             }],
         }
-        run = Run(wf, {}, tmp_path)
+        run = Workflow(wf, tmp_path)
         try:
             node = run.nodes_by_id["n"]
             ok, _ = verify_with_command("true", run, node, {"data": {}}, 1)
@@ -390,7 +396,7 @@ class TestVerify:
                 "run": {"tool": "scripts/x.sh"},
             }],
         }
-        run = Run(wf, {}, tmp_path)
+        run = Workflow(wf, tmp_path)
         try:
             node = run.nodes_by_id["n"]
             ok, reason = verify_with_command("false", run, node, {"data": {}}, 1)
@@ -409,7 +415,7 @@ class TestVerify:
                 "run": {"tool": "scripts/x.sh"},
             }],
         }
-        run = Run(wf, {}, tmp_path)
+        run = Workflow(wf, tmp_path)
         try:
             node = run.nodes_by_id["n"]
             envelope = {"status": "success", "data": {"x": 42}}
@@ -419,6 +425,71 @@ class TestVerify:
             assert ok is True
         finally:
             run.cleanup()
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  TestVerifyHuman — stdin Q&A, "approve" gate
+# ───────────────────────────────────────────────────────────────────────
+
+class TestVerifyHuman:
+    def _node(self):
+        return Node.from_dict({
+            "id": "n",
+            "goal": "g",
+            "steps": ["s"],
+            "run": {"tool": "x.sh"},
+            "verify": {"human": "Looks good?"},
+        })
+
+    def test_no_tty_rejects(self, monkeypatch):
+        # When stdin is not a TTY, must reject with stable feedback.
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+        ok, fb = verify_with_human(self._node(), {"data": {}}, "Looks good?")
+        assert ok is False
+        assert "no TTY" in fb
+
+    def test_approve_passes(self, monkeypatch, capsys):
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("builtins.input", lambda _: "approve")
+        ok, fb = verify_with_human(self._node(), {"data": {"x": 1}},
+                                   "Approve?")
+        assert ok is True
+
+    def test_approve_case_insensitive(self, monkeypatch):
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("builtins.input", lambda _: "  APPROVE  ")
+        ok, _ = verify_with_human(self._node(), {"data": {}}, "?")
+        assert ok is True
+
+    def test_anything_else_rejects_with_feedback(self, monkeypatch):
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("builtins.input",
+                            lambda _: "make it more concise")
+        ok, fb = verify_with_human(self._node(), {"data": {}}, "?")
+        assert ok is False
+        assert fb == "make it more concise"
+
+    def test_validator_accepts_human(self):
+        wf = {
+            "nodes": [{
+                "id": "n", "goal": "g", "steps": ["s"],
+                "run": {"tool": "x.sh"},
+                "verify": {"human": "Looks good?"},
+            }],
+        }
+        errs = validate_workflow(wf)
+        assert all("verify" not in e for e in errs)
+
+    def test_validator_rejects_two_verify_types(self):
+        wf = {
+            "nodes": [{
+                "id": "n", "goal": "g", "steps": ["s"],
+                "run": {"tool": "x.sh"},
+                "verify": {"human": "ok?", "command": "true"},
+            }],
+        }
+        errs = validate_workflow(wf)
+        assert any("at most one" in e for e in errs)
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -550,12 +621,13 @@ class TestE2E:
             }),
         )
 
-        # Tool 2: read upstream's root_cause from input, return a patch.
+        # Tool 2: read upstream diagnose's root_cause from input, return a patch.
+        # In v1.1, runtime auto-injects upstream envelopes under input.upstream.<id>.
         make_executable_tool(
             scripts / "fix.sh",
             r"""
 input_json=$(cat)
-cause=$(echo "$input_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['cause'])")
+cause=$(echo "$input_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['upstream']['diagnose']['data']['root_cause'])")
 cat <<EOF
 {"status":"success","data":{"patch":"FIXED: $cause","files_changed":["foo.py"]},"error":null,"feedback":null,"request_human":false}
 EOF
@@ -595,12 +667,7 @@ EOF
                     "goal": "Write a patch addressing the cause",
                     "steps": ["read cause", "write patch"],
                     "needs": ["diagnose"],
-                    "run": {
-                        "tool": "scripts/fix.sh",
-                        "input": {
-                            "cause": "{{nodes.diagnose.output.data.root_cause}}"
-                        },
-                    },
+                    "run": {"tool": "scripts/fix.sh"},
                     "output_schema": {
                         "patch": "string",
                         "files_changed": "array",
@@ -636,7 +703,7 @@ EOF
         assert errors == [], f"validation errors: {errors}"
 
         run_dir = proj / ".camflow" / "run"
-        result = run_workflow(wf, {}, run_dir)
+        result = run_workflow(wf, run_dir)
         assert result == "done", f"expected 'done', got {result!r}"
 
         # All 3 nodes succeeded
@@ -646,12 +713,13 @@ EOF
             )
             assert out["status"] == "success", f"{nid} status={out['status']}"
 
-        # Verify the template rendered correctly: fix's input.json should
-        # contain "null deref at line 42" (came from diagnose's output)
+        # Verify upstream auto-injection: fix's input.json carries the
+        # full diagnose envelope under `upstream.diagnose`.
         fix_input = json.loads(
             (run_dir / "nodes" / "fix" / "attempt-1" / "input.json").read_text()
         )
-        assert "null deref at line 42" in fix_input["cause"]
+        assert fix_input["upstream"]["diagnose"]["data"]["root_cause"] \
+            == "null deref at line 42"
 
         # Verify final envelope of test node
         test_out = json.loads(
@@ -684,10 +752,10 @@ EOF
 
         # First run
         rd = default_run_dir(proj)
-        assert run_workflow(wf, {}, rd) == "done"
+        assert run_workflow(wf, rd) == "done"
         # Second run (default_run_dir auto-archives)
         rd2 = default_run_dir(proj)
-        assert run_workflow(wf, {}, rd2) == "done"
+        assert run_workflow(wf, rd2) == "done"
 
         archives = list((proj / ".camflow" / "archives").iterdir())
         assert len(archives) >= 1
@@ -703,7 +771,7 @@ EOF
             envelope_tool_body({"passed": False, "tests_run": 5}),
         )
         wf = self._three_node_workflow()
-        result = run_workflow(wf, {}, proj / ".camflow" / "run")
+        result = run_workflow(wf, proj / ".camflow" / "run")
         assert result == "halted"
         # halt.json written
         halt = json.loads((proj / ".camflow" / "run" / "halt.json").read_text())
@@ -748,7 +816,7 @@ fi
                 "retry": 3,
             }],
         }
-        result = run_workflow(wf, {}, proj / ".camflow" / "run")
+        result = run_workflow(wf, proj / ".camflow" / "run")
         assert result == "done"
         # Should have 2 attempt directories
         attempts = sorted((proj / ".camflow" / "run" / "nodes" / "n").iterdir())
@@ -778,7 +846,7 @@ fi
             }],
         }
         rd = proj / ".camflow" / "run"
-        result = run_workflow(wf, {}, rd)
+        result = run_workflow(wf, rd)
         assert result == "halted"
         events = [json.loads(line)
                   for line in (rd / "trace.jsonl").read_text().splitlines()]
@@ -813,7 +881,7 @@ fi
             }],
         }
         rd = proj / ".camflow" / "run"
-        result = run_workflow(wf, {}, rd)
+        result = run_workflow(wf, rd)
         assert result == "halted"
         # Only 1 attempt — request_human skipped retry
         attempts = list((rd / "nodes" / "n").iterdir())

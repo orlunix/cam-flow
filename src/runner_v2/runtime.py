@@ -134,8 +134,7 @@ _TEMPLATE_RE = re.compile(r"\{\{\s*(.+?)\s*\}\}")
 
 def render_str(s: str, ctx: dict) -> str:
     """Substitute `{{expr}}` in s with eval_expr(expr, ctx).
-    Strict — missing fields raise ExprError. Workflow author must supply
-    state defaults rather than rely on optional markers.
+    Strict — missing fields raise ExprError. No `?` optional marker.
     """
     def repl(m):
         v = eval_expr(m.group(1).strip(), ctx)
@@ -243,11 +242,16 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
             if not isinstance(verify, dict):
                 errors.append(f"{nid}.verify: must be a dict")
             else:
-                has_crit = "criterion" in verify
-                has_cmd = "command" in verify
-                if has_crit and has_cmd:
+                v_keys = {k for k in ("criterion", "command", "human")
+                          if k in verify}
+                if len(v_keys) > 1:
                     errors.append(
-                        f"{nid}.verify: cannot have both `criterion` and `command`"
+                        f"{nid}.verify: at most one of `criterion`, "
+                        f"`command`, `human` (got {sorted(v_keys)})"
+                    )
+                if "human" in verify and not isinstance(verify["human"], str):
+                    errors.append(
+                        f"{nid}.verify.human: must be a string (the prompt to show the user)"
                     )
         # needs references valid ids
         for dep in n.get("needs", []) or []:
@@ -447,12 +451,13 @@ def build_run_prompt(node: "Node", input_dict: dict,
                      workflow_context: str | None = None) -> str:
     """Compose the prompt for a run agent (skill mode).
 
-    Layout:
+    Layout (v1.1):
       [skill template]
-      [Workflow Context]   ← shared across every node, optional
+      [Workflow Context]      ← shared across every node, optional
       [Goal]
       [Steps]
-      [Inputs]
+      [Upstream Outputs]      ← auto-injected from `needs`, optional
+      [Note: previous]         ← only on retry
       [Output schema + delivery protocol]
     """
     parts = []
@@ -465,11 +470,16 @@ def build_run_prompt(node: "Node", input_dict: dict,
         "# Steps (you MUST do these, in order)\n"
         + _format_steps_for_prompt(node.steps)
     )
-    parts.append(
-        "# Inputs\n```json\n"
-        + json.dumps(input_dict, indent=2, ensure_ascii=False)
-        + "\n```"
-    )
+    upstream = input_dict.get("upstream") or {}
+    if upstream:
+        sections = []
+        for dep_id, env in upstream.items():
+            sections.append(
+                f"## {dep_id}\n```json\n"
+                + json.dumps(env, indent=2, ensure_ascii=False)
+                + "\n```"
+            )
+        parts.append("# Upstream Outputs\n" + "\n\n".join(sections))
     schema_section = _format_schema_for_prompt(node.output_schema)
     parts.append(
         f"# Output\n"
@@ -499,8 +509,11 @@ def build_run_prompt(node: "Node", input_dict: dict,
     if "previous" in input_dict:
         parts.append(
             "# Note: previous attempt failed\n"
-            "Inputs include a `previous` key with the last attempt's envelope. "
-            "Read `previous.feedback` to know what went wrong; address it this time."
+            "```json\n"
+            + json.dumps(input_dict["previous"], indent=2, ensure_ascii=False)
+            + "\n```\n"
+            "Read `feedback` (or `error.message`) to know what went wrong; "
+            "address it in this attempt."
         )
     return "\n\n".join(parts)
 
@@ -654,16 +667,16 @@ def auto_schema_check(envelope: dict, schema: dict) -> tuple[bool, str]:
     return True, ""
 
 
-def verify_with_command(cmd_template: str, run: "Run", node: "Node",
+def verify_with_command(cmd_template: str, workflow: "Workflow", node: "Node",
                         envelope: dict, attempt_n: int,
                         timeout: int = 60) -> tuple[bool, str]:
     """Render cmd template, run bash, gate on exit code."""
-    ctx = run.expr_ctx(current_output=envelope)
+    ctx = workflow.expr_ctx(current_output=envelope)
     try:
         cmd = render_str(cmd_template, ctx)
     except ExprError as e:
         return False, f"verify command template error: {e}"
-    cwd = run.run_dir / "nodes" / node.id / f"attempt-{attempt_n}"
+    cwd = workflow.run_dir / "nodes" / node.id / f"attempt-{attempt_n}"
     cwd.mkdir(parents=True, exist_ok=True)
     # Always write agent_output.json so cmds can read uniformly across
     # mock / tool / skill paths.
@@ -682,18 +695,46 @@ def verify_with_command(cmd_template: str, run: "Run", node: "Node",
     return True, "ok"
 
 
-def verify_with_agent(node: "Node", run: "Run", envelope: dict,
+def verify_with_human(node: "Node", envelope: dict,
+                      prompt_text: str) -> tuple[bool, str]:
+    """Show envelope + prompt to user via stdin/stdout.
+
+    User must type 'approve' (case-insensitive, whitespace-trimmed) to
+    accept. Anything else is treated as feedback for the next retry.
+    EOF / no-TTY → reject with feedback "no TTY available for human verify".
+    """
+    if not sys.stdin.isatty():
+        return False, "no TTY available for human verify"
+
+    print(f"\n─── Human verify required: {node.id} ───", file=sys.stderr)
+    data = envelope.get("data") or {}
+    print(json.dumps(data, indent=2, ensure_ascii=False), file=sys.stderr)
+    print(file=sys.stderr)
+    print(prompt_text.strip(), file=sys.stderr)
+    print("\nType 'approve' to accept, or describe what to change:",
+          file=sys.stderr)
+    sys.stderr.flush()
+    try:
+        line = input("> ")
+    except EOFError:
+        return False, "stdin closed before human verify response"
+    if line.strip().lower() == "approve":
+        return True, "approved by human"
+    return False, line.strip()
+
+
+def verify_with_agent(node: "Node", workflow: "Workflow", envelope: dict,
                       attempt_n: int) -> tuple[bool, str]:
     """Spawn a verify-agent (using built-in evaluator skill or override).
 
     Returns (approved, feedback). Feedback comes from the agent's
     `data.reasoning` (and step_results details on reject).
     """
-    sub_dir = run.run_dir / "nodes" / node.id / f"attempt-{attempt_n}" / "verify"
+    sub_dir = workflow.run_dir / "nodes" / node.id / f"attempt-{attempt_n}" / "verify"
     sub_dir.mkdir(parents=True, exist_ok=True)
     prompt = build_verify_prompt(
         node, envelope,
-        workflow_context=run.workflow.get("context"),
+        workflow_context=workflow.spec.get("context"),
     )
     (sub_dir / "prompt.txt").write_text(prompt)
     try:
@@ -701,7 +742,7 @@ def verify_with_agent(node: "Node", run: "Run", envelope: dict,
             prompt=prompt,
             workspace=sub_dir,
             name=f"{node.id}-verify-{attempt_n}",
-            tag=run.tag,
+            tag=workflow.tag,
             output_file=OUTPUT_FILENAME,
             timeout_s=camc.DEFAULT_SKILL_TIMEOUT_S,
         )
@@ -740,18 +781,18 @@ class Node:
 
     Public attrs (everything you'd want from outside):
       static (set at load):
-        id, goal, steps, needs, input_template, output_schema, retry_max
+        id, goal, steps, needs, output_schema, retry_max
       runtime (mutated during execution):
         lifecycle, result, retry_count, output, history
       config (used by behaviors):
         run_config    {skill: ...} or {tool: ...}
-        verify_config None (default agent) | {criterion: ...} | {command: ...}
+        verify_config None (default agent) | {criterion}|{command}|{human}
 
-    Behavior is via methods: execute_attempt(), do_verify().
+    Behavior is via methods: run(), verify(), execute_attempt().
     """
 
     def __init__(self, *, id: str, goal: str, steps: list[str],
-                 needs: list[str], input_template: dict,
+                 needs: list[str],
                  output_schema: dict, retry_max: int,
                  run_config: dict, verify_config: Optional[dict]):
         # ── static ──
@@ -759,7 +800,6 @@ class Node:
         self.goal = goal
         self.steps = steps
         self.needs = needs
-        self.input_template = input_template
         self.output_schema = output_schema
         self.retry_max = retry_max
         self.run_config = run_config
@@ -781,7 +821,6 @@ class Node:
             goal=d["goal"],
             steps=list(d["steps"]),
             needs=list(d.get("needs") or []),
-            input_template=dict(run.get("input") or {}),
             output_schema=dict(d.get("output_schema") or {}),
             retry_max=int(d.get("retry", 1)),
             run_config={k: run[k] for k in ("skill", "tool") if k in run},
@@ -808,45 +847,52 @@ class Node:
 
     # ─── Execute one attempt (run + verify) ───────────────────────────
 
-    def execute_attempt(self, run: "Run", attempt_n: int) -> dict:
-        """Run + verify one full attempt. Returns final envelope.
+    def execute_attempt(self, workflow: "Workflow", attempt_n: int) -> dict:
+        """One attempt = run + verify + persist. Returns final envelope.
 
         Side effects:
           - writes input.json + output.json to the attempt dir
           - emits trace events
-          - mutates self.history / self.output (caller does state moves)
+          - mutates self.history / self.output (caller does lifecycle moves)
         """
-        att_dir = run.run_dir / "nodes" / self.id / f"attempt-{attempt_n}"
+        att_dir = workflow.run_dir / "nodes" / self.id / f"attempt-{attempt_n}"
         att_dir.mkdir(parents=True, exist_ok=True)
 
-        # Render input. Auto-inject `previous` on retries.
-        ctx = run.expr_ctx()
-        rendered = render_deep(self.input_template, ctx)
+        # Build input by auto-collecting upstream + previous-attempt feedback.
+        # No user-authored templates — `run.input` was removed in v1.1.
+        upstream = {}
+        for dep_id in self.needs:
+            up = workflow.nodes_by_id.get(dep_id)
+            if up is not None and up.output is not None:
+                upstream[dep_id] = up.output
+        rendered: dict = {}
+        if upstream:
+            rendered["upstream"] = upstream
         if attempt_n > 1 and self.history:
-            rendered = {**rendered, "previous": self.history[-1]}
+            rendered["previous"] = self.history[-1]
         (att_dir / "input.json").write_text(
             json.dumps(rendered, indent=2, ensure_ascii=False)
         )
 
-        run.trace("node_started", node=self.id, attempt=attempt_n,
-                  reason=("retry" if attempt_n > 1 else "needs satisfied"))
+        workflow.trace("node_started", node=self.id, attempt=attempt_n,
+                       reason=("retry" if attempt_n > 1 else "needs satisfied"))
 
         # Run.
-        envelope = self._do_run(run, rendered, att_dir, attempt_n)
+        envelope = self.run(workflow, rendered, att_dir, attempt_n)
 
         # Verify (only when run reported success).
         if envelope["status"] == "success":
-            run.trace("verify_started", node=self.id, attempt=attempt_n)
-            ok, feedback = self._do_verify(run, envelope, attempt_n)
+            workflow.trace("verify_started", node=self.id, attempt=attempt_n)
+            ok, feedback = self.verify(workflow, envelope, attempt_n)
             if not ok:
                 envelope["status"] = "fail"
                 envelope["error"] = {"code": "VERIFY_FAIL", "message": feedback}
                 envelope["feedback"] = feedback
-                run.trace("verify_failed", node=self.id, attempt=attempt_n,
-                          reason=feedback)
+                workflow.trace("verify_failed", node=self.id, attempt=attempt_n,
+                               reason=feedback)
             else:
                 envelope["feedback"] = feedback
-                run.trace("verify_completed", node=self.id, attempt=attempt_n)
+                workflow.trace("verify_completed", node=self.id, attempt=attempt_n)
 
         # Persist final envelope + record on node.
         (att_dir / "output.json").write_text(
@@ -856,26 +902,26 @@ class Node:
         self.output = envelope
 
         if envelope["status"] == "success":
-            run.trace("node_completed", node=self.id, attempt=attempt_n,
-                      status="success")
+            workflow.trace("node_completed", node=self.id, attempt=attempt_n,
+                           status="success")
         else:
-            run.trace("node_failed", node=self.id, attempt=attempt_n,
-                      reason=(envelope.get("error") or {}).get("message", "?"))
+            workflow.trace("node_failed", node=self.id, attempt=attempt_n,
+                           reason=(envelope.get("error") or {}).get("message", "?"))
         return envelope
 
-    def _do_run(self, run: "Run", input_dict: dict, att_dir: Path,
-                attempt_n: int) -> dict:
-        """Dispatch to skill or tool executor."""
+    def run(self, workflow: "Workflow", input_dict: dict, att_dir: Path,
+            attempt_n: int) -> dict:
+        """Do the work — dispatch to skill or tool executor."""
         if "skill" in self.run_config:
             skill_name = self.run_config["skill"]
-            skill_path = _resolve_skill_path(skill_name, run.project_root)
+            skill_path = _resolve_skill_path(skill_name, workflow.project_root)
             skill_md = skill_path.read_text() if skill_path else ""
             return exec_skill(skill_md, self, input_dict, att_dir,
-                              attempt_n, run.tag,
-                              workflow_context=run.workflow.get("context"))
+                              attempt_n, workflow.tag,
+                              workflow_context=workflow.spec.get("context"))
         if "tool" in self.run_config:
             tool_path = _resolve_tool_path(self.run_config["tool"],
-                                           run.project_root)
+                                           workflow.project_root)
             if not tool_path:
                 return empty_envelope(
                     "fail",
@@ -891,9 +937,9 @@ class Node:
                    "message": f"node {self.id} run has neither skill nor tool"},
         )
 
-    def _do_verify(self, run: "Run", envelope: dict,
-                   attempt_n: int) -> tuple[bool, str]:
-        """Run schema check, then user-declared verify (or default agent)."""
+    def verify(self, workflow: "Workflow", envelope: dict,
+               attempt_n: int) -> tuple[bool, str]:
+        """Schema check, then user-declared verify (or default agent)."""
         # 1. auto schema
         ok, reason = auto_schema_check(envelope, self.output_schema)
         if not ok:
@@ -902,21 +948,23 @@ class Node:
         cfg = self.verify_config
         if cfg is None:
             # Default: agent verify with steps as criterion.
-            return verify_with_agent(self, run, envelope, attempt_n)
+            return verify_with_agent(self, workflow, envelope, attempt_n)
         if "command" in cfg:
             return verify_with_command(
-                cfg["command"], run, self, envelope, attempt_n,
+                cfg["command"], workflow, self, envelope, attempt_n,
                 timeout=int(cfg.get("timeout", 60)),
             )
+        if "human" in cfg:
+            return verify_with_human(self, envelope, cfg["human"])
         # criterion (default agent path with explicit override criterion)
-        return verify_with_agent(self, run, envelope, attempt_n)
+        return verify_with_agent(self, workflow, envelope, attempt_n)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  RUN (workflow execution context)
+#  WORKFLOW — the runtime instance (composer / scheduler; doesn't run)
 # ═══════════════════════════════════════════════════════════════════════
 
-class Run:
+class Workflow:
     """One execution of a workflow.
 
     Owns:
@@ -924,18 +972,20 @@ class Run:
       - the node graph + their lifecycle state
       - the camc run tag (for crash-safety net)
       - the workflow-level state machine (running/done/halted)
+
+    Workflow does NOT itself run() or verify() — Node does. Workflow only
+    schedules nodes (`execute_dag`).
     """
 
-    def __init__(self, workflow: dict, state: dict, run_dir: Path,
+    def __init__(self, spec: dict, run_dir: Path,
                  *, resume: bool = False):
-        self.workflow = workflow
-        self.state = state
+        self.spec = spec
         self.run_dir = run_dir
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.nodes_by_id: dict[str, Node] = {
-            n["id"]: Node.from_dict(n) for n in workflow["nodes"]
+            n["id"]: Node.from_dict(n) for n in spec["nodes"]
         }
-        self.workflow_state = "running"
+        self.lifecycle = "running"
         self.step_n = 0
         self.run_id = gen_run_id()
         self.tag = f"camflow:{self.run_id}"
@@ -945,9 +995,8 @@ class Run:
 
         if not resume:
             (run_dir / "workflow.yaml").write_text(
-                yaml.safe_dump(workflow, sort_keys=False)
+                yaml.safe_dump(spec, sort_keys=False)
             )
-            (run_dir / "state.json").write_text(json.dumps(state, indent=2))
         else:
             if self.trace_path.exists():
                 self.step_n = sum(1 for _ in self.trace_path.open())
@@ -984,9 +1033,14 @@ class Run:
     # ─── Template context ─────────────────────────────────────────────
 
     def expr_ctx(self, current_output: dict | None = None) -> dict:
+        """Template namespace dict.
+
+        v1.1: only `nodes.<id>.output` namespace, plus `output.X` when
+        verifying (current envelope under check). No `state` / `inputs`.
+        """
         nodes_view = {nid: n.public_view() for nid, n in self.nodes_by_id.items()
                       if n.output is not None}
-        ctx = {"state": self.state, "nodes": nodes_view}
+        ctx = {"nodes": nodes_view}
         if current_output is not None:
             ctx["output"] = current_output
         return ctx
@@ -1026,7 +1080,81 @@ class Run:
                            "message": f"halted by '{halted_node.id}'"},
                 )
         self.trace("workflow_halted", node=halted_node.id, reason=reason)
-        self.workflow_state = "halted"
+        self.lifecycle = "halted"
+
+    # ─── DAG execution (the scheduler — Workflow's only behavior) ─────
+
+    def execute_dag(self) -> str:
+        """Schedule and run all nodes. Returns 'done' or 'halted'.
+
+        Workflow doesn't run() or verify() — it picks ready nodes and
+        delegates each attempt to Node.execute_attempt().
+        """
+        while self.lifecycle == "running":
+            ready = self.ready_nodes()
+            if not ready:
+                if self.all_done():
+                    self.trace("workflow_completed", status="success")
+                    self.lifecycle = "done"
+                    return "done"
+                # Deadlock (shouldn't happen on valid DAG with success-only deps,
+                # but be defensive). Halt the first not-done node.
+                for n in self.nodes_by_id.values():
+                    if not n.is_done():
+                        self.halt(n, "deadlock: no ready nodes",
+                                  empty_envelope(
+                                      "fail",
+                                      error={"code": "DEADLOCK",
+                                             "message": "no ready nodes"}))
+                        return "halted"
+                self.lifecycle = "done"
+                return "done"
+
+            # Pick first ready by declaration order in YAML.
+            node_ids_in_order = list(self.nodes_by_id.keys())
+            ready_set = {n.id for n in ready}
+            node = next(self.nodes_by_id[nid] for nid in node_ids_in_order
+                        if nid in ready_set)
+            node.lifecycle = "running"
+
+            attempt_n = node.retry_count + 1
+            envelope = node.execute_attempt(self, attempt_n)
+
+            # Explicit human-handoff request → halt immediately, skip retry.
+            if envelope.get("request_human"):
+                self.trace("node_requested_human", node=node.id,
+                           reason=(envelope.get("error") or {}).get("message", ""))
+                node.lifecycle = "done"
+                node.result = "fail"
+                self.halt(node, "node requested human", envelope)
+                return "halted"
+
+            if envelope["status"] == "success":
+                node.lifecycle = "done"
+                node.result = "success"
+                continue
+
+            # status = fail. Decide: retry or halt.
+            if node.retry_count < node.retry_max:
+                node.retry_count += 1
+                self.trace("retry_triggered", node=node.id,
+                           retry_count=node.retry_count,
+                           retry_max=node.retry_max,
+                           reason=(envelope.get("error") or {}).get("message", "?"))
+                # node.lifecycle stays "running"; loop picks it again next iter.
+                continue
+
+            # Out of retries.
+            self.trace("retry_exhausted", node=node.id,
+                       retry_max=node.retry_max)
+            node.lifecycle = "done"
+            node.result = "fail"
+            self.halt(node, f"retry exhausted (retry_max={node.retry_max})",
+                      envelope)
+            return "halted"
+
+        # Loop exited because lifecycle != "running".
+        return self.lifecycle
 
     def cleanup(self) -> None:
         """End-of-run: remove pid file + uninstall safety net."""
@@ -1057,91 +1185,24 @@ class Run:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  MAIN LOOP
+#  MAIN LOOP — Workflow.execute_dag (the scheduler)
 # ═══════════════════════════════════════════════════════════════════════
 
-def run_workflow(workflow: dict, state: dict, run_dir: Path,
-                 *, resume_with_run: Optional["Run"] = None) -> str:
-    """Execute a workflow → return final state ('done' or 'halted').
+def run_workflow(workflow: dict, run_dir: Path,
+                 *, resume_with_run: Optional["Workflow"] = None) -> str:
+    """Execute a workflow → return final lifecycle state ('done' or 'halted').
 
     `resume_with_run` is for the resume command — caller pre-builds a
-    Run with prior attempts replayed.
+    Workflow with prior attempts replayed.
     """
-    run = resume_with_run if resume_with_run is not None else \
-        Run(workflow, state, run_dir)
+    wf = resume_with_run if resume_with_run is not None else \
+        Workflow(workflow, run_dir)
     if resume_with_run is None:
-        run.trace("workflow_started", run_id=run.run_id)
+        wf.trace("workflow_started", run_id=wf.run_id)
     try:
-        return _main_loop(run)
+        return wf.execute_dag()
     finally:
-        run.cleanup()
-
-
-def _main_loop(run: Run) -> str:
-    while run.workflow_state == "running":
-        ready = run.ready_nodes()
-        if not ready:
-            if run.all_done():
-                run.trace("workflow_completed", status="success")
-                run.workflow_state = "done"
-                return "done"
-            # Deadlock (shouldn't happen on valid DAG with success-only deps,
-            # but be defensive). Halt the first not-done node.
-            for n in run.nodes_by_id.values():
-                if not n.is_done():
-                    run.halt(n, "deadlock: no ready nodes",
-                             empty_envelope(
-                                 "fail",
-                                 error={"code": "DEADLOCK",
-                                        "message": "no ready nodes"}))
-                    return "halted"
-            run.workflow_state = "done"
-            return "done"
-
-        # Pick first ready by declaration order in YAML.
-        node_ids_in_order = list(run.nodes_by_id.keys())
-        ready_set = {n.id for n in ready}
-        node = next(run.nodes_by_id[nid] for nid in node_ids_in_order
-                    if nid in ready_set)
-        node.lifecycle = "running"
-
-        attempt_n = node.retry_count + 1
-        envelope = node.execute_attempt(run, attempt_n)
-
-        # Explicit human-handoff request → halt immediately, skip retry.
-        if envelope.get("request_human"):
-            run.trace("node_requested_human", node=node.id,
-                      reason=(envelope.get("error") or {}).get("message", ""))
-            node.lifecycle = "done"
-            node.result = "fail"
-            run.halt(node, "node requested human", envelope)
-            return "halted"
-
-        if envelope["status"] == "success":
-            node.lifecycle = "done"
-            node.result = "success"
-            continue
-
-        # status = fail. Decide: retry or halt.
-        if node.retry_count < node.retry_max:
-            node.retry_count += 1
-            run.trace("retry_triggered", node=node.id,
-                      retry_count=node.retry_count, retry_max=node.retry_max,
-                      reason=(envelope.get("error") or {}).get("message", "?"))
-            # node.lifecycle stays "running"; loop picks it again next iter.
-            continue
-
-        # Out of retries.
-        run.trace("retry_exhausted", node=node.id,
-                  retry_max=node.retry_max)
-        node.lifecycle = "done"
-        node.result = "fail"
-        run.halt(node, f"retry exhausted (retry_max={node.retry_max})",
-                 envelope)
-        return "halted"
-
-    # Loop exited because workflow_state != "running".
-    return run.workflow_state
+        wf.cleanup()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1187,13 +1248,12 @@ def _cmd_resume(argv: list[str]) -> int:
         return 1
     halt_info = json.loads(halt_path.read_text())
     workflow = yaml.safe_load((rd / "workflow.yaml").read_text())
-    state = json.loads((rd / "state.json").read_text())
 
-    run = Run(workflow, state, rd, resume=True)
+    wf = Workflow(workflow, rd, resume=True)
     # Replay history.
     summary = _summarize_run(rd)
     for nrec in summary["nodes"]:
-        node = run.nodes_by_id.get(nrec["id"])
+        node = wf.nodes_by_id.get(nrec["id"])
         if node is None or not nrec["attempts"]:
             continue
         node.history = list(nrec["attempts"])
@@ -1211,7 +1271,7 @@ def _cmd_resume(argv: list[str]) -> int:
     # Reset the halted node so it gets re-executed; bump retry budget by 1
     # so resume actually has a try.
     halted_id = halt_info["halted_node"]
-    node = run.nodes_by_id[halted_id]
+    node = wf.nodes_by_id[halted_id]
     node.lifecycle = "waiting"
     node.result = None
     if args.feedback:
@@ -1222,15 +1282,15 @@ def _cmd_resume(argv: list[str]) -> int:
             node.output = node.history[-1]
     # Allow at least one more attempt past retry_max from before.
     node.retry_max = max(node.retry_max + 1, node.retry_count + 1)
-    run.workflow_state = "running"
+    wf.lifecycle = "running"
 
     halt_path.unlink()  # clear; if it halts again, we'll write fresh
-    run.trace("workflow_resumed", node=halted_id,
-              retry_count=node.retry_count,
-              feedback_len=len(args.feedback))
+    wf.trace("workflow_resumed", node=halted_id,
+             retry_count=node.retry_count,
+             feedback_len=len(args.feedback))
 
     print(f"resuming {halted_id}", file=sys.stderr)
-    result = run_workflow(workflow, state, rd, resume_with_run=run)
+    result = run_workflow(workflow, rd, resume_with_run=wf)
     print(f"result:  {result}", file=sys.stderr)
     return _result_to_exit(result)
 
@@ -1246,11 +1306,9 @@ def _result_to_exit(result: str) -> int:
 def _cmd_run(argv: list[str]) -> int:
     p = argparse.ArgumentParser(
         prog="camflow",
-        description="Run a workflow YAML (camflow v1.0).",
+        description="Run a workflow YAML (camflow v1.1).",
     )
     p.add_argument("workflow", help="path to workflow YAML")
-    p.add_argument("--state", default=None,
-                   help="JSON file with initial state")
     p.add_argument("--run-dir", default=None,
                    help="run directory (default: <project>/.camflow/run/)")
     p.add_argument("--validate", action="store_true",
@@ -1268,11 +1326,6 @@ def _cmd_run(argv: list[str]) -> int:
         print("workflow is valid")
         return 0
 
-    state = {}
-    if args.state:
-        with open(args.state) as f:
-            state = json.load(f)
-
     if args.run_dir:
         run_dir = Path(args.run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -1280,7 +1333,7 @@ def _cmd_run(argv: list[str]) -> int:
         run_dir = default_run_dir(project)
 
     print(f"run_dir: {run_dir}")
-    result = run_workflow(wf, state, run_dir)
+    result = run_workflow(wf, run_dir)
     print(f"result:  {result}")
     return _result_to_exit(result)
 
@@ -1290,7 +1343,7 @@ def main(argv: list[str] | None = None) -> int:
     if not argv:
         print(
             "Usage:\n"
-            "  camflow <workflow.yaml> [--state STATE] [--run-dir DIR] [--validate]\n"
+            "  camflow <workflow.yaml> [--run-dir DIR] [--validate]\n"
             "  camflow resume <run_dir> [--feedback TEXT]\n"
             "\n"
             "Inspect a run:  cat .camflow/run/trace.jsonl\n"
