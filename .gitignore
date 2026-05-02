@@ -19,3 +19,15 @@ data/
 .pytest_cache/
 .DS_Store
 .claude/
+
+# Round-3 PDX NVIP skill symlinks (point at ~/.skillm/repos/skill-lib/...).
+# Not part of camflow itself; leftover from a Peregrine experiment.
+skills/as2-debug
+skills/rerun-test
+skills/run-regression
+skills/tree-build
+skills/tree-query
+skills/tree-setup
+skills/vmod-debug
+skills/vmod-edit
+skills/wavedbg
