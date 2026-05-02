@@ -53,9 +53,10 @@ nodes:
    uses default agent verify with the steps as criterion. Don't write
    `verify: { agent: ... }` — that's not a thing.
 5. **Quote strings that contain colons or special YAML chars.**
-6. The user reviews this YAML next (verify=human on this node). If they
-   approve, the runtime executes it. If they reject, you get their
-   feedback as `previous.feedback` on retry.
+6. **`verify: human` is opt-in.** Carry it through ONLY if `design_dag`
+   actually put it on a node, which it should only do when the user's
+   original prompt asked for review/approval. Don't add `verify: human`
+   on your own; don't drop it if it was intentionally placed.
 
 ## On retry
 

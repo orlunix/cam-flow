@@ -60,20 +60,18 @@ nodes:
     retry: 3
 
   - id: render_yaml
-    goal: "Emit a syntactically valid + user-approved workflow.yaml"
+    goal: "Emit a syntactically valid camflow v1.1 workflow.yaml"
     needs: [design_dag]
     steps:
       - "Read upstream design_dag (auto-injected as upstream.design_dag)"
       - "Serialize the DAG and context to YAML following spec v1.1"
       - "Ensure yaml_text is a single string suitable for writing to workflow.yaml"
+      - "If the user explicitly asked to review/approve the plan, attach verify={human: ...} to the LAST node so they can gate execution; otherwise do not insert any human verify"
       - "If the user rejected a previous attempt, follow previous.feedback"
     run:
       skill: yaml_writer
     output_schema:
       yaml_text: string
     verify:
-      human: |
-        Review the proposed workflow.yaml below.
-        Type 'approve' to accept and have the runtime execute it.
-        Otherwise, describe what to change.
-    retry: 5
+      criterion: "yaml_text parses as YAML and matches camflow v1.1 schema (no inputs:/state:/run.input; nodes have id+goal+steps+run)"
+    retry: 3

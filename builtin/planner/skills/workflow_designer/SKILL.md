@@ -42,7 +42,18 @@ A JSON envelope written to `agent_output.json`. Required `data` fields:
    Fall back to `tool` references for shell scripts when applicable.
 4. **Verify everything non-trivial.** Default is `verify: agent` (steps
    as checklist). Use `verify.command` for things you can check with
-   bash exit code. Use `verify.human` only at human-decision points.
+   bash exit code.
+
+   **`verify: human` is OPT-IN.** Only insert it when the user's prompt
+   explicitly asks to review / approve / inspect / check before running
+   (e.g. "let me review the plan first", "show me before running",
+   "ask me before applying"). Default is no human in the loop —
+   workflows run end-to-end without bothering the user. Adding human
+   approval the user didn't ask for is a regression.
+
+   When the user did ask for review, attach the `verify: { human: ... }`
+   to the **last** node (the one whose output the user wants to gate
+   on), not every node.
 5. **Retry sparingly.** Default 1 (no retry). High-stakes generative
    work (code, plans) → 2-3. Deterministic tools rarely need retry.
 6. **`workflow.context`** is for facts shared across all nodes — put

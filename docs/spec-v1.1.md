@@ -478,6 +478,14 @@ Run in the attempt directory. Exit 0 → approved. Non-zero → rejected; feedba
 
 ### `verify: { human: <prompt-text-shown-to-user> }`
 
+**Opt-in only.** A workflow node should carry `verify: human` only when
+the user's original prompt explicitly asked for review / approval /
+manual gating ("let me review", "ask me before X", "show me before
+running"). The Planner does NOT insert human approval by default —
+workflows run end-to-end without user interaction unless the user asked
+to be in the loop. Inserting `verify: human` the user didn't request is
+a UX regression, not a safety improvement.
+
 Runtime prints to stdout:
 
 ```
@@ -703,6 +711,7 @@ Planner failure → camflow halts with the Planner's halt.json. User sees what P
 11. **`camflow run` always invokes Planner.** No bypass. The CLI shape mirrors `camc run`.
 12. **Adding a verify type requires RFC.** Currently: agent (default), command, human.
 13. **Adding an executor type requires RFC.** Currently: skill, tool. (No `human` executor — human-in-loop is a verify type, not a run type.)
+14. **`verify: human` is opt-in.** Planner inserts it only when the user's prompt explicitly asks for review/approval. Workflows default to running end-to-end without human interaction.
 
 Breaking any of these without explicit reason is a regression.
 
