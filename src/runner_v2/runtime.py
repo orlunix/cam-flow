@@ -210,6 +210,8 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
     nodes = wf.get("nodes")
     if not isinstance(nodes, list) or not nodes:
         return ["workflow.nodes is missing or empty"]
+    if "context" in wf and not isinstance(wf["context"], str):
+        errors.append("workflow.context: must be a string")
 
     ids = [n.get("id") for n in nodes]
     if any(not i for i in ids):
@@ -441,11 +443,13 @@ def _format_steps_for_prompt(steps: list[str]) -> str:
 
 
 def build_run_prompt(node: "Node", input_dict: dict,
-                     skill_md: str | None = None) -> str:
+                     skill_md: str | None = None,
+                     workflow_context: str | None = None) -> str:
     """Compose the prompt for a run agent (skill mode).
 
     Layout:
       [skill template]
+      [Workflow Context]   ← shared across every node, optional
       [Goal]
       [Steps]
       [Inputs]
@@ -454,6 +458,8 @@ def build_run_prompt(node: "Node", input_dict: dict,
     parts = []
     if skill_md:
         parts.append(skill_md.strip())
+    if workflow_context and workflow_context.strip():
+        parts.append(f"# Workflow Context\n{workflow_context.strip()}")
     parts.append(f"# Goal\n{node.goal}")
     parts.append(
         "# Steps (you MUST do these, in order)\n"
@@ -499,7 +505,8 @@ def build_run_prompt(node: "Node", input_dict: dict,
     return "\n\n".join(parts)
 
 
-def build_verify_prompt(node: "Node", run_envelope: dict) -> str:
+def build_verify_prompt(node: "Node", run_envelope: dict,
+                        workflow_context: str | None = None) -> str:
     """Compose the prompt for the verify-agent (default verify path).
 
     Verify-agent's data shape is fixed: {approved, step_results, reasoning}.
@@ -508,6 +515,8 @@ def build_verify_prompt(node: "Node", run_envelope: dict) -> str:
     parts = [
         f"You are evaluating whether the previous node `{node.id}` did its job.",
     ]
+    if workflow_context and workflow_context.strip():
+        parts.append(f"# Workflow Context\n{workflow_context.strip()}")
     if criterion:
         parts.append(f"# Criterion\n{criterion}")
     parts.append(f"# Goal (same as run's)\n{node.goal}")
@@ -586,9 +595,11 @@ def exec_tool(tool_path: Path, input_dict: dict, workspace: Path) -> dict:
 
 
 def exec_skill(skill_md: str, node: "Node", input_dict: dict,
-               workspace: Path, attempt_n: int, run_id_tag: str) -> dict:
+               workspace: Path, attempt_n: int, run_id_tag: str,
+               workflow_context: str | None = None) -> dict:
     """Spawn a camc agent loaded with the skill template + run prompt."""
-    prompt = build_run_prompt(node, input_dict, skill_md=skill_md)
+    prompt = build_run_prompt(node, input_dict, skill_md=skill_md,
+                              workflow_context=workflow_context)
     (workspace / "prompt.txt").write_text(prompt)
     agent_name = f"{node.id}-attempt-{attempt_n}"
     try:
@@ -680,7 +691,10 @@ def verify_with_agent(node: "Node", run: "Run", envelope: dict,
     """
     sub_dir = run.run_dir / "nodes" / node.id / f"attempt-{attempt_n}" / "verify"
     sub_dir.mkdir(parents=True, exist_ok=True)
-    prompt = build_verify_prompt(node, envelope)
+    prompt = build_verify_prompt(
+        node, envelope,
+        workflow_context=run.workflow.get("context"),
+    )
     (sub_dir / "prompt.txt").write_text(prompt)
     try:
         _aid, raw = camc.run_and_collect(
@@ -857,7 +871,8 @@ class Node:
             skill_path = _resolve_skill_path(skill_name, run.project_root)
             skill_md = skill_path.read_text() if skill_path else ""
             return exec_skill(skill_md, self, input_dict, att_dir,
-                              attempt_n, run.tag)
+                              attempt_n, run.tag,
+                              workflow_context=run.workflow.get("context"))
         if "tool" in self.run_config:
             tool_path = _resolve_tool_path(self.run_config["tool"],
                                            run.project_root)

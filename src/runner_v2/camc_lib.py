@@ -29,8 +29,26 @@ from pathlib import Path
 
 # ─── Configuration ─────────────────────────────────────────────────────
 
-DEFAULT_SKILL_TIMEOUT_S = int(os.environ.get("CAMFLOW_SKILL_TIMEOUT", "600"))
-DEFAULT_AGENT_TIMEOUT_S = int(os.environ.get("CAMFLOW_AGENT_TIMEOUT", "1800"))
+# By default, no timeout — runtime waits indefinitely for the sub-agent's
+# output file. Real engineering tasks (smake builds, model training, P4
+# syncs) routinely run longer than any sane fixed cap. If the agent is
+# truly stuck, the user can `kill $(cat .camflow/run/runner.pid)`. If you
+# want a hard ceiling for an automated/CI run, set CAMFLOW_SKILL_TIMEOUT.
+#
+# Env var values:
+#   CAMFLOW_SKILL_TIMEOUT=N (positive int)  → wait at most N seconds
+#   CAMFLOW_SKILL_TIMEOUT unset / "0" / "" → wait forever (default)
+def _parse_timeout_env(name: str) -> int | None:
+    v = (os.environ.get(name) or "").strip()
+    if not v or v == "0":
+        return None
+    try:
+        n = int(v)
+        return n if n > 0 else None
+    except ValueError:
+        return None
+
+DEFAULT_SKILL_TIMEOUT_S = _parse_timeout_env("CAMFLOW_SKILL_TIMEOUT")
 POLL_INTERVAL_S = float(os.environ.get("CAMFLOW_SKILL_POLL_INTERVAL", "2"))
 
 # camc's `run` prints "Starting <tool> agent <hex>"; we regex it out
@@ -142,14 +160,19 @@ def kill_by_tag(tag: str) -> int:
 
 # ─── File-watch primitive ──────────────────────────────────────────────
 
-def wait_for_file(workspace: Path, filename: str, timeout_s: int,
+def wait_for_file(workspace: Path, filename: str,
+                  timeout_s: int | None = None,
                   *, since_mtime: float | None = None) -> Path:
     """Poll until <workspace>/<filename> exists, has fresh mtime, and
-    parses as JSON. Returns the Path. Raises CamcTimeout after timeout_s.
+    parses as JSON. Returns the Path.
+
+    timeout_s=None (default) → wait forever. The caller (or user) is
+    responsible for killing the runner if the agent truly hangs.
+    timeout_s>0 → raise CamcTimeout after that many seconds.
     """
     output_path = workspace / filename
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
+    deadline = (time.monotonic() + timeout_s) if timeout_s else None
+    while True:
         if output_path.exists():
             try:
                 mt = output_path.stat().st_mtime
@@ -160,11 +183,12 @@ def wait_for_file(workspace: Path, filename: str, timeout_s: int,
                     json.loads(output_path.read_text())
                     return output_path
                 except json.JSONDecodeError:
-                    pass  # still being written
+                    pass
+        if deadline is not None and time.monotonic() >= deadline:
+            raise CamcTimeout(
+                f"timed out waiting for {output_path.name} after {timeout_s}s"
+            )
         time.sleep(POLL_INTERVAL_S)
-    raise CamcTimeout(
-        f"timed out waiting for {output_path.name} after {timeout_s}s"
-    )
 
 
 # ─── The composite — what runtime actually calls ──────────────────────
@@ -172,7 +196,7 @@ def wait_for_file(workspace: Path, filename: str, timeout_s: int,
 def run_and_collect(prompt: str, workspace: Path, name: str, tag: str,
                     *,
                     output_file: str = "agent_output.json",
-                    timeout_s: int = DEFAULT_SKILL_TIMEOUT_S,
+                    timeout_s: int | None = DEFAULT_SKILL_TIMEOUT_S,
                     write_id_to: Path | None = None) -> tuple[str, dict]:
     """Spawn → wait → parse envelope → kill (always). Returns (agent_id, envelope).
 

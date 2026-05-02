@@ -30,6 +30,8 @@ from runner_v2.runtime import (
     Run,
     WorkflowParseError,
     auto_schema_check,
+    build_run_prompt,
+    build_verify_prompt,
     eval_expr,
     empty_envelope,
     load_workflow,
@@ -417,6 +419,103 @@ class TestVerify:
             assert ok is True
         finally:
             run.cleanup()
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  TestPrompt — workflow.context injection, run + verify prompts
+# ───────────────────────────────────────────────────────────────────────
+
+class TestPrompt:
+    def _node(self):
+        return Node.from_dict({
+            "id": "n",
+            "goal": "do the thing",
+            "steps": ["s1", "s2"],
+            "run": {"tool": "x.sh"},
+        })
+
+    def test_run_prompt_no_context(self):
+        out = build_run_prompt(self._node(), {"k": "v"})
+        assert "# Workflow Context" not in out
+        assert "# Goal\ndo the thing" in out
+
+    def test_run_prompt_with_context(self):
+        out = build_run_prompt(self._node(), {"k": "v"},
+                               workflow_context="ip=peregrine5d1\ntree=prgn5d1")
+        assert "# Workflow Context\nip=peregrine5d1\ntree=prgn5d1" in out
+        # context must come before goal
+        assert out.index("# Workflow Context") < out.index("# Goal")
+
+    def test_run_prompt_blank_context_skipped(self):
+        out = build_run_prompt(self._node(), {}, workflow_context="   \n  ")
+        assert "# Workflow Context" not in out
+
+    def test_verify_prompt_with_context(self):
+        out = build_verify_prompt(self._node(), {"status": "success"},
+                                  workflow_context="shared facts")
+        assert "# Workflow Context\nshared facts" in out
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  TestCamcLib — timeout semantics
+# ───────────────────────────────────────────────────────────────────────
+
+class TestCamcLib:
+    def test_default_skill_timeout_is_none(self):
+        # No env var set → wait forever (None)
+        assert camc_lib._parse_timeout_env("CAMFLOW_NONEXISTENT_KEY_XYZ") is None
+
+    def test_parse_timeout_zero_is_none(self, monkeypatch):
+        monkeypatch.setenv("CAMFLOW_TEST_TIMEOUT", "0")
+        assert camc_lib._parse_timeout_env("CAMFLOW_TEST_TIMEOUT") is None
+
+    def test_parse_timeout_positive(self, monkeypatch):
+        monkeypatch.setenv("CAMFLOW_TEST_TIMEOUT", "120")
+        assert camc_lib._parse_timeout_env("CAMFLOW_TEST_TIMEOUT") == 120
+
+    def test_parse_timeout_garbage_is_none(self, monkeypatch):
+        monkeypatch.setenv("CAMFLOW_TEST_TIMEOUT", "abc")
+        assert camc_lib._parse_timeout_env("CAMFLOW_TEST_TIMEOUT") is None
+
+    def test_wait_for_file_finds_existing(self, tmp_path):
+        (tmp_path / "out.json").write_text('{"ok":true}')
+        # timeout_s=None, but file already exists → returns immediately
+        p = camc_lib.wait_for_file(tmp_path, "out.json", timeout_s=1)
+        assert p == tmp_path / "out.json"
+
+    def test_wait_for_file_times_out(self, tmp_path):
+        with pytest.raises(camc_lib.CamcTimeout):
+            camc_lib.wait_for_file(tmp_path, "missing.json", timeout_s=1)
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  TestValidateContext — workflow.context type
+# ───────────────────────────────────────────────────────────────────────
+
+class TestValidateContext:
+    def test_context_string_ok(self):
+        wf = {
+            "context": "shared facts",
+            "nodes": [{
+                "id": "n", "goal": "g", "steps": ["s"],
+                "run": {"tool": "x.sh"},
+            }],
+        }
+        # may have skill/tool errors when project_root passed; we only
+        # care that context-on-string doesn't raise
+        errs = validate_workflow(wf)
+        assert "workflow.context" not in " ".join(errs)
+
+    def test_context_non_string_rejected(self):
+        wf = {
+            "context": {"a": "b"},  # dict, not string
+            "nodes": [{
+                "id": "n", "goal": "g", "steps": ["s"],
+                "run": {"tool": "x.sh"},
+            }],
+        }
+        errs = validate_workflow(wf)
+        assert any("workflow.context: must be a string" in e for e in errs)
 
 
 # ───────────────────────────────────────────────────────────────────────

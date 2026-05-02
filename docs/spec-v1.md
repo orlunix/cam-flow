@@ -111,6 +111,12 @@ workflow: <name>
 version: "1.0"
 goal: |                           # optional, top-level intent
   ...
+context: |                        # optional, shared prompt prepended to every node
+  Free-form text. Use this for facts that apply to the whole workflow
+  but aren't really runtime "state" — e.g. tree names, IP names, host
+  paths, naming conventions. The runtime injects this verbatim as a
+  `# Workflow Context` block above each node's `# Goal` in both run
+  and verify prompts.
 state:                            # optional, declarative schema for initial state
   field_name:
     type: <type>
@@ -122,6 +128,12 @@ nodes:
 ```
 
 The `state` section is documentation; runtime doesn't enforce it. Initial state is whatever the user passes via `--state foo.json`.
+
+`context` (string) is purely a prompt-time concern: it does NOT participate in templating, is NOT writable by nodes, and is NOT validated as state. Use it instead of `state.X` for config that is constant for the run (e.g. `ip=peregrine5d1`, `tree=prgn5d1_cmpv1`). Runtime contract:
+
+* If `workflow.context` is present and a non-blank string, the runtime prepends `# Workflow Context\n<context>` to every run-agent and verify-agent prompt, between the skill template and the node `# Goal`.
+* If absent or blank, no `# Workflow Context` section is emitted — node prompts look identical to v1.0 without context.
+* `context` is NOT renderable: no `{{...}}` substitution. It is a literal string.
 
 ---
 
