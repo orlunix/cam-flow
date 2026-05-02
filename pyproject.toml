@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "camflow"
-version = "0.6.0"
-description = "Minimal agent workflow runner — DAG dependencies, serial execution, retry as the only backwards mechanism"
+version = "1.1.0"
+description = "Self-hosting, prompt-driven multi-agent workflow runner — Planner compiles a prompt into a verified DAG"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -17,7 +17,7 @@ dependencies = [
 test = ["pytest>=8.0"]
 
 [project.scripts]
-camflow = "runner.runtime:main"
+camflow = "runner_v2.runtime:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
