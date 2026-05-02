@@ -57,6 +57,10 @@ nodes:
    actually put it on a node, which it should only do when the user's
    original prompt asked for review/approval. Don't add `verify: human`
    on your own; don't drop it if it was intentionally placed.
+7. **`run.tool:` is rare.** Carry it through ONLY if `design_dag`
+   placed it (which means design_dag judged the §10 5-criterion bar is
+   met). Don't change a `skill` to a `tool`. Don't change a `tool` to a
+   `skill`. The decision belongs to design_dag, not yaml_writer.
 
 ## On retry
 

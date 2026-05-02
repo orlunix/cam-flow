@@ -39,7 +39,29 @@ A JSON envelope written to `agent_output.json`. Required `data` fields:
    prompt. No `run.input` field — that doesn't exist in v1.1.
 3. **Pick existing skills.** If you don't know a skill exists, don't
    reference it. The runtime fails workflow load if a skill is missing.
-   Fall back to `tool` references for shell scripts when applicable.
+
+   **`run.tool:` is an escape hatch with hard criteria.** Default every
+   node to `run: { skill: <name> }`. Use `run: { tool: <path> }` only
+   when ALL FIVE of these hold for the node:
+
+   1. Known command, no judgment about *what* to run.
+   2. Inputs are fully determined by upstream + workflow.context.
+   3. The script writes a structured envelope itself (no LLM
+      interpretation of stdout/stderr needed).
+   4. Idempotent and side-effect-bounded.
+   5. Cost or speed actually matters here (in a loop, or hot path).
+
+   If ANY criterion fails → skill. If you're not sure → skill.
+
+   **Tool anti-patterns** (do NOT design these):
+   - tool that wraps a one-liner doing JSON post-processing of upstream
+   - tool that conditionally chooses among commands based on upstream
+   - tool that reads files and tries to interpret them
+   - chains of three+ tool nodes for what is really one pipeline
+
+   When the work is "compile / test / lint / format with a known CLI",
+   tool is correct. When the work is "look at the failing test and
+   propose a fix", that's skill.
 4. **Verify everything non-trivial.** Default is `verify: agent` (steps
    as checklist). Use `verify.command` for things you can check with
    bash exit code.

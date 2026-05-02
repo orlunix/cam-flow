@@ -86,7 +86,7 @@ class Node:
     needs           : list[str]
     output_schema   : dict             # field → type
     retry_max       : int              # default 1 = no retry
-    run_config      : {"skill": str}              # always a skill — see §10
+    run_config      : {"skill": str} | {"tool": str}    # XOR; skill is default (see §10)
     verify_config   : None
                     | {"criterion": str}     # agent verify with override
                     | {"command": str, "timeout"?: int}
@@ -113,7 +113,7 @@ Different layers, different semantics:
 
 | | `run` does | `verify` does |
 |---|---|---|
-| Node | calls camc-spawned skill agent — does the actual work | checks one envelope (schema + criterion / command / human) |
+| Node | runs a skill (camc-spawned agent) — or a tool (shell script) for narrow mechanical cases — does the actual work | checks one envelope (schema + criterion / command / human) |
 | Workflow | **doesn't exist** — Workflow has `execute_dag` (scheduler), not `run` | **doesn't exist** — Workflow's correctness = aggregate of children |
 
 They share **data vocabulary** (`goal`, `lifecycle`, `result` as attribute names) but **not behavior**. Workflow is a composer; Node is an executor.
@@ -222,12 +222,12 @@ Use `context` for prompt-shared facts — including the original user prompt, wh
     - "step 2"
   needs: [<node_id>, ...]         # optional, default []
 
-  run:                            # REQUIRED — always a skill in v1.1
-    skill: <skill_name>           # the only allowed key (see §10 Skill registry)
-                                   # NOTE: no `input:` field. Upstream node outputs
-                                   #       are auto-injected; no per-run user input.
-                                   # NOTE: no `tool:` either. Deterministic mechanical
-                                   #       work belongs in `verify.command`, not run.
+  run:                            # REQUIRED — exactly one of:
+    skill: <skill_name>           # default and strongly preferred (see §10)
+    # OR
+    tool: <path>                  # narrow escape hatch — only if ALL 5 criteria
+                                   # in §10 hold. Stdin=input.json; stdout=envelope.
+                                   # NOTE: no `input:` field; upstream is auto-injected.
 
   output_schema:                  # optional but recommended
     field_name: <type>            # type ∈ {string, integer, number, boolean, array}
@@ -247,7 +247,7 @@ Use `context` for prompt-shared facts — including the original user prompt, wh
 | `goal` | ✅ | — |
 | `steps` | ✅ | — |
 | `run` | ✅ | — |
-| `run.skill` | ✅ | — |
+| `run.skill` or `run.tool` | ✅ (one of) | — |
 | `needs` | ❌ | `[]` |
 | `output_schema` | ❌ | `{}` (no field-presence check) |
 | `verify` | ❌ | implicit `agent + steps` |
@@ -255,18 +255,19 @@ Use `context` for prompt-shared facts — including the original user prompt, wh
 
 ### Phase rules
 
-- **Run phase**: every node has exactly `run: { skill: <name> }`. No
-  alternative executors. The run phase is always LLM-driven via camc.
+- **Run phase**: every node has exactly **one** of:
+  - `run: { skill: <name> }` — **default and strongly preferred** (see §10).
+  - `run: { tool: <path> }` — narrow escape hatch with hard criteria (see §10).
 - **Verify phase**: at most one of `verify.criterion` / `verify.command` /
-  `verify.human`. The verify phase is the **only** place a deterministic
-  tool (bash command exit code) can be the gate.
+  `verify.human`. `verify.command` is the canonical deterministic gate.
 
-> **Why split this way?** "Doing the work" inevitably involves
-> judgment, integration of context, multi-step decisions — that's what
-> skills (Claude Code agents) are for. "Checking the work" is often a
-> mechanical pass/fail (does the test pass? does the file parse? did
-> the patch apply?) — that's what `verify.command` is for. v1.0 mixed
-> both into `run` (skill XOR tool); v1.1 cleanly separates them.
+`run.skill XOR run.tool` (exactly one). The two are mutually exclusive.
+
+> **Why two run options?** Real workflows have two kinds of work:
+> *integrative* (read code, interpret output, decide next step) and
+> *mechanical* (run pytest, format file). Skills do the first well but
+> are slow + expensive for the second. Tool is the escape hatch for
+> the second — see §10 for the hard criteria gating its use.
 
 ### No `run.input` field in v1.1
 
@@ -334,8 +335,9 @@ Halt writes `<run_dir>/halt.json` and propagates downstream nodes to `done+fail`
      - on retry (n>1), `previous` = last attempt's envelope
    Write attempt-N/input.json
 3. Call node.run(workflow, attempt_n) → returns envelope
-     - spawn camc agent with the assembled prompt (see §8); agent
+     - skill: spawn camc agent with the assembled prompt (see §8); agent
        writes envelope to agent_output.json and exits
+     - tool:  subprocess; stdin=input.json, stdout=envelope JSON
 4. If envelope.status == "fail" → return envelope (caller decides retry/halt)
 5. If envelope.status == "success":
      a. auto_schema_check(envelope, output_schema)
@@ -451,7 +453,9 @@ Write a single JSON envelope to `agent_output.json` in cwd:
 - Don't print to stdout; only write the file. Don't use markdown fences.
 ```
 
-(In v1.1, `run` is always skill — there is no separate tool path.)
+For `run.tool:`: the prompt is N/A. The tool subprocess receives
+`input.json` (containing `upstream` + `previous`) on stdin and is
+required to write the envelope JSON to stdout.
 
 ---
 
@@ -608,12 +612,63 @@ is no per-skill tool-grant mechanism in camflow itself — that would
 require a runtime extension and an RFC. If you need a non-standard tool
 set, that's currently out of scope.
 
-> **No `run.tool:` in v1.1.** Earlier versions allowed nodes to bypass
-> camc entirely by running a shell script as the executor. v1.1 removes
-> that path: every node runs through camc as a skill. Mechanical /
-> deterministic work that v1.0 would have done in a tool node now
-> belongs in **`verify.command`** (a bash exit-code gate after the
-> skill's run). See doctrine #15.
+### When to use `run.tool:` (hard rules)
+
+`run.tool: <path>` runs a shell script directly as the node's executor:
+stdin = `input.json` (with `upstream` + `previous`), stdout = envelope
+JSON. Workflow-load resolves it to `<project>/<path>` and fails if the
+file isn't `-x`.
+
+**Tool nodes are an escape hatch, not a coequal alternative to skills.**
+Use tool **only if ALL FIVE of these hold**:
+
+1. **Known command, no judgment.** The work is "run *this exact*
+   command" — pytest, prettier, terraform plan, make. There is no
+   decision to make about *what* to run.
+2. **Inputs are fully determined.** Everything the script needs is
+   already in `input.json` (i.e., from upstream envelopes); no extra
+   context-reading, no "look around the project to figure it out".
+3. **Output is structured by the script itself.** The script writes a
+   well-formed envelope. No LLM is needed to *interpret* command output
+   into `data` fields.
+4. **Idempotent and side-effect-bounded.** Re-running it is safe; the
+   side effects are confined to a known location (a build dir, a
+   formatter overwriting files, etc.).
+5. **Cost or speed actually matters.** This step runs often enough, or
+   in a loop, that the LLM startup overhead (10–30s + tokens per spawn)
+   is meaningful.
+
+**If ANY of those don't hold → use a skill.** In particular, use a
+skill when:
+
+* The node needs to **read multiple files and reason** about them.
+* The node needs to **handle cases** ("try X, if it fails apply Y").
+* The node needs to **interpret stdout/stderr** into structured data.
+* The node needs to **integrate `workflow.context`** into its action
+  (e.g., "respect the conventions stated in context").
+* The output requires **synthesis** of more than what the script
+  literally prints.
+* You're unsure. **Default to skill.**
+
+A skill agent can always shell out via Bash, so anything a tool can
+do, a skill can do — slower and more expensive, but also more
+adaptable. The Planner's job is to pick the right one per node. See
+the workflow_designer SKILL.md for the operational rules it follows.
+
+### When NOT to use a tool node
+
+Anti-patterns — these are tool misuse and will be flagged by the
+verify-agent reviewing Planner's output:
+
+* "Tool that wraps a Python one-liner that imports json and post-processes
+  upstream output." → that's interpretation, use a skill.
+* "Tool that conditionally chooses between two commands based on
+  upstream data." → that's judgment, use a skill.
+* "Tool that runs `git status` and tries to decide if the working tree
+  is clean." → that's reading + reasoning, use a skill.
+* Stacking three tool nodes in a row to chain shell pipelines. → if it's
+  truly mechanical, write one tool that does the whole pipeline; if any
+  step needs interpretation, use a skill for the chain.
 
 ---
 
@@ -695,7 +750,8 @@ version: "1.1"
 
 context: |
   You are a multi-step planner. Given a user prompt, produce a workflow.yaml
-  that decomposes the task into a DAG of skill nodes, each with
+  that decomposes the task into a DAG of nodes (skills by default,
+  tools only for narrow mechanical cases — see §10), each with
   explicit goals, steps, dependencies, and verification.
   
   Output format MUST conform to camflow v1.1 spec (no inputs:, no run.input,
@@ -721,7 +777,7 @@ nodes:
     goal: "Design a DAG of nodes whose successful execution accomplishes the task"
     needs: [understand]
     steps:
-      - "Pick from available skills only (the strict registry)"
+      - "Pick a skill from the strict registry. Use a tool ONLY if all 5 §10 criteria hold; otherwise skill."
       - "Order them by dependency"
       - "Decide retry/verify for each — high-stakes work gets verify=agent or verify=command"
       - "Identify shared facts that should go in workflow.context"
@@ -774,7 +830,6 @@ Planner failure → camflow halts with the Planner's halt.json. User sees what P
 | `{{state.X}}` / `{{inputs.X}}` templates | Same as above. |
 | `state.X.default` | Workflow author doesn't pre-fill values. Anything constant goes in `workflow.context`. |
 | `run.input:` field | Upstream outputs are auto-injected; no per-node user input. |
-| `run.tool:` (entire executor type) | Run phase is skill-only. Mechanical work moves to `verify.command`. |
 | `camflow exec workflow.yaml` | No bypass of Planner. |
 | `camflow --validate` | No bypass of Planner. |
 | `agent.X` autonomous executor | Multi-step work goes into multi-node DAG. |
@@ -806,8 +861,8 @@ Planner failure → camflow halts with the Planner's halt.json. User sees what P
 10. **Runtime contract for envelope is enforced via prompt injection** — every agent gets the explicit shape, schema, and rules.
 11. **`camflow run` always invokes Planner.** No bypass. The CLI shape mirrors `camc run`.
 12. **Adding a verify type requires RFC.** Currently: agent (default), command, human.
-13. **Run phase is skill-only.** Every node has `run: { skill: <name> }`. No `run.tool:`, no `run.human:`. Adding a new run-phase executor type requires RFC.
-14. **Verify phase carries the deterministic gate.** `verify.command` (bash exit code) is the canonical place for "did the test pass / did the file parse / did the patch apply" checks. Don't try to fold these into run.
+13. **Skill is the default run executor.** `run.tool:` is allowed only when ALL FIVE hard criteria in §10 hold (known command + fully-determined inputs + script-structured output + idempotent + cost matters). When in doubt, use skill. Adding a new run-phase executor type beyond skill / tool requires RFC.
+14. **Verify phase carries the deterministic gate.** `verify.command` (bash exit code) is the canonical place for "did the test pass / did the file parse / did the patch apply" checks. Verify-side commands are unconstrained — they're already deterministic by design. The hard rules in #13 are about RUN-phase tools, not verify.
 15. **`verify: human` is opt-in.** Planner inserts it only when the user's prompt explicitly asks for review/approval. Workflows default to running end-to-end without human interaction.
 
 Breaking any of these without explicit reason is a regression.
@@ -869,10 +924,12 @@ nodes:
     goal: "Apply the patch and run pytest"
     needs: [propose_fix]
     steps:
-      - "Apply upstream.propose_fix.data.patch using the Bash + Edit tools"
-      - "Run python -m pytest from the project root"
-      - "Capture pass/fail and tests_run from pytest output"
-    run: { skill: test_runner }
+      - "Apply upstream.propose_fix.data.patch"
+      - "Run python -m pytest"
+      - "Capture pass/fail"
+    run: { tool: scripts/apply_and_test.sh }    # OK to use tool here:
+                                                 # known command, no judgment,
+                                                 # script writes envelope itself
     output_schema:
       passed: boolean
       tests_run: integer
@@ -881,11 +938,12 @@ nodes:
     retry: 1
 ```
 
-> Note the `run_tests` node: the **run** is a skill (`test_runner` —
-> the agent applies the patch and shells out to pytest using its Bash
-> tool), and the **verify** is a deterministic command (bash exit code
-> on the parsed envelope). This is the v1.1 split — skill does the
-> integration work, command is the pass/fail gate.
+> Note `run_tests` legitimately uses `run.tool:` — it's a known
+> command (apply patch + pytest), inputs are fully determined by
+> upstream, the script structures its own output, and the operation is
+> idempotent. All five §10 criteria hold. Compare to `diagnose` and
+> `propose_fix` which need code-reading and synthesis — those must be
+> skills.
 
 The user reviewed `render_yaml`'s output, typed `approve`. Runtime now executes this 3-node workflow:
 
