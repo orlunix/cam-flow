@@ -978,7 +978,8 @@ class Workflow:
     """
 
     def __init__(self, spec: dict, run_dir: Path,
-                 *, resume: bool = False):
+                 *, resume: bool = False,
+                 project_root: Optional[Path] = None):
         self.spec = spec
         self.run_dir = run_dir
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -1001,13 +1002,17 @@ class Workflow:
             if self.trace_path.exists():
                 self.step_n = sum(1 for _ in self.trace_path.open())
 
-        # project_root: the dir holding .camflow/.
-        parts = run_dir.resolve().parts
-        if ".camflow" in parts:
-            idx = parts.index(".camflow")
-            self.project_root = Path(*parts[:idx]) if idx > 0 else Path("/")
+        # project_root: explicit override (used by builtin Planner workflow)
+        # OR derived from run_dir's .camflow ancestor.
+        if project_root is not None:
+            self.project_root = project_root
         else:
-            self.project_root = Path.cwd().resolve()
+            parts = run_dir.resolve().parts
+            if ".camflow" in parts:
+                idx = parts.index(".camflow")
+                self.project_root = Path(*parts[:idx]) if idx > 0 else Path("/")
+            else:
+                self.project_root = Path.cwd().resolve()
 
         self.pid_path.write_text(str(os.getpid()))
 
@@ -1303,60 +1308,129 @@ def _result_to_exit(result: str) -> int:
     return {"done": 0, "halted": 2}.get(result, 1)
 
 
+def _builtin_planner_dir() -> Path:
+    """The builtin Planner workflow's directory."""
+    return _camflow_repo_root() / "builtin" / "planner"
+
+
 def _cmd_run(argv: list[str]) -> int:
+    """`camflow run "<prompt>"` — spawn Planner, execute its output."""
     p = argparse.ArgumentParser(
-        prog="camflow",
-        description="Run a workflow YAML (camflow v1.1).",
+        prog="camflow run",
+        description="Compile a prompt into a workflow via Planner, then run it.",
     )
-    p.add_argument("workflow", help="path to workflow YAML")
+    p.add_argument("prompt", nargs="?", default=None,
+                   help="natural-language task prompt (required)")
     p.add_argument("--run-dir", default=None,
-                   help="run directory (default: <project>/.camflow/run/)")
-    p.add_argument("--validate", action="store_true",
-                   help="validate the workflow and exit")
+                   help="run directory (default: ./.camflow/run/)")
     args = p.parse_args(argv)
 
-    wf = load_workflow(args.workflow)
-    project = Path(args.workflow).resolve().parent
-    errors = validate_workflow(wf, project_root=project)
-    if errors:
-        for e in errors:
-            print(f"ERROR: {e}", file=sys.stderr)
-        return 2
-    if args.validate:
-        print("workflow is valid")
-        return 0
+    if not args.prompt or not args.prompt.strip():
+        print("ERROR: camflow run requires a prompt.\n"
+              "Usage: camflow run \"<your task description>\"",
+              file=sys.stderr)
+        return 1
 
+    project = Path.cwd().resolve()
     if args.run_dir:
-        run_dir = Path(args.run_dir)
-        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = Path(args.run_dir).resolve()
     else:
         run_dir = default_run_dir(project)
+    run_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"run_dir: {run_dir}")
-    result = run_workflow(wf, run_dir)
-    print(f"result:  {result}")
+    # Persist the user's prompt at run-dir root for debug + resume.
+    (run_dir / "prompt.txt").write_text(args.prompt)
+
+    # ── Phase 1: run the Planner workflow ──────────────────────────────
+    planner_dir = _builtin_planner_dir()
+    planner_yaml = planner_dir / "workflow.yaml"
+    if not planner_yaml.exists():
+        print(f"ERROR: builtin Planner missing at {planner_yaml}",
+              file=sys.stderr)
+        return 1
+    planner_spec = yaml.safe_load(planner_yaml.read_text())
+
+    # Inject user prompt at the top of Planner's context.
+    base_ctx = planner_spec.get("context") or ""
+    planner_spec["context"] = (
+        f"# Original user prompt\n{args.prompt.strip()}\n\n"
+        f"---\n\n{base_ctx}"
+    )
+    errors = validate_workflow(planner_spec, project_root=planner_dir)
+    if errors:
+        for e in errors:
+            print(f"ERROR (Planner): {e}", file=sys.stderr)
+        return 1
+
+    planner_run_dir = run_dir / "planner"
+    print(f"compiling prompt via Planner → {planner_run_dir}", file=sys.stderr)
+    planner_wf = Workflow(planner_spec, planner_run_dir,
+                          project_root=planner_dir)
+    planner_wf.trace("workflow_started", run_id=planner_wf.run_id,
+                     role="planner")
+    try:
+        planner_result = planner_wf.execute_dag()
+    finally:
+        planner_wf.cleanup()
+
+    if planner_result != "done":
+        print(f"Planner halted ({planner_result}). See "
+              f"{planner_run_dir}/halt.json for details.", file=sys.stderr)
+        return _result_to_exit(planner_result)
+
+    # ── Phase 2: extract Planner's yaml_text and run it ────────────────
+    render_node = planner_wf.nodes_by_id.get("render_yaml")
+    if render_node is None or not render_node.output:
+        print("ERROR: Planner finished but produced no render_yaml output",
+              file=sys.stderr)
+        return 1
+    yaml_text = (render_node.output.get("data") or {}).get("yaml_text")
+    if not yaml_text:
+        print("ERROR: Planner's render_yaml output is missing yaml_text",
+              file=sys.stderr)
+        return 1
+
+    try:
+        user_spec = parse_workflow_yaml(yaml_text)
+    except WorkflowParseError as e:
+        print(f"ERROR: Planner produced invalid YAML: {e}", file=sys.stderr)
+        return 1
+
+    errors = validate_workflow(user_spec, project_root=project)
+    if errors:
+        for e in errors:
+            print(f"ERROR (compiled workflow): {e}", file=sys.stderr)
+        return 1
+
+    print(f"executing compiled workflow → {run_dir}", file=sys.stderr)
+    result = run_workflow(user_spec, run_dir)
+    print(f"result: {result}", file=sys.stderr)
     return _result_to_exit(result)
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(argv) if argv is not None else sys.argv[1:]
-    if not argv:
+    if not argv or argv[0] in ("-h", "--help"):
         print(
+            "camflow — prompt-driven, multi-agent workflow runner\n"
+            "\n"
             "Usage:\n"
-            "  camflow <workflow.yaml> [--run-dir DIR] [--validate]\n"
-            "  camflow resume <run_dir> [--feedback TEXT]\n"
+            "  camflow run \"<prompt>\"          compile + run a workflow\n"
+            "  camflow resume <run_dir>         resume a halted run\n"
             "\n"
             "Inspect a run:  cat .camflow/run/trace.jsonl\n"
             "Stop a run:     kill $(cat .camflow/run/runner.pid)\n",
             file=sys.stderr,
         )
-        return 2
+        return 2 if argv else 1
     cmd = argv[0]
+    if cmd == "run":
+        return _cmd_run(argv[1:])
     if cmd == "resume":
         return _cmd_resume(argv[1:])
-    if cmd in ("-h", "--help"):
-        return _cmd_run(argv)
-    return _cmd_run(argv)
+    print(f"ERROR: unknown subcommand '{cmd}'. "
+          f"Try `camflow --help`.", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

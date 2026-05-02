@@ -1,0 +1,60 @@
+workflow: bug_fix
+version: "1.1"
+
+# Reference: what Planner might produce for the prompt
+#   "Fix the TypeError on line 87 of foo.py: 'NoneType' has no attribute 'split'"
+
+context: |
+  Original task (from user):
+    Fix the TypeError on line 87 of foo.py: 'NoneType' has no attribute 'split'.
+
+  Run-constants:
+    - Codebase: src/ (Python). Tests: tests/ (pytest only).
+    - Target file: src/foo.py around line 87.
+
+nodes:
+  - id: diagnose
+    goal: "Identify the bug's root cause from the report"
+    steps:
+      - "Read foo.py around line 87 and surrounding context"
+      - "Identify which variable is None when 'split' is called"
+      - "Determine why that variable is None at that point"
+      - "Write a one-sentence root cause"
+    run:
+      skill: analyzer
+    output_schema:
+      root_cause: string
+      affected_location: string
+    retry: 2
+
+  - id: propose_fix
+    goal: "Write a minimal patch addressing the root cause"
+    needs: [diagnose]
+    steps:
+      - "Read upstream.diagnose.data.root_cause and affected_location"
+      - "Produce a unified-diff patch touching only the affected lines"
+      - "Provide a one-sentence explanation"
+    run:
+      skill: code_writer
+    output_schema:
+      patch: string
+      explanation: string
+    verify:
+      criterion: "patch directly addresses root_cause + minimal change"
+    retry: 3
+
+  - id: run_tests
+    goal: "Apply the patch and run pytest"
+    needs: [propose_fix]
+    steps:
+      - "Apply upstream.propose_fix.data.patch to the codebase"
+      - "Run python -m pytest"
+      - "Capture pass/fail"
+    run:
+      tool: scripts/apply_and_test.sh
+    output_schema:
+      passed: boolean
+      tests_run: integer
+    verify:
+      command: "test $(jq -r .data.passed agent_output.json) = 'true'"
+    retry: 1

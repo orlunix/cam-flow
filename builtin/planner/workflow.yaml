@@ -1,0 +1,79 @@
+workflow: planner
+version: "1.1"
+
+goal: |
+  Compile a user prompt into a camflow v1.1 workflow.yaml.
+  This builtin workflow is what `camflow run "<prompt>"` invokes.
+  The Planner's output (a workflow.yaml string) is then executed by
+  the runtime as a normal workflow.
+
+context: |
+  You are the camflow Planner — a self-hosted compiler that turns a
+  natural-language user task into a deterministic DAG of skill/tool
+  nodes, each with explicit goals, steps, dependencies, and
+  verification.
+
+  The user's original prompt is supplied to you (look at the
+  `# Workflow Context` block at the top of each node's prompt — the
+  runtime concatenates it there before this `context`).
+
+  Output format MUST conform to camflow v1.1 spec:
+    - no `state:` / `inputs:` section, no `run.input:` field
+    - cross-node data via `needs` (auto-injected)
+    - `workflow.context` for shared facts
+    - verify types: agent (default) | command | human
+
+nodes:
+  - id: understand
+    goal: "Parse the user prompt into a structured task statement"
+    steps:
+      - "Read the user's original prompt (top of this prompt's Workflow Context)"
+      - "Extract the explicit goal stated by the user"
+      - "Identify any constraints, preconditions, success criteria"
+      - "Note any ambiguities that may need user clarification later"
+    run:
+      skill: prompt_analyzer
+    output_schema:
+      task_statement: string
+      constraints: array
+      ambiguities: array
+    verify:
+      criterion: "task_statement faithfully covers what the user asked; constraints + ambiguities are accurate"
+    retry: 2
+
+  - id: design_dag
+    goal: "Design a DAG of skill/tool nodes that accomplishes the task"
+    needs: [understand]
+    steps:
+      - "Read the upstream understand envelope (auto-injected as upstream.understand)"
+      - "Pick existing skills (or tools) that map to natural decomposition steps"
+      - "Order the nodes by dependency via `needs`"
+      - "Decide retry/verify for each — default 1, bump for high-stakes generative work"
+      - "Identify run-constants that should go in workflow.context"
+    run:
+      skill: workflow_designer
+    output_schema:
+      dag: array
+      context: string
+    verify:
+      criterion: "DAG covers the task statement; needs are consistent (no orphan, no cycle); each node references a real skill or tool"
+    retry: 3
+
+  - id: render_yaml
+    goal: "Emit a syntactically valid + user-approved workflow.yaml"
+    needs: [design_dag]
+    steps:
+      - "Read upstream design_dag (auto-injected as upstream.design_dag)"
+      - "Serialize the DAG and context to YAML following spec v1.1"
+      - "Ensure yaml_text is a single string suitable for writing to workflow.yaml"
+      - "If the user rejected a previous attempt, follow previous.feedback"
+    run:
+      skill: yaml_writer
+    output_schema:
+      yaml_text: string
+    verify:
+      human: |
+        Review the proposed workflow.yaml below.
+        Type 'approve' to accept and have the runtime execute it.
+        Otherwise, describe what to change.
+    retry: 5
