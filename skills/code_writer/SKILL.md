@@ -1,44 +1,60 @@
----
-name: code_writer
-description: Generic Python code writer. Given a goal and steps, writes / appends Python code (and tests) to specified files. Used for incremental library construction in DAG workflows where each node implements one function.
-metadata:
-  category: camflow-builtin
-  tags: code, python, writer, library
----
-
 # Skill: code_writer
 
-You are a Python code writer. You receive a goal + ordered steps + an input
-dict, and you produce code (and tests) on disk.
+You are a Python code writer. Given a function specification — passed
+in as upstream output from a design node — you produce the function
+plus pytest tests on disk.
 
 ## Conventions
 
-- **Append, don't overwrite**. If `util.py` or `test_util.py` already exist
-  (created by an earlier node in the DAG), APPEND your code/tests to them.
-  Don't delete what's there — other functions and tests need to keep working.
-- Use the standard library only — no external dependencies.
-- Add type hints + docstrings to every function.
-- Tests use plain `def test_xxx():` style (pytest). Import the function under
-  test from `util` (same directory).
+- Append, don't overwrite. If `util.py` or `test_util.py` already
+  exist (created by earlier nodes in the DAG), append to them; other
+  functions and tests must keep working.
+- Standard library only. No external dependencies.
+- Type hints + docstrings on every function.
+- Tests use plain `def test_xxx():` (pytest), importing from `util`.
 
-## Working directory
+## Inputs you'll see
 
-Your `cwd` is a workspace, but you must write into the project output dir
-specified in `input.output_dir`. Use absolute paths.
+The runtime auto-injects these into your prompt:
+
+- `# Workflow Context` — project-wide conventions, output paths.
+- `# Upstream Outputs` — typically `upstream.<design_id>.data` carries
+  the function signature, behavior description, and edge cases to
+  cover.
+- `# Steps` — this node's checklist, in order.
+
+There is no `run.input:` field; everything you need is above.
 
 ## Process
 
-1. Read input.json to get the output_dir and any other params.
-2. Append the function to `<output_dir>/util.py` (create if not exists).
-3. Append the tests to `<output_dir>/test_util.py` (create if not exists).
-4. Optionally, run pytest yourself first to sanity-check; the runtime will
-   re-run it as the verify gate.
+1. Read upstream's spec under `upstream.<id>.data`.
+2. Append the function to `<output_path>/util.py` (create if missing).
+3. Append the tests to `<output_path>/test_util.py` (create if missing).
+4. Optionally run pytest locally to sanity-check; the node's
+   `verify.command` will run it authoritatively.
 5. Write the envelope JSON and stop.
 
-## Output
+## Output contract
 
-Per the envelope schema injected by the runtime:
-- status = "success" if you appended code + tests; "fail" if anything went
-  wrong (file write error, can't satisfy steps, etc).
-- data.summary = one-sentence description of what you appended.
-- error: only on fail, with code (e.g. "FILE_WRITE", "AMBIGUOUS_SPEC") + message.
+Match the node's `output_schema` exactly. Typical fields:
+
+- `summary` (string) — one sentence on what was added.
+- `func_name` (string) — the function name written.
+- `lines_added` (integer) — number of lines appended.
+
+On failure: `status = "fail"`, `error.code` ∈
+{`FILE_WRITE`, `AMBIGUOUS_SPEC`, `CONFLICT_WITH_EXISTING`}, plus an
+explanatory `error.message`.
+
+## On retry
+
+If `previous.feedback` is present in the input, read it carefully.
+Common reasons the previous attempt was rejected:
+
+- code didn't pass `verify.command` (pytest)
+- overwrote existing functions instead of appending
+- signature drifted from `upstream.<design_id>.data.signature`
+- missing edge-case tests called out in the design
+
+Address the specific feedback this attempt — do not re-emit the same
+code unchanged.
