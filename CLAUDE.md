@@ -96,6 +96,12 @@ Highlights of the v1.1 spec to keep top-of-mind:
   halted node's last-envelope `feedback` field — surfaces as
   `previous.feedback` on the next attempt, same channel as
   agent-rejected retries. See spec §13 for full semantics.
+- **`--steps N` is the debug breakpoint.** Both `run` and `resume`
+  accept `--steps N` (N ≥ 1) — halt cleanly after N node-attempts.
+  The halt is `kind="breakpoint"` (not `"halt"`); downstream nodes
+  stay pristine; resume picks up without resetting state. Built on
+  the existing halt+resume infrastructure, no new lifecycle states.
+  See spec §14.
 
 ## Project layout
 

@@ -886,3 +886,144 @@ fi
         # Only 1 attempt — request_human skipped retry
         attempts = list((rd / "nodes" / "n").iterdir())
         assert len(attempts) == 1
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  TestStepping — --steps N debug breakpoints
+# ───────────────────────────────────────────────────────────────────────
+
+class TestStepping:
+    """`--steps N` halts cleanly with kind=breakpoint after N attempts;
+    `camflow resume` continues without resetting node state or bumping
+    retry_max (since the node didn't actually fail)."""
+
+    def _setup_three_node_proj(self, tmp_path: Path) -> Path:
+        proj = tmp_path / "proj"
+        scripts = proj / "scripts"
+        scripts.mkdir(parents=True)
+        for i, name in enumerate(["a", "b", "c"], start=1):
+            make_executable_tool(
+                scripts / f"{name}.sh",
+                envelope_tool_body({"step": i}),
+            )
+        return proj
+
+    def _three_seq_workflow(self) -> dict:
+        return {
+            "workflow": "step_demo", "version": "1.0",
+            "nodes": [
+                {"id": "a", "goal": "first", "steps": ["s"],
+                 "run": {"tool": "scripts/a.sh"},
+                 "output_schema": {"step": "integer"},
+                 "verify": {"command": "true"}},
+                {"id": "b", "goal": "second", "steps": ["s"],
+                 "needs": ["a"],
+                 "run": {"tool": "scripts/b.sh"},
+                 "output_schema": {"step": "integer"},
+                 "verify": {"command": "true"}},
+                {"id": "c", "goal": "third", "steps": ["s"],
+                 "needs": ["b"],
+                 "run": {"tool": "scripts/c.sh"},
+                 "output_schema": {"step": "integer"},
+                 "verify": {"command": "true"}},
+            ],
+        }
+
+    def test_steps_halts_cleanly(self, tmp_path):
+        from runner_v2.runtime import run_workflow
+        proj = self._setup_three_node_proj(tmp_path)
+        wf = self._three_seq_workflow()
+        rd = proj / ".camflow" / "run"
+        result = run_workflow(wf, rd, max_attempts=1)
+        assert result == "halted"
+
+        halt = json.loads((rd / "halt.json").read_text())
+        assert halt["kind"] == "breakpoint"
+        assert halt["halted_node"] == "a"
+        assert "step limit" in halt["reason"]
+
+        # Only the first node ran
+        assert (rd / "nodes" / "a" / "attempt-1" / "output.json").exists()
+        assert not (rd / "nodes" / "b").exists()
+        assert not (rd / "nodes" / "c").exists()
+
+    def test_steps_propagate_fail_false(self, tmp_path):
+        """Step halt must NOT mark downstream nodes as done+fail."""
+        from runner_v2.runtime import Workflow, run_workflow
+        proj = self._setup_three_node_proj(tmp_path)
+        wf_dict = self._three_seq_workflow()
+        rd = proj / ".camflow" / "run"
+        run_workflow(wf_dict, rd, max_attempts=1)
+
+        # Re-load to inspect what got persisted: downstream nodes
+        # should have NO attempt directories (step halt didn't fake-fail
+        # them like a real halt would).
+        assert not (rd / "nodes" / "b").exists()
+        assert not (rd / "nodes" / "c").exists()
+
+    def test_resume_after_step_halt_continues(self, tmp_path, monkeypatch):
+        """After --steps halt, resume runs to completion."""
+        from runner_v2.runtime import run_workflow, _cmd_resume
+        proj = self._setup_three_node_proj(tmp_path)
+        wf = self._three_seq_workflow()
+        rd = proj / ".camflow" / "run"
+        run_workflow(wf, rd, max_attempts=1)
+        assert (rd / "halt.json").exists()
+
+        # Now resume — should run the remaining 2 nodes
+        rc = _cmd_resume([str(rd)])
+        assert rc == 0
+        for nid in ("a", "b", "c"):
+            assert (rd / "nodes" / nid / "attempt-1" / "output.json").exists()
+        assert not (rd / "halt.json").exists()  # cleared
+
+    def test_resume_with_more_steps(self, tmp_path):
+        """Resume --steps 1 advances exactly 1 more node, then halts again."""
+        from runner_v2.runtime import run_workflow, _cmd_resume
+        proj = self._setup_three_node_proj(tmp_path)
+        wf = self._three_seq_workflow()
+        rd = proj / ".camflow" / "run"
+
+        # Step 1: run node a
+        run_workflow(wf, rd, max_attempts=1)
+        # Step 2: resume, advance node b only
+        rc = _cmd_resume([str(rd), "--steps", "1"])
+        assert rc == 2  # halted (step limit)
+        assert (rd / "halt.json").exists()
+        assert (rd / "nodes" / "b" / "attempt-1" / "output.json").exists()
+        assert not (rd / "nodes" / "c").exists()
+        # Step 3: resume to end
+        rc = _cmd_resume([str(rd)])
+        assert rc == 0
+        assert (rd / "nodes" / "c" / "attempt-1" / "output.json").exists()
+
+    def test_steps_count_includes_retries(self, tmp_path):
+        """--steps counts attempts, not nodes — retries also tick the counter."""
+        from runner_v2.runtime import run_workflow
+        proj = tmp_path / "proj"
+        scripts = proj / "scripts"
+        scripts.mkdir(parents=True)
+        # Tool that always fails — will retry up to retry_max
+        make_executable_tool(
+            scripts / "flaky.sh",
+            'echo \'{"status":"fail","data":{},'
+            '"error":{"code":"E","message":"nope"},'
+            '"feedback":null,"request_human":false}\'\n',
+        )
+        wf = {
+            "workflow": "retries", "version": "1.0",
+            "nodes": [{
+                "id": "x", "goal": "g", "steps": ["s"],
+                "run": {"tool": "scripts/flaky.sh"},
+                "retry": 5,  # plenty of retry budget
+            }],
+        }
+        rd = proj / ".camflow" / "run"
+        # Halt after 2 attempts. The node fails twice (retry 1) then we step-halt.
+        result = run_workflow(wf, rd, max_attempts=2)
+        assert result == "halted"
+        halt = json.loads((rd / "halt.json").read_text())
+        assert halt["kind"] == "breakpoint"
+        # 2 attempts on disk
+        attempts = sorted((rd / "nodes" / "x").iterdir())
+        assert len(attempts) == 2

@@ -1061,40 +1061,60 @@ class Workflow:
 
     # ─── Halt + cleanup ───────────────────────────────────────────────
 
-    def halt(self, halted_node: Node, reason: str, envelope: dict) -> None:
-        """Trip the workflow-level halted state + write halt.json."""
+    def halt(self, halted_node: Node, reason: str, envelope: dict,
+             *, propagate_fail: bool = True) -> None:
+        """Trip the workflow-level halted state + write halt.json.
+
+        propagate_fail=True (default): real halt — every not-yet-done
+        node gets marked done+fail (so downstream is consistent in the
+        trace). Used by retry-exhausted, request_human, deadlock, etc.
+
+        propagate_fail=False: soft halt — used for `--steps N`
+        breakpoints. Other nodes keep their state (waiting / done /
+        running) so resume continues seamlessly. halt.json carries
+        kind="breakpoint" so resume knows not to bump retry_max.
+        """
+        kind = "halt" if propagate_fail else "breakpoint"
         halt_info = {
             "halted_node": halted_node.id,
             "retry_count": halted_node.retry_count,
             "reason": reason,
             "envelope": envelope,
             "trace_step": self.step_n + 1,
+            "kind": kind,
         }
         (self.run_dir / "halt.json").write_text(
             json.dumps(halt_info, indent=2, ensure_ascii=False)
         )
-        # Mark all not-yet-run nodes as done+fail (so trace is consistent;
-        # downstream "skipped" is implicit — they just never executed).
-        for n in self.nodes_by_id.values():
-            if not n.is_done():
-                n.lifecycle = "done"
-                n.result = "fail"
-                n.output = empty_envelope(
-                    "fail",
-                    error={"code": "UPSTREAM_HALTED",
-                           "message": f"halted by '{halted_node.id}'"},
-                )
-        self.trace("workflow_halted", node=halted_node.id, reason=reason)
+        if propagate_fail:
+            for n in self.nodes_by_id.values():
+                if not n.is_done():
+                    n.lifecycle = "done"
+                    n.result = "fail"
+                    n.output = empty_envelope(
+                        "fail",
+                        error={"code": "UPSTREAM_HALTED",
+                               "message": f"halted by '{halted_node.id}'"},
+                    )
+        event = "workflow_halted" if propagate_fail else "workflow_paused"
+        self.trace(event, node=halted_node.id, reason=reason)
         self.lifecycle = "halted"
 
     # ─── DAG execution (the scheduler — Workflow's only behavior) ─────
 
-    def execute_dag(self) -> str:
+    def execute_dag(self, *, max_attempts: Optional[int] = None) -> str:
         """Schedule and run all nodes. Returns 'done' or 'halted'.
 
         Workflow doesn't run() or verify() — it picks ready nodes and
         delegates each attempt to Node.execute_attempt().
+
+        max_attempts: if given, halt cleanly (kind="breakpoint") after
+        that many node-attempts complete. Counts each
+        Node.execute_attempt() call, so retries also count. Resume
+        continues from where the step-halt left off without resetting
+        the halted node's state.
         """
+        attempts_run = 0
         while self.lifecycle == "running":
             ready = self.ready_nodes()
             if not ready:
@@ -1124,6 +1144,7 @@ class Workflow:
 
             attempt_n = node.retry_count + 1
             envelope = node.execute_attempt(self, attempt_n)
+            attempts_run += 1
 
             # Explicit human-handoff request → halt immediately, skip retry.
             if envelope.get("request_human"):
@@ -1137,6 +1158,11 @@ class Workflow:
             if envelope["status"] == "success":
                 node.lifecycle = "done"
                 node.result = "success"
+                if max_attempts is not None and attempts_run >= max_attempts:
+                    self.halt(node,
+                              f"step limit reached ({max_attempts} attempts)",
+                              envelope, propagate_fail=False)
+                    return "halted"
                 continue
 
             # status = fail. Decide: retry or halt.
@@ -1146,6 +1172,11 @@ class Workflow:
                            retry_count=node.retry_count,
                            retry_max=node.retry_max,
                            reason=(envelope.get("error") or {}).get("message", "?"))
+                if max_attempts is not None and attempts_run >= max_attempts:
+                    self.halt(node,
+                              f"step limit reached ({max_attempts} attempts)",
+                              envelope, propagate_fail=False)
+                    return "halted"
                 # node.lifecycle stays "running"; loop picks it again next iter.
                 continue
 
@@ -1194,18 +1225,22 @@ class Workflow:
 # ═══════════════════════════════════════════════════════════════════════
 
 def run_workflow(workflow: dict, run_dir: Path,
-                 *, resume_with_run: Optional["Workflow"] = None) -> str:
+                 *, resume_with_run: Optional["Workflow"] = None,
+                 max_attempts: Optional[int] = None) -> str:
     """Execute a workflow → return final lifecycle state ('done' or 'halted').
 
     `resume_with_run` is for the resume command — caller pre-builds a
     Workflow with prior attempts replayed.
+
+    `max_attempts` (debug): halt cleanly after that many node-attempts
+    via a breakpoint-kind halt. Resume continues from there.
     """
     wf = resume_with_run if resume_with_run is not None else \
         Workflow(workflow, run_dir)
     if resume_with_run is None:
         wf.trace("workflow_started", run_id=wf.run_id)
     try:
-        return wf.execute_dag()
+        return wf.execute_dag(max_attempts=max_attempts)
     finally:
         wf.cleanup()
 
@@ -1243,7 +1278,12 @@ def _cmd_resume(argv: list[str]) -> int:
     p.add_argument("run_dir")
     p.add_argument("--feedback", default="",
                    help="extra feedback injected into halted node's input.previous.feedback")
+    p.add_argument("--steps", type=int, default=None,
+                   help="(debug) advance only N node-attempts, then halt again")
     args = p.parse_args(argv)
+    if args.steps is not None and args.steps < 1:
+        print("ERROR: --steps must be >= 1", file=sys.stderr)
+        return 1
 
     rd = Path(args.run_dir)
     halt_path = rd / "halt.json"
@@ -1265,7 +1305,8 @@ def _cmd_resume(argv: list[str]) -> int:
         last = node.history[-1]
         node.output = last
         node.retry_count = len(nrec["attempts"]) - 1
-        # Resumed-from node will reset to running below; others stay done.
+        # Resumed-from node will reset to running below (real-halt path);
+        # others stay done.
         if last.get("status") == "success":
             node.lifecycle = "done"
             node.result = "success"
@@ -1273,29 +1314,43 @@ def _cmd_resume(argv: list[str]) -> int:
             node.lifecycle = "done"
             node.result = "fail"
 
-    # Reset the halted node so it gets re-executed; bump retry budget by 1
-    # so resume actually has a try.
     halted_id = halt_info["halted_node"]
-    node = wf.nodes_by_id[halted_id]
-    node.lifecycle = "waiting"
-    node.result = None
-    if args.feedback:
-        # Splice user-provided feedback into the last envelope so it
-        # appears in input.previous.feedback on next attempt.
-        if node.history:
-            node.history[-1] = {**node.history[-1], "feedback": args.feedback}
-            node.output = node.history[-1]
-    # Allow at least one more attempt past retry_max from before.
-    node.retry_max = max(node.retry_max + 1, node.retry_count + 1)
-    wf.lifecycle = "running"
+    is_breakpoint = halt_info.get("kind") == "breakpoint"
 
+    if is_breakpoint:
+        # Step / breakpoint halt — node states on disk are correct as-is.
+        # No reset, no retry_max bump, no feedback splice (the node
+        # didn't fail; it was paused).
+        if args.feedback:
+            print("WARNING: --feedback ignored on breakpoint resume "
+                  "(no failed attempt to inject into).", file=sys.stderr)
+    else:
+        # Real halt — reset the halted node so it gets re-executed; bump
+        # retry budget by 1 so resume actually has a try.
+        node = wf.nodes_by_id[halted_id]
+        node.lifecycle = "waiting"
+        node.result = None
+        if args.feedback:
+            # Splice user-provided feedback into the last envelope so it
+            # appears in input.previous.feedback on next attempt.
+            if node.history:
+                node.history[-1] = {**node.history[-1],
+                                    "feedback": args.feedback}
+                node.output = node.history[-1]
+        # Allow at least one more attempt past retry_max from before.
+        node.retry_max = max(node.retry_max + 1, node.retry_count + 1)
+
+    wf.lifecycle = "running"
     halt_path.unlink()  # clear; if it halts again, we'll write fresh
     wf.trace("workflow_resumed", node=halted_id,
-             retry_count=node.retry_count,
-             feedback_len=len(args.feedback))
+             retry_count=wf.nodes_by_id[halted_id].retry_count,
+             feedback_len=len(args.feedback),
+             from_breakpoint=is_breakpoint)
 
-    print(f"resuming {halted_id}", file=sys.stderr)
-    result = run_workflow(workflow, rd, resume_with_run=wf)
+    print(f"resuming {halted_id}{' (breakpoint)' if is_breakpoint else ''}",
+          file=sys.stderr)
+    result = run_workflow(workflow, rd, resume_with_run=wf,
+                          max_attempts=args.steps)
     print(f"result:  {result}", file=sys.stderr)
     return _result_to_exit(result)
 
@@ -1324,9 +1379,15 @@ def _cmd_run(argv: list[str]) -> int:
     p.add_argument("-i", "--interactive", action="store_true",
                    help="pause after Planner compiles, let you approve "
                         "(or revise) the workflow.yaml before execution")
+    p.add_argument("--steps", type=int, default=None,
+                   help="(debug) halt cleanly after N node-attempts; "
+                        "use `camflow resume` to continue or step further")
     p.add_argument("--run-dir", default=None,
                    help="run directory (default: ./.camflow/run/)")
     args = p.parse_args(argv)
+    if args.steps is not None and args.steps < 1:
+        print("ERROR: --steps must be >= 1", file=sys.stderr)
+        return 1
 
     if not args.prompt or not args.prompt.strip():
         print("ERROR: camflow run requires a prompt.\n"
@@ -1425,7 +1486,7 @@ def _cmd_run(argv: list[str]) -> int:
         return 1
 
     print(f"executing compiled workflow → {run_dir}", file=sys.stderr)
-    result = run_workflow(user_spec, run_dir)
+    result = run_workflow(user_spec, run_dir, max_attempts=args.steps)
     print(f"result: {result}", file=sys.stderr)
     return _result_to_exit(result)
 
@@ -1439,7 +1500,9 @@ def main(argv: list[str] | None = None) -> int:
             "Usage:\n"
             "  camflow run \"<prompt>\"          compile + run (fire-and-forget)\n"
             "  camflow run -i \"<prompt>\"       compile + pause for plan approval, then run\n"
+            "  camflow run --steps N \"<...>\"   (debug) halt after N node-attempts\n"
             "  camflow resume <run_dir>         resume a halted run\n"
+            "  camflow resume <run_dir> --steps N  resume but advance only N more attempts\n"
             "\n"
             "Inspect a run:  cat .camflow/run/trace.jsonl\n"
             "Stop a run:     kill $(cat .camflow/run/runner.pid)\n",

@@ -806,17 +806,20 @@ The Planner sub-directory makes Planner's own execution **fully inspectable as j
 ## 12. CLI
 
 ```
-camflow run "<prompt>"           # fire-and-forget: Planner compiles, runtime executes
-camflow run -i "<prompt>"        # interactive: pause for plan approval before execution
-camflow resume <run_dir>         # resume a halted run
+camflow run "<prompt>"               # fire-and-forget: Planner compiles, runtime executes
+camflow run -i "<prompt>"            # interactive: pause for plan approval before execution
+camflow run --steps N "<prompt>"     # debug: halt after N node-attempts
+camflow resume <run_dir>             # resume a halted run
+camflow resume <run_dir> --steps N   # resume but advance only N more attempts
 ```
 
 | command | behavior | exit codes |
 |---|---|---|
 | `run "<prompt>"` | mandatory prompt; runs Planner → executes generated workflow.yaml | 0 done / 1 invocation error / 2 halted |
 | `run -i "<prompt>"` | same, plus a plan-approval gate after Planner finishes (see §9) | 0 / 1 / 2 |
+| `run --steps N "<prompt>"` | runs but halts after N node-attempts (debug breakpoint, see §14). | 0 / 1 / 2 |
 | `run` (no prompt) | print error and exit | 1 |
-| `resume <run_dir> [--feedback "<text>"]` | resume a halted run; one more attempt for the halted node, optional human feedback. See §13 for full semantics. | 0 / 1 / 2 |
+| `resume <run_dir> [--feedback "<text>"] [--steps N]` | resume a halted run. See §13 for full semantics. | 0 / 1 / 2 |
 
 `-i` / `--interactive` patches Planner's `render_yaml` node at startup
 to require human approval of the compiled `workflow.yaml`. Without
@@ -966,7 +969,129 @@ post-mortem analysis without extra tooling.
 
 ---
 
-## 14. The builtin Planner workflow
+## 14. Debugging (`--steps N` breakpoints)
+
+For debugging, both `camflow run` and `camflow resume` accept an
+optional `--steps N` flag (N ≥ 1) that halts the workflow cleanly
+after N node-attempts have completed. This is camflow's debug
+breakpoint — useful for inspecting state mid-flow without burning
+through the whole DAG.
+
+```bash
+camflow run --steps 1 "<prompt>"           # halt after 1st node-attempt
+camflow resume <run_dir> --steps 1         # advance one more attempt, halt again
+camflow resume <run_dir> --steps 5         # advance up to 5, halt if not yet done
+camflow resume <run_dir>                   # no --steps → run to natural completion
+```
+
+Typical single-step session:
+
+```bash
+$ camflow run --steps 1 "fix the bug in foo.py"
+# Planner compiles, runtime halts after first user-workflow node attempt
+$ ls .camflow/run/nodes/             # inspect what happened
+$ cat .camflow/run/halt.json         # kind: "breakpoint"
+$ camflow resume .camflow/run --steps 1     # next step
+$ ...                                # iterate
+$ camflow resume .camflow/run        # finally, run to end
+```
+
+### Halt artifacts
+
+Step halts and real halts both write `halt.json`, but they're
+clearly distinguishable:
+
+| field | step halt | real halt |
+|---|---|---|
+| `kind` | `"breakpoint"` | `"halt"` |
+| `reason` | `"step limit reached (N attempts)"` | retry exhausted / request_human / deadlock / verify-fail |
+| trace event | `workflow_paused` | `workflow_halted` |
+| downstream nodes | **untouched** (still `waiting` / not yet executed) | **marked `done+fail`** with `error.code = "UPSTREAM_HALTED"` |
+
+The downstream-untouched property is crucial: it's what makes
+resume-after-step seamless. If step halts propagated fail like real
+halts do, resume would refuse to run the downstream nodes (they'd be
+`done+fail`). The runtime `Workflow.halt(propagate_fail=False)` keeps
+those nodes pristine.
+
+### How `resume` treats a step halt differently
+
+When `halt.json["kind"] == "breakpoint"`, `_cmd_resume`:
+
+* **Does NOT reset the halted node to `waiting`.** A step-halted node
+  most commonly succeeded — re-running it would be wrong.
+* **Does NOT bump `retry_max += 1`.** That bump exists to give a
+  failed node one more shot; a step-halted node didn't fail.
+* **Silently ignores `--feedback`** (with a stderr warning) since
+  there's no failed attempt envelope to inject feedback into.
+
+The `_cmd_resume` body is identical otherwise: replay history from
+disk, set `lifecycle = "running"`, delete `halt.json`, re-enter
+`execute_dag()`.
+
+### What counts as one step
+
+One `Node.execute_attempt()` call. So:
+
+* A node that succeeds first try = **1 step**.
+* A node that fails + retries 2 times before succeeding = **3 steps**.
+* A node that exhausts `retry_max` = **`retry_max + 1` steps**, then
+  halts naturally (`--steps` is a no-op on top of natural halt;
+  whichever fires first wins).
+
+Pick `--steps` values accordingly: usually `--steps 1` for true
+single-step, larger N when you've inspected and want to skip ahead
+to the next interesting point.
+
+### What `--steps` does NOT do
+
+* Doesn't reset or modify any node state. Pure read-then-pause.
+* Doesn't change Planner behavior — Planner always runs to completion
+  before user-workflow execution starts. `--steps` only counts
+  attempts in the **user workflow** (the compiled DAG), not Planner's
+  internal nodes.
+* Doesn't combine with `-i`. They're orthogonal: `-i` gates plan
+  approval (before user workflow execution), `--steps` gates each
+  attempt within user-workflow execution. You can use both:
+  `camflow run -i --steps 1 "<prompt>"` first asks for plan approval,
+  then runs only the first user-node attempt.
+* Doesn't alter `retry_max` or any node-level config — it's purely a
+  runtime instrumentation knob.
+
+### What to inspect during a pause
+
+The `<run_dir>` is just files; everything is plainly readable:
+
+```bash
+cat <run_dir>/trace.jsonl                                          # event stream
+cat <run_dir>/halt.json                                            # why we paused
+cat <run_dir>/nodes/<id>/attempt-N/prompt.txt                      # what the agent saw
+cat <run_dir>/nodes/<id>/attempt-N/agent_output.json               # what it wrote
+cat <run_dir>/nodes/<id>/attempt-N/output.json                     # what runtime validated
+cat <run_dir>/nodes/<id>/attempt-N/verify-N/agent_output.json      # verify-agent reasoning
+```
+
+There is no `camflow inspect` subcommand because there doesn't need
+to be — these files are designed to be readable. If a future use case
+warrants pretty-formatting, that's a `camflow inspect` candidate;
+v1.1 doesn't ship it.
+
+### Implementation note
+
+`--steps` is built purely on the existing halt+resume infrastructure:
+
+* `Workflow.execute_dag(max_attempts=None)` accepts an optional limit.
+* `Workflow.halt(..., propagate_fail=False)` writes a breakpoint-kind
+  halt without touching downstream nodes.
+* `_cmd_resume` branches on `halt.json["kind"]` to skip the
+  retry-bump path.
+
+No new lifecycle states, no new subcommands, no new envelope fields.
+The whole feature is ~30 lines of runtime change + 5 tests.
+
+---
+
+## 15. The builtin Planner workflow
 
 Lives at `camflow/builtin/planner/`:
 
@@ -1057,7 +1182,7 @@ Planner failure → camflow halts with the Planner's halt.json. User sees what P
 
 ---
 
-## 15. Reserved / forbidden in v1.1
+## 16. Reserved / forbidden in v1.1
 
 | Cut | Why |
 |---|---|
@@ -1084,7 +1209,7 @@ Planner failure → camflow halts with the Planner's halt.json. User sees what P
 
 ---
 
-## 16. Doctrine (rules for changing this spec)
+## 17. Doctrine (rules for changing this spec)
 
 1. **Two classes only: `Workflow` and `Node`.** No third runtime class.
 2. **Workflow doesn't run or verify.** It only schedules.
