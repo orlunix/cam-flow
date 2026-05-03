@@ -1358,12 +1358,44 @@ def _cmd_resume(argv: list[str]) -> int:
     is_breakpoint = halt_info.get("kind") == "breakpoint"
 
     if is_breakpoint:
-        # Step / breakpoint halt — node states on disk are correct as-is.
-        # No reset, no retry_max bump, no feedback splice (the node
-        # didn't fail; it was paused).
-        if args.feedback:
-            print("WARNING: --feedback ignored on breakpoint resume "
-                  "(no failed attempt to inject into).", file=sys.stderr)
+        # Step / breakpoint halt. The naive replay above sets the
+        # halted node to lifecycle="done", result="fail" if its last
+        # envelope is fail — but a breakpoint can fire AFTER a failed
+        # attempt with retry budget remaining (i.e., retry_triggered
+        # already incremented retry_count, but the next attempt didn't
+        # run because we paused). In that mid-retry case the node is
+        # NOT really done — restore it to lifecycle="waiting" so the
+        # scheduler picks it up.
+        #
+        # Detection: halt.json captured retry_count AT halt time. If
+        # that's higher than what we'd deduce from on-disk attempts
+        # (len(history) - 1), retry_triggered fired and we're paused
+        # mid-retry.
+        halted_node = wf.nodes_by_id.get(halted_id)
+        halt_rc = int(halt_info.get("retry_count", 0))
+        deduced_rc = (len(halted_node.history) - 1) if (
+            halted_node and halted_node.history
+        ) else 0
+        is_mid_retry = (halted_node is not None
+                        and halted_node.history
+                        and halt_rc > deduced_rc)
+        if is_mid_retry:
+            halted_node.lifecycle = "waiting"
+            halted_node.result = None
+            halted_node.retry_count = halt_rc
+            if args.feedback:
+                halted_node.history[-1] = {
+                    **halted_node.history[-1],
+                    "feedback": args.feedback,
+                }
+                halted_node.output = halted_node.history[-1]
+        else:
+            # Breakpoint after a successful attempt (or before first
+            # attempt). Node states on disk are correct as-is.
+            if args.feedback:
+                print("WARNING: --feedback ignored on breakpoint resume "
+                      "(no in-flight failed attempt to inject into).",
+                      file=sys.stderr)
     else:
         # Real halt — reset the halted node so it gets re-executed; bump
         # retry budget by 1 so resume actually has a try.
@@ -1575,7 +1607,13 @@ def _cmd_run(argv: list[str]) -> int:
     project = Path.cwd().resolve()
     if args.run_dir:
         run_dir = Path(args.run_dir).resolve()
+    elif args.from_node:
+        # Rerun mode default: use existing ./.camflow/run/ directly.
+        # Do NOT call default_run_dir() — that archives the prior run,
+        # which is exactly the data we need to operate on.
+        run_dir = project / ".camflow" / RUN_DIRNAME
     else:
+        # Fresh-run default: archive any prior run, get a clean dir.
         run_dir = default_run_dir(project)
 
     # ── Rerun mode ─────────────────────────────────────────────────────

@@ -1055,16 +1055,28 @@ those nodes pristine.
 
 When `halt.json["kind"] == "breakpoint"`, `_cmd_resume`:
 
-* **Does NOT reset the halted node to `waiting`.** A step-halted node
-  most commonly succeeded — re-running it would be wrong.
-* **Does NOT bump `retry_max += 1`.** That bump exists to give a
-  failed node one more shot; a step-halted node didn't fail.
-* **Silently ignores `--feedback`** (with a stderr warning) since
-  there's no failed attempt envelope to inject feedback into.
+* **Generally does NOT reset the halted node to `waiting`** — the
+  step-halt may have fired right after a successful attempt, in which
+  case the node is correctly `done+success` and should not re-run.
+* **Does NOT bump `retry_max += 1`** — the node didn't truly fail.
+* Detects an important sub-case: **mid-retry pause**. If the
+  breakpoint fired immediately after a *failed* attempt that still
+  had retry budget left (`retry_triggered` already incremented
+  `retry_count`, but the next attempt didn't run because we paused),
+  the on-disk last-envelope is fail but the node is NOT done. Resume
+  detects this by comparing `halt.json["retry_count"]` against
+  `len(history) - 1`; if the halt-time count is higher, retry was
+  triggered but didn't yet run, so resume sets `lifecycle = "waiting"`
+  and `retry_count = halt_rc` so the scheduler picks the node up
+  again. `--feedback` IS honored in this case (same channel as a
+  real-halt resume — splices into `history[-1].feedback`).
+* For breakpoints that fired after a success or before any attempt,
+  `--feedback` is ignored with a stderr warning (no in-flight failed
+  attempt to inject into).
 
-The `_cmd_resume` body is identical otherwise: replay history from
-disk, set `lifecycle = "running"`, delete `halt.json`, re-enter
-`execute_dag()`.
+The `_cmd_resume` body is otherwise identical: replay history from
+disk, set `workflow.lifecycle = "running"`, delete `halt.json`,
+re-enter `execute_dag()`.
 
 ### What counts as one step
 
@@ -1125,6 +1137,11 @@ camflow run --from <node_id> [--run-dir <path>] [--feedback "<text>"] [--steps N
 `--run-dir` defaults to `./.camflow/run/`. The presence of `--from`
 (without a prompt) tells `run` to operate on the existing run dir
 instead of compiling a fresh one.
+
+> **Important:** with `--from`, the runtime does NOT archive the
+> existing run dir. Archiving is only done by fresh-prompt runs
+> (which need a clean slate). `--from` operates in-place — that's
+> the data it needs to work with.
 
 Use cases:
 

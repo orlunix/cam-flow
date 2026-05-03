@@ -1174,3 +1174,130 @@ class TestRerun:
         rc = _cmd_rerun([str(rd), "p"])
         assert rc == 0
         assert not (rd / "halt.json").exists()
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  TestReviewerFixes — two reviewer-flagged regressions
+# ───────────────────────────────────────────────────────────────────────
+
+class TestReviewerFixes:
+    """1. `camflow run --from <node>` (no --run-dir) used to call
+          default_run_dir() which archives the existing run, leaving
+          rerun pointed at an empty dir.
+       2. `--steps` halting right after a failed attempt with retry
+          budget remaining used to restore as done+fail on resume,
+          so the scheduler wouldn't re-pick the node."""
+
+    def _setup_seq_proj(self, tmp_path):
+        proj = tmp_path / "proj"
+        scripts = proj / "scripts"
+        scripts.mkdir(parents=True)
+        for i, name in enumerate(["a", "b"], start=1):
+            make_executable_tool(
+                scripts / (name + ".sh"),
+                envelope_tool_body({"step": i}),
+            )
+        return proj
+
+    def _seq_workflow(self):
+        return {
+            "workflow": "rev", "version": "1.0",
+            "nodes": [
+                {"id": "a", "goal": "first", "steps": ["s"],
+                 "run": {"tool": "scripts/a.sh"},
+                 "output_schema": {"step": "integer"},
+                 "verify": {"command": "true"}},
+                {"id": "b", "goal": "second", "steps": ["s"],
+                 "needs": ["a"],
+                 "run": {"tool": "scripts/b.sh"},
+                 "output_schema": {"step": "integer"},
+                 "verify": {"command": "true"}},
+            ],
+        }
+
+    def test_run_from_default_path_does_not_archive(self, tmp_path,
+                                                    monkeypatch):
+        """Reviewer fix #1."""
+        from runner_v2.runtime import _cmd_run
+        proj = self._setup_seq_proj(tmp_path)
+        monkeypatch.chdir(proj)
+        wf = self._seq_workflow()
+
+        rd = proj / ".camflow" / "run"
+        run_workflow(wf, rd)
+        assert (rd / "nodes" / "a" / "attempt-1" / "output.json").exists()
+
+        archives_dir = proj / ".camflow" / "archives"
+        archives_before = (set(archives_dir.iterdir())
+                           if archives_dir.exists() else set())
+
+        rc = _cmd_run(["--from", "a"])
+        assert rc == 0
+
+        archives_after = (set(archives_dir.iterdir())
+                          if archives_dir.exists() else set())
+        assert archives_after == archives_before, \
+            "rerun must not archive the existing run"
+        assert (rd / "nodes" / "a" / "attempt-1" / "output.json").exists()
+        assert (rd / "nodes" / "a" / "attempt-2" / "output.json").exists()
+
+    def test_step_halt_during_retry_resume_continues(self, tmp_path):
+        """Reviewer fix #2."""
+        from runner_v2.runtime import _cmd_resume
+        proj = tmp_path / "proj"
+        scripts = proj / "scripts"
+        scripts.mkdir(parents=True)
+        sentinel = proj / ".n"
+        sentinel.write_text("0")
+        # Tool that fails on attempt 1, succeeds on attempt 2.
+        # Build the script body in Python to avoid heredoc-in-heredoc.
+        flaky_body = (
+            'n=$(cat ' + str(sentinel) + ')\n'
+            'n=$((n+1))\n'
+            'echo "$n" > ' + str(sentinel) + '\n'
+            'if [ "$n" -lt 2 ]; then\n'
+            '  echo \'{"status":"fail","data":{},'
+            '"error":{"code":"E","message":"first fails"},'
+            '"feedback":null,"request_human":false}\'\n'
+            'else\n'
+            '  echo \'{"status":"success","data":{"step":1},'
+            '"error":null,"feedback":null,"request_human":false}\'\n'
+            'fi\n'
+        )
+        make_executable_tool(scripts / "flaky.sh", flaky_body)
+
+        wf = {
+            "workflow": "rt", "version": "1.0",
+            "nodes": [{
+                "id": "x", "goal": "g", "steps": ["s"],
+                "run": {"tool": "scripts/flaky.sh"},
+                "output_schema": {"step": "integer"},
+                "verify": {"command": "true"},
+                "retry": 3,
+            }],
+        }
+        rd = proj / ".camflow" / "run"
+
+        # Step-halt after attempt-1 failed (retry_triggered fired).
+        result = run_workflow(wf, rd, max_attempts=1)
+        assert result == "halted"
+        halt = json.loads((rd / "halt.json").read_text())
+        assert halt["kind"] == "breakpoint"
+        assert halt["retry_count"] == 1, (
+            "retry_count in halt.json should reflect the post-retry-trigger "
+            "value (1), not pre (0)"
+        )
+
+        att1 = json.loads(
+            (rd / "nodes" / "x" / "attempt-1" / "output.json").read_text()
+        )
+        assert att1["status"] == "fail"
+
+        # Resume — node must be re-picked, attempt-2 must run + succeed.
+        rc = _cmd_resume([str(rd)])
+        assert rc == 0
+        assert (rd / "nodes" / "x" / "attempt-2" / "output.json").exists()
+        att2 = json.loads(
+            (rd / "nodes" / "x" / "attempt-2" / "output.json").read_text()
+        )
+        assert att2["status"] == "success"
