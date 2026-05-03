@@ -1,137 +1,82 @@
 # camflow — project memory for future Claude sessions
 
-This is a from-scratch rewrite (started 2026-04-28) of an earlier camflow
-that grew to ~15k lines and got over-engineered. The earlier version is
-on the `archive/phase-abc-2026-04` branch. **Do not resurrect** any of
-the deleted modules (planner/, evolution/, registry/, steward/, etc.)
-without explicit user consent — they were intentionally cut.
+This is a from-scratch rewrite. Earlier overgrown versions live on
+`archive/phase-abc-2026-04` — **do not resurrect** any of those
+deleted modules (planner/, evolution/, registry/, steward/,
+error_classifier/, brainstorm/, ...) without explicit user consent.
+They were cut on purpose.
 
 ## What it is
 
-**camflow = camc + flow.** A multi-agent workflow runner that drives agents through `camc`.
-
-Two foundational principles — both load-bearing:
-
-1. **Multi-agent system.** Three primitives, strictly distinct:
-   - **Workflow** = a multi-agent DAG (the artifact). Lives in user space.
-   - **Agent** = a single `camc`-spawned execution unit. Autonomous *internally*
-     (multi-step, multi-skill, may use Read/Write/Bash) but **one camc run** —
-     agents do NOT kick off workflows.
-   - **Skill** = a capability template (`SKILL.md` prompt + tool grants).
-     Agents USE skills.
-
-   Built-in agent definitions live in `agents/<name>/AGENT.md`. Built-in skill
-   templates live in `skills/<name>/SKILL.md`. Roles like Planner / Evaluator /
-   Worker / Orchestrator are AGENTS — `agents/planner/AGENT.md` (autonomous,
-   uses skill_searcher + workflow_designer internally) — NOT
-   `skills/planner/SKILL.md` (one prompt) and NOT
-   `workflows/planner/workflow.yaml` (sub-DAG). Both alternatives are wrong.
-
-2. **Every LLM invocation goes through `camc run`.** `claude -p` and direct
-   Anthropic SDK calls are **forbidden** — if any path in the runtime wants to
-   call an LLM another way, that's a bug. See "Core infrastructure" below.
-
-DAG dependencies for modeling, serial runner for execution. Retry is the only
-backwards mechanism. Every node output is the same envelope.
-
-> "DAG for dependency modeling, serial runner for execution — agents through camc."
-
-The full language spec is in [`docs/spec.md`](docs/spec.md) (v0.6).
-The architectural intent is in [`docs/harness-design.md`](docs/harness-design.md).
-**Read these before changing the runner.**
-
-## Core infrastructure: camc (default), cam (multi-machine)
-
-**This is load-bearing. Read carefully.**
-
-The CLIs `camc` and `cam` are the foundational infrastructure of this project.
-**All agent spawning must go through them**, not by bypassing to `claude -p`
-or the Anthropic SDK.
-
-**Default: `camc`.** Reach for `cam` only when multi-machine orchestration
-is explicitly needed.
-
-- `camc` — standalone per-machine client. `camc run` to start an agent, `list/status/logs/stop/kill/send/key/capture/apply`. **The default path for the runner.**
-- `cam` — full Coding Agent Manager with server mode (`serve`, `release`, `sync`, `machines.json`). Use only when crossing machines.
-
-Why this is load-bearing:
-- camc/cam owns telemetry, lifecycle, heartbeat, orphan handling. Bypassing it loses all of that.
-- The Orchestrator (future LLM agent) will drive flows via the same surface, so unifying spawn/stop/inspect there means one mental model.
-- camc is local-first / simple-first; cam adds server overhead that's not needed single-machine.
-
-**Current state:** `skill.X` is fully wired through `camc run` (no `claude -p` anywhere). Agent lifecycle: spawn via camc → wait for `<workspace>/agent_output.json` → schema check → if mismatch, `camc send` feedback (inner self-correction loop, capped by `CAMFLOW_SKILL_INNER_RETRIES`, default 3) → `camc kill` to clean up. `agent.X` (autonomous, tool-using) is the v0.8 next step on the same camc surface.
-
-`claude -p` is **forbidden** in the runtime. All LLM invocations go through camc. When parsing camc output, use `camc --json` for machine-callable JSON (note: `camc run` itself is text-only — parse the agent ID via the `Starting <tool> agent <id>` regex).
-
-## Status: v0.7
-
-| Layer | What runs |
-|---|---|
-| Runtime | `src/runner/runtime.py` — DAG + retry + verify + when + skip propagation, ~810 lines |
-| Mocks | `mock:` field on a node returns canned envelope (testing) |
-| Tools | `uses: tool.X` runs `tools/X.sh`, stdin = input JSON, stdout = envelope JSON |
-| Skills | `uses: skill.X` spawns a one-shot agent via `camc run` (workspace = node attempt dir; agent writes envelope to `agent_output.json`; runner self-corrects on schema mismatch via `camc send`; cleans up via `camc kill`) |
-| Agents | `uses: agent.X` → returns `NOT_IMPLEMENTED` (v0.8 — autonomous tool-using agents) |
-| CLI | `camflow <workflow> --state <state.json>` via pyproject `[project.scripts]` entry |
-| Halt | `status: halted` envelope OR retry-exhausted → workflow_halted (exit 2), `halt.json` sidecar |
-| Tests | 38 pytest tests, 0.2 s, all mock+tool path; agent-demo + plan-demo manual (LLM cost) |
-
-## Done
-
-- ✅ Workflow language v0.6 (spec.md). Nodes have id / goal / needs / when / uses / input / output_schema / verify / retry. No `next` / no `goto`.
-- ✅ Expression evaluator (App. A): `==`, `!=`, `<`, `<=`, `>`, `>=`, `and`, `or`, `not`, attribute chains, `[n]` subscript, YAML-style `true`/`false`/`null` literals. Implemented via `ast` whitelist walk, **not** `eval()`.
-- ✅ Template renderer (App. B): `{{state.x}}`, `{{nodes.X.latest.output.*}}`, `{{nodes.X.attempts[n].output.*}}` (1-indexed), `{{retry.feedback}}`. Trailing `?` opts into "missing → empty string". **Strict mode**: missing field on existing namespace raises `ExprError` (use `?` to opt out).
-- ✅ Retry (simplified): retries **only the current node**. No `target` field. Triggers on `success` + `until` false, OR on node failure. Retry exhausted → halt (not fail).
-- ✅ Halt: envelope `status: halted` halts the workflow; retry exhausted halts; node failure with no retry halts. `halt.json` sidecar written at run root. Exit codes: 0 success, 2 halted, 1 failed.
-- ✅ State is **read-only** after workflow start. The old DSL `set:` is gone. Cross-node data flow uses `nodes.X.latest.output` references.
-- ✅ Run dir: `<project>/.camflow/runs/<run_id>/`. Structure per spec App. C: workflow.yaml snapshot, state.json, trace.jsonl, nodes/<id>/attempt-<n>/{output.json, workspace/{input.json, prompt.txt, response.txt, raw_stdout.txt}}, plus halt.json on halt and runner.pid while running.
-- ✅ Workspace dir per attempt: tools `cwd` is `workspace/` + `CAMFLOW_WORKSPACE` env var; skills' prompt + inputs live there too. Future `agent.X` via camc will also `cwd` here.
-- ✅ Auto-schema: runner automatically validates `data` against `output_schema` after success. User no longer writes `{type: schema}` in verify; `verify:` is for additional checks (rule, future file/command/agent).
-- ✅ `camflow` CLI installed via `pip install -e .`. Entry point `runner.runtime:main`.
-- ✅ Planner = 1-node workflow (`uses: skill.planner`, template at `prompts/planner.md`). `camflow plan "<goal>" [--run]` is the user-facing convenience.
-
-## Roadmap
-
-### v0.8 — agent.X (autonomous, tool-using) via camc
-
-`skill.X` already runs through camc (one-shot, runner-driven turn loop with self-correction). v0.8 adds `agent.X`: long-running autonomous agents that decide their own tool use and only emit a final envelope when they consider themselves done.
-
-Implementation will reuse the camc adapter (`_camc_run` / `_camc_send` / `_camc_kill` / `_wait_for_output` already in runtime.py) — the difference is the prompt template (autonomy + tool-grant) and the wait loop (might be longer; might watch for camc `state=idle` after work, not just `agent_output.json` appearing).
-
-`cam` (the multi-machine variant) is reserved for when workflows need to spawn agents on remote nodes — not part of v0.8.
-
-### v0.9 — Orchestrator + extra CLI subcommands
-
-The Orchestrator is a separate LLM agent that **drives the runner via the
-camflow CLI**, not by importing the runtime. Two functions:
-1. Exception handler — runner emits an event, orchestrator decides retry/abort/escalate.
-2. Human-in-the-loop — handles questions / approvals.
-
-This means CLI must grow: `camflow status` / `stop` / `resume` / `inspect-state` / `inspect-trace` / `send-control` / `abort`. All must be machine-callable: stable arg shapes, JSON output, exit codes that distinguish success / user-action-needed / hard-fail.
-
-### Later — Planner
-
-A separate LLM agent that takes a natural-language goal and **generates a
-workflow.yaml**. Lives outside the runtime. Will eventually own the
-`prompts/` directory (the 4 templates: planner / orchestrator / evaluator
-/ worker, currently empty).
-
-## Architecture
-
-The 4-role design from `docs/harness-design.md`:
+**camflow = camc + flow.** A self-hosting, prompt-driven multi-agent
+workflow runner.
 
 ```
-Planner (LLM)        — natural language → workflow.yaml         [Later]
-Runner (Python)      — executes workflow.yaml deterministically [Done]
-Worker (LLM)         — runs inside skill.X / agent.X nodes      [Done for skill, v0.8 for agent]
-Evaluator (LLM)      — judges quality at evaluator-type nodes   [Later — built-in checks for now]
-Orchestrator (LLM)   — exception handler + human-in-loop        [v0.9, drives runner via CLI]
+camc    run "<prompt>"   →  one agent, hopes for the best
+camflow run "<prompt>"   →  Planner compiles prompt → DAG → Runtime
+                            executes each node with retry + verify
 ```
 
-LLMs are **off the dispatch path**. The runner is pure Python and decides
-nothing semantically — it follows the DAG, runs nodes, persists outputs,
-and lets the LLMs do reasoning inside nodes. This keeps the engine
-deterministic and easy to reason about under failure.
+User-facing CLI mirrors `camc run`: one mandatory prompt, two verbs
+(`run`, `resume`). Everything else is internal.
+
+## Three load-bearing principles
+
+1. **Self-hosting via the Planner builtin workflow.**
+   `camflow run` invokes the **Planner workflow** at
+   `builtin/planner/workflow.yaml`, which compiles the user prompt
+   into a `workflow.yaml`. The runtime then executes that. The Planner
+   is itself a normal camflow workflow — it goes through the same
+   Workflow/Node/retry/halt/trace machinery as any user workflow.
+   There is no non-interactive bypass; every run goes through Planner.
+
+2. **Two classes only: `Workflow` and `Node`.**
+   - `Workflow` — runtime instance, the scheduler. Has `lifecycle ∈
+     {running, done, halted}`. **Doesn't run, doesn't verify.** Its
+     only behavior is `execute_dag()` (pick ready node, delegate,
+     decide retry/halt).
+   - `Node` — atomic execution unit. Has `lifecycle ∈ {waiting,
+     running, done}` and `result ∈ {success, fail}`. Methods: `run()`
+     (skill or tool), `verify()` (criterion / command / human),
+     `execute_attempt()` (run + verify + persist).
+
+3. **Every LLM invocation goes through `camc_lib.run_and_collect`.**
+   `claude -p` and direct Anthropic SDK calls are forbidden. If any
+   path in the runtime calls an LLM another way, that's a bug.
+
+## Spec is source of truth
+
+[`docs/spec-v1.1.md`](docs/spec-v1.1.md) is the canonical spec
+(~870 lines). 15 doctrine rules at the bottom — any change that
+contradicts those needs an explicit RFC. Read it before changing
+runtime semantics.
+
+Highlights of the v1.1 spec to keep top-of-mind:
+
+- **Prompt is the only external input.** No `--state`, no `--inputs`,
+  no `state:` / `inputs:` YAML, no `{{state.X}}` templates, no
+  `run.input:` field. Cross-node data is auto-injected as
+  `# Upstream Outputs`. Templating exists only inside `verify.command`
+  with the single namespace `{{nodes.<id>.output.X}}`.
+- **`workflow.context`** — shared prompt block injected into every
+  node. Planner writes the user's original prompt + run-constants here.
+- **Skill is the default run executor.** `run.tool:` is allowed only
+  when **all five** §10 criteria hold (known command + fully-determined
+  inputs + script-structured output + idempotent + cost matters). When
+  in doubt, use skill.
+- **`verify.command`** — bash exit code as the deterministic gate.
+  Verify-side commands are unconstrained — use them freely for
+  pass/fail checks.
+- **`verify.human`** — opt-in only. Planner inserts it only when the
+  user's prompt explicitly asks for review/approval.
+- **Retry is a counter, not an expression.** No `retry.until`. On
+  retry, runtime auto-injects `previous` (last attempt's envelope)
+  into the next attempt's input.
+- **Status is binary: `success` or `fail`.** No third value, ever.
+- **Halt is workflow-level only.** Nodes don't halt; they end
+  done+success or done+fail.
+- **Strict skill registry.** Workflow load fails if any referenced
+  skill is missing. No dynamic creation.
 
 ## Project layout
 
@@ -139,82 +84,135 @@ deterministic and easy to reason about under failure.
 camflow/
 ├── README.md
 ├── LICENSE
-├── pyproject.toml
+├── pyproject.toml                     # entry: camflow = "runner_v2.runtime:main"
 ├── docs/
-│   ├── harness-design.md       # design intent, true north
-│   └── spec.md                 # v0.6 workflow language spec
-├── src/runner/                 # the Python package (named `runner`, not `camflow`, to avoid project-name collision)
-│   ├── __init__.py
-│   └── runtime.py              # the DAG runner, single file for now
-├── prompts/                    # 4 prompt templates, empty until v0.9+
+│   ├── spec.md / spec-v1.0.md         # historical
+│   └── spec-v1.1.md                   # ← source of truth, read this first
+├── src/runner_v2/                     # the v1.1 runtime — only path
+│   ├── camc_lib.py                    # camc subprocess wrapper
+│   └── runtime.py                     # Workflow + Node + execute_dag + CLI
+├── builtin/planner/                   # the self-hosting Planner workflow
+│   ├── workflow.yaml                  # understand → design_dag → render_yaml
+│   └── skills/
+│       ├── prompt_analyzer/SKILL.md
+│       ├── workflow_designer/SKILL.md
+│       └── yaml_writer/SKILL.md
+├── skills/                            # global skill registry
+│   ├── analyzer/, evaluator/, reviewer/   # tracked
+│   └── code_writer/                   # untracked (v1.0 content; v1.1 update pending)
 ├── examples/
-│   ├── echo-retry/             # all-mock smoke
-│   ├── retry-demo/             # tools, test self-retries 3x via tester.sh CAMFLOW_ATTEMPT
-│   ├── code-review/            # tools, fan-out/fan-in/when-branching
-│   ├── halt-demo/              # tools, retry exhaustion → halt (exit 2 + halt.json)
-│   └── agent-demo/             # real Claude (skill.X), 3 nodes, ~$0.35 per run
-└── tests/test_runtime.py       # 29 tests, pure mock+tool, no LLM
+│   ├── README.md
+│   └── bug-fix-compiled/              # reference workflow.yaml shape
+├── examples-v1.0-archive/             # the 6 old hand-authored examples
+└── tests/test_v2.py                   # 67 tests, no LLM cost
 ```
-
-## Conventions / decisions
-
-- **`runner/` not `camflow/`**: the package directory holds Python code; `camflow` is the project (and CLI binary) name. Avoid the redundancy.
-- **Single file until 5+ files**: `runner/runtime.py` is one ~800-line file. Don't split it preemptively. When it gets to 1500+ lines, then split (likely candidates: `expr.py`, `template.py`, `verify.py`).
-- **Strict expression mode**: `{{state.missing}}` raises; use `{{state.missing?}}` to opt into empty-string fallback.
-- **One-shot skills via `camc run`**: each skill node spawns a camc-managed Claude agent in the per-attempt workspace. Prompt is compiled deterministically (workflow.goal + node.goal + input + schema instruction + delivery protocol). Agent writes the envelope to `agent_output.json`; runner self-corrects on schema mismatch via `camc send`; cleanup via `camc kill`. Skill templates load from `prompts/<name>.md`.
-- **Persisted artifacts**: every attempt writes prompt.txt + response.txt + output.json. Highly debuggable. Don't remove.
-- **No CI yet**: tests run locally. Don't add CI/.github until the project has stabilized.
-
-## DO / DON'T for future Claude sessions
-
-**DO**
-- Read `docs/spec.md` before changing runtime semantics.
-- Read this file (CLAUDE.md) before adding new files or features.
-- Run the example workflows after any runtime change to catch regressions:
-  ```bash
-  pytest tests/ -q
-  camflow examples/echo-retry/workflow.yaml --state examples/echo-retry/state.json
-  camflow examples/retry-demo/workflow.yaml --state examples/retry-demo/state.json
-  camflow examples/code-review/workflow.yaml --state examples/code-review/state.json
-  camflow examples/halt-demo/workflow.yaml --state examples/halt-demo/state.json   # expect exit 2
-  # agent-demo / plan --run only when explicitly asked — burns LLM credits
-  ```
-- When adding a new tool script, use `python3 -c '...'` for output, not bash heredoc with f-strings — the bash/Python escaping is a footgun (we hit this on `code-review` first run).
-
-**DON'T**
-- **Don't model a role as a single skill OR as a sub-workflow.** Planner /
-  Evaluator / Worker / Orchestrator are AGENTS — `agents/<name>/AGENT.md`
-  (autonomous Claude Code session, one camc spawn, multi-step internally). A
-  single SKILL.md is too small (one prompt). A sub-workflow (DAG) is too
-  big (agents don't kick off workflows). The right shape is one autonomous
-  agent that internally uses multiple skills. See `multi_agent_system.md`.
-- Don't add features that aren't in the spec.md or roadmap.
-- Don't predict-build the Orchestrator / Planner — wait until they're needed.
-- Don't restore deleted concepts: methodology routing, escalation levels, error_classifier, result_reader, brainstorm, evolution. They were cut on purpose.
-- Don't add `agent.X` in a hurry — the goal of v0.8 is keeping it ~half the lines of the old agent_runner.py. Plan it before coding.
-- Don't bypass camc. The runtime starts agents via `camc run` only — never `claude -p`, never the Anthropic SDK. Reach for `cam` only when crossing machines.
-- Don't push `force` to remote (origin/main has 17 leftover Phase-A commits from before the reset; needs explicit user authorization to force-push).
 
 ## How to run
 
 ```bash
-# Install (editable mode)
+# install (editable)
 pip install -e .
 
-# Run a workflow
-camflow <workflow.yaml> --state <state.json>
+# run a workflow from a prompt
+camflow run "<your task description>"
 
-# Validate without running
-camflow <workflow.yaml> --validate
+# resume after a halt
+camflow resume .camflow/run
 
-# Tests
+# inspect mid-run
+cat .camflow/run/trace.jsonl
+cat .camflow/run/halt.json     # only if halted
+
+# stop a run
+kill $(cat .camflow/run/runner.pid)
+
+# tests
 pip install -e '.[test]'
-pytest tests/ -q
+pytest tests/test_v2.py -q
 ```
+
+## Run dir layout
+
+Every `camflow run` writes to `<project>/.camflow/run/`:
+
+```
+.camflow/run/
+├── prompt.txt                         # the original user prompt
+├── workflow.yaml                      # compiled IR (from Planner)
+├── trace.jsonl                        # event stream
+├── runner.pid                         # while running
+├── halt.json                          # only if halted
+├── planner/                           # Planner's own sub-run dir
+│   ├── workflow.yaml                  # = builtin/planner/workflow.yaml
+│   ├── trace.jsonl
+│   └── nodes/{understand,design_dag,render_yaml}/attempt-N/
+└── nodes/<user_node_id>/attempt-N/
+    ├── input.json                     # upstream + previous (auto-injected)
+    ├── prompt.txt                     # full prompt sent to camc (skill nodes)
+    ├── agent_output.json              # what the agent wrote
+    ├── output.json                    # validated envelope
+    └── verify-N/                      # only when verify=agent
+        ├── prompt.txt
+        ├── agent_output.json
+        └── output.json
+```
+
+The Planner sub-dir mirrors the same shape — Planner's own execution
+is fully inspectable as just another camflow run.
+
+## Conventions / decisions
+
+- **`runner_v2/` not `camflow/`** as the package dir — `camflow` is
+  the project name + CLI, `runner_v2` is the Python package.
+- **Single-file runtime** — `runner_v2/runtime.py` is intentionally
+  one file (~1300 lines). Don't split preemptively. If it crosses
+  ~1800 lines, candidates are `expr.py` + `template.py` + `verify.py`.
+- **Strict expressions**: `{{nodes.missing}}` raises `ExprError`. No
+  `?` opt-out marker.
+- **Persisted artifacts**: every attempt writes prompt.txt + input.json
+  + output.json + agent_output.json. Highly debuggable. Don't remove.
+- **No CI yet**: tests run locally. Don't add `.github/` until project
+  has stabilized.
+
+## DO / DON'T
+
+**DO**
+- Read [`docs/spec-v1.1.md`](docs/spec-v1.1.md) before changing
+  runtime semantics.
+- Read this file (CLAUDE.md) before adding new files or features.
+- Run `pytest tests/test_v2.py -q` after any runtime change. 67 tests
+  in ~2.5s, no LLM cost.
+- A real `camflow run "<small task>"` smoke test is the right way to
+  verify the Planner chain end-to-end — but it does spend LLM credits.
+  Only run when explicitly asked.
+
+**DON'T**
+- **Don't bring back `state:` / `inputs:` / `--state` / `{{state.X}}`
+  / `run.input:`.** All cut in v1.1 on purpose. Per-run input = the
+  user prompt; Planner compiles it; that's the only path.
+- **Don't bypass the Planner.** No `camflow exec workflow.yaml`, no
+  `--validate`, no positional yaml argument. Every CLI run goes
+  through Planner.
+- **Don't insert `verify: human` by default.** Opt-in only — Planner
+  adds it only when the user's prompt explicitly asks for review.
+  Putting it on a node the user didn't ask for is a UX regression,
+  not a safety improvement.
+- **Don't model a role as a single SKILL.md OR as a sub-workflow.**
+  Planner / Evaluator / Worker / Orchestrator are AGENTS — autonomous
+  Claude Code sessions, one camc spawn per role, multi-step
+  internally. A single SKILL.md is too small (one prompt). A
+  sub-workflow (DAG) is too big (agents don't kick off workflows).
+- **Don't bypass camc.** Runtime starts agents via `camc run` only —
+  never `claude -p`, never the Anthropic SDK. Reach for `cam` only
+  when crossing machines.
+- **Don't loosen the `run.tool:` 5-criterion gate.** If you find
+  yourself wanting tool but not all 5 hold, it's a skill.
+- **Don't push `--force` to remote** (origin has leftover Phase-A
+  commits that need explicit user authorization to force-push).
 
 ## Pointers
 
-- Workflow language spec: [`docs/spec.md`](docs/spec.md) (v0.6, 472 lines)
-- Architecture / true-north: [`docs/harness-design.md`](docs/harness-design.md) (511 lines)
-- Memory (this conversation's persistent notes): `~/.claude/projects/-home-hren--openclaw-workspace-camflow/memory/`
+- Workflow + runtime spec: [`docs/spec-v1.1.md`](docs/spec-v1.1.md)
+- Memory (per-conversation notes):
+  `~/.claude/projects/-home-hren--openclaw-workspace-camflow/memory/`
 - Old codebase (do not import from): `archive/phase-abc-2026-04` branch
