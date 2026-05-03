@@ -32,6 +32,12 @@ from typing import Any, Callable, Optional
 import yaml
 
 from . import camc_lib as camc
+from .assets import (
+    _builtin_planner_dir,
+    _camflow_repo_root,
+    _resolve_skill_path,
+    _resolve_tool_path,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -306,26 +312,7 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
     return errors
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  SKILL / TOOL RESOLUTION
-# ═══════════════════════════════════════════════════════════════════════
-
-def _camflow_repo_root() -> Path:
-    """Where this runtime ships from — has builtin skills/."""
-    return Path(__file__).resolve().parents[2]
-
-
-def _resolve_skill_path(name: str, project_root: Path) -> Path | None:
-    for root in (project_root, _camflow_repo_root()):
-        p = root / "skills" / name / "SKILL.md"
-        if p.exists():
-            return p
-    return None
-
-
-def _resolve_tool_path(rel: str, project_root: Path) -> Path | None:
-    p = (project_root / rel).resolve()
-    return p if p.is_file() and os.access(p, os.X_OK) else None
+# Skill / tool resolution lives in `assets.py`, imported above.
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1433,11 +1420,6 @@ def _cmd_resume(argv: list[str]) -> int:
 
 def _result_to_exit(result: str) -> int:
     return {"done": 0, "halted": 2}.get(result, 1)
-
-
-def _builtin_planner_dir() -> Path:
-    """The builtin Planner workflow's directory."""
-    return _camflow_repo_root() / "builtin" / "planner"
 
 
 def _downstream_set(wf: "Workflow", root_id: str) -> set[str]:
