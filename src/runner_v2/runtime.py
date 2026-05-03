@@ -551,6 +551,37 @@ def build_verify_prompt(node: "Node", run_envelope: dict,
         "feedback the run agent sees on its next attempt."
     )
     parts.append(
+        "# Evidence protocol (no hollow approves)\n"
+        "Every step_result you mark `passed: true` MUST cite **concrete\n"
+        "evidence** in the `evidence` field — not just a feeling.\n"
+        "\n"
+        "Acceptable evidence:\n"
+        "  * a verbatim quote from `envelope.data.<field>` "
+        "(e.g. `data.root_cause = \"null deref at line 42\"`).\n"
+        "  * a file path + line range you actually inspected via "
+        "Read/Bash, with the relevant lines quoted.\n"
+        "  * literal output of a check command you ran in this directory "
+        "(e.g. `pytest -q` → \"5 passed in 0.3s\").\n"
+        "\n"
+        "NOT acceptable evidence:\n"
+        "  * \"the envelope says the step was done\" — that's the run "
+        "agent's claim, not verification.\n"
+        "  * \"looks correct\" / \"seems fine\" / \"the summary "
+        "mentions it\" — vague.\n"
+        "  * echoing back the step text — the step is what you're "
+        "checking, not evidence the step was done.\n"
+        "\n"
+        "If you can't find concrete evidence for a step, mark it "
+        "`passed: false` and explain in `reasoning` what's missing. "
+        "Better to bounce work back to the run agent with specific "
+        "feedback than to rubber-stamp.\n"
+        "\n"
+        "Steps with `passed: false` should also have `evidence` filled "
+        "with whatever you DID find (or `\"<missing>\"` if literally "
+        "nothing exists), so the run agent on retry can see what you "
+        "looked at."
+    )
+    parts.append(
         f"# Output\n"
         f"Write to `{OUTPUT_FILENAME}`:\n\n"
         f"```json\n"
@@ -559,8 +590,14 @@ def build_verify_prompt(node: "Node", run_envelope: dict,
         f'  "data": {{\n'
         f'    "approved": true | false,\n'
         f'    "step_results": [\n'
-        f'      {{"step": 1, "passed": true|false, "reasoning": "..."}}\n'
-        f"      , ...\n"
+        f'      {{\n'
+        f'        "step": 1,\n'
+        f'        "passed": true | false,\n'
+        f'        "evidence": "<verbatim quote / file:line / cmd output; '
+        f'REQUIRED>",\n'
+        f'        "reasoning": "<one sentence why this step passed or failed>"\n'
+        f'      }},\n'
+        f"      ...\n"
         f"    ],\n"
         f'    "reasoning": "<one-sentence overall>"\n'
         f"  }},\n"

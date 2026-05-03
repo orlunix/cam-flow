@@ -471,14 +471,49 @@ If `verify` is omitted, runtime spawns an evaluator agent that reads node.steps 
 {
   "approved": true | false,
   "step_results": [
-    {"step": 1, "passed": <bool>, "reasoning": "..."},
+    {
+      "step": 1,
+      "passed": true | false,
+      "evidence": "<verbatim quote / file:line / cmd output>",
+      "reasoning": "<one sentence why this step passed or failed>"
+    },
     ...
   ],
   "reasoning": "<one sentence overall>"
 }
 ```
 
-`step_results` length = `len(node.steps)`. On reject, the per-step reasoning is concatenated into the feedback string for the next retry.
+`step_results` length = `len(node.steps)`. On reject, the full
+step_results entries (including `evidence`) are concatenated into the
+feedback string for the next retry — so the run agent sees both what
+verify objected to AND what verify did or didn't look at.
+
+#### Evidence protocol (no hollow approves)
+
+The verify-agent prompt is built with an explicit evidence protocol
+to prevent rubber-stamp approves. For every step marked
+`passed: true`, the agent MUST cite concrete evidence in the
+`evidence` field — not vibes, not echoed step text, not "the envelope
+says it was done".
+
+Acceptable evidence:
+
+* a verbatim quote from `envelope.data.<field>` ("data.root_cause = ...")
+* a file path + line range the agent inspected via Read/Bash, with the
+  relevant lines quoted
+* literal output of a check command the agent ran in the attempt
+  directory ("pytest -q" → "5 passed in 0.3s")
+
+If the agent can't find concrete evidence for a step, it must mark it
+`passed: false` and explain what's missing in `reasoning`. Better to
+bounce work back to the run agent with specific feedback than to
+rubber-stamp.
+
+This is enforced via the prompt only — no runtime check rejects an
+approved-with-empty-evidence response. The principle is to make hollow
+approves uncomfortable to write rather than impossible. If you observe
+the verify-agent gaming this in practice, file an issue and we
+consider runtime enforcement.
 
 ### `verify: { criterion: <text> }`
 

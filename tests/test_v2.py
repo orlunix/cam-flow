@@ -526,6 +526,20 @@ class TestPrompt:
                                   workflow_context="shared facts")
         assert "# Workflow Context\nshared facts" in out
 
+    def test_verify_prompt_has_evidence_protocol(self):
+        """No-hollow-approve guard: verify prompt must require concrete
+        evidence per step, listing acceptable + unacceptable forms."""
+        out = build_verify_prompt(self._node(), {"status": "success"})
+        # The protocol heading is present
+        assert "Evidence protocol" in out
+        # Acceptable-evidence and not-acceptable-evidence sections both there
+        assert "Acceptable evidence" in out
+        assert "NOT acceptable evidence" in out
+        # The output schema includes the `evidence` field
+        assert '"evidence"' in out
+        # Specifically, the prompt rejects vague approve language
+        assert "looks correct" in out.lower() or "vibes" in out.lower()
+
 
 # ───────────────────────────────────────────────────────────────────────
 #  TestCamcLib — timeout semantics
