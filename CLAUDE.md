@@ -222,9 +222,12 @@ is fully inspectable as just another camflow run.
 - **Don't bring back `state:` / `inputs:` / `--state` / `{{state.X}}`
   / `run.input:`.** All cut in v1.1 on purpose. Per-run input = the
   user prompt; Planner compiles it; that's the only path.
-- **Don't bypass the Planner.** No `camflow exec workflow.yaml`, no
-  `--validate`, no positional yaml argument. Every CLI run goes
-  through Planner.
+- **Don't bypass the Planner for fresh prompts.** No
+  `camflow exec workflow.yaml`, no `--validate`, no positional yaml
+  argument. Every fresh-prompt `camflow run "<prompt>"` goes through
+  Planner. (`camflow resume` and `camflow run --from <node>` re-use
+  the existing compiled workflow.yaml on disk — they don't re-invoke
+  Planner, and that's correct.)
 - **Don't insert `verify: human` anywhere by default.** Both flavors
   are opt-in (CLI `-i` for plan-level; user-prompt language for
   in-flow node-level). `camflow run "<prompt>"` should run end-to-end

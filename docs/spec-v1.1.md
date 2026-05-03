@@ -1359,7 +1359,7 @@ Planner failure → camflow halts with the Planner's halt.json. User sees what P
 8. **Template has 1 namespace** (`nodes.<id>.output`), used in 1 place (`verify.command`). Plus `output.X` inside verify.command for the envelope under verification.
 9. **Every LLM invocation goes through `camc_lib.run_and_collect`.** No `claude -p`, no SDK.
 10. **Runtime contract for envelope is enforced via prompt injection** — every agent gets the explicit shape, schema, and rules.
-11. **`camflow run` always invokes Planner.** No bypass. The CLI shape mirrors `camc run`.
+11. **`camflow run "<prompt>"` always invokes Planner.** No bypass for fresh-prompt compilation. (`camflow run --from <node>` and `camflow resume` operate on an existing run dir and skip Planner — they're not "fresh runs".) The fresh-run CLI shape mirrors `camc run`.
 12. **Adding a verify type requires RFC.** Currently: agent (default), command, human.
 13. **Skill is the default run executor.** `run.tool:` is allowed only when ALL FIVE hard criteria in §10 hold (known command + fully-determined inputs + script-structured output + idempotent + cost matters). When in doubt, use skill. Adding a new run-phase executor type beyond skill / tool requires RFC.
 14. **Verify phase carries the deterministic gate.** `verify.command` (bash exit code) is the canonical place for "did the test pass / did the file parse / did the patch apply" checks. Verify-side commands are unconstrained — they're already deterministic by design. The hard rules in #13 are about RUN-phase tools, not verify.
