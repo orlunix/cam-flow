@@ -229,11 +229,16 @@ is fully inspectable as just another camflow run.
   are opt-in (CLI `-i` for plan-level; user-prompt language for
   in-flow node-level). `camflow run "<prompt>"` should run end-to-end
   with zero pauses unless the user asked for one.
-- **Don't model a role as a single SKILL.md OR as a sub-workflow.**
-  Planner / Evaluator / Worker / Orchestrator are AGENTS — autonomous
-  Claude Code sessions, one camc spawn per role, multi-step
-  internally. A single SKILL.md is too small (one prompt). A
-  sub-workflow (DAG) is too big (agents don't kick off workflows).
+- **Don't let user workflows kick off other workflows.** Nodes do
+  ONE camc spawn each (a skill agent or a tool), and they don't
+  recursively start `camflow run`. The **Planner builtin is the sole
+  system-level exception** to this rule — `camflow run` itself is
+  implemented by running the Planner workflow whose output (a
+  workflow.yaml) the runtime then executes. That recursion lives in
+  the runtime CLI dispatch, NOT inside any user node. If you find
+  yourself wanting a node to spawn its own DAG, the right shape is
+  more nodes in the parent DAG; the Planner can be invoked again to
+  redesign if needed.
 - **Don't bypass camc.** Runtime starts agents via `camc run` only —
   never `claude -p`, never the Anthropic SDK. Reach for `cam` only
   when crossing machines.

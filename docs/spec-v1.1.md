@@ -1262,31 +1262,42 @@ nodes:
     retry: 3
 
   - id: render_yaml
-    goal: "Emit a syntactically valid + user-approved workflow.yaml"
+    goal: "Emit a syntactically valid camflow v1.1 workflow.yaml"
     needs: [design_dag]
     steps:
       - "Serialize the DAG and context to YAML following spec v1.1"
       - "Include the original user prompt in workflow.context"
-      - "Verify the YAML loads, validates, and reflects the design"
+      - "Ensure yaml_text is a single string suitable for writing to workflow.yaml"
     run: { skill: yaml_writer }
     output_schema:
       yaml_text: string
     verify:
-      human: |
-        Review the proposed workflow.yaml below.
-        Type 'approve' to accept and run it.
-        Otherwise, describe what to change.
-    retry: 5
+      criterion: "yaml_text parses as YAML and matches camflow v1.1 schema (no inputs:/state:/run.input; nodes have id+goal+steps+run)"
+    retry: 3
 ```
 
-When the user runs `camflow run "<prompt>"`:
+When the user runs `camflow run "<prompt>"` (default, no `-i`):
 
 1. Runtime starts the Planner workflow with the user prompt copied into Planner's `workflow.context` (so Planner's nodes can read it like any other node reads context).
 2. Planner runs: understand → design_dag → render_yaml.
-3. `render_yaml`'s verify=human shows the user the candidate workflow.yaml. User types `approve` or feedback.
-4. On reject, retry kicks in: `yaml_writer` regenerates with `previous.feedback` from the user. Up to retry=5 cycles.
-5. On approve, Planner workflow ends `done+success`. Runtime extracts `nodes.render_yaml.output.data.yaml_text`, writes it to `<run_dir>/workflow.yaml`, and starts a new `execute_dag()` on it.
+3. `render_yaml`'s verify is `criterion`-based — an evaluator agent checks the produced YAML parses + matches v1.1 schema. **No human pause.**
+4. If verify rejects, retry kicks in: `yaml_writer` regenerates with `previous.feedback`. Up to retry=3 cycles.
+5. On verify success, Planner workflow ends `done+success`. Runtime extracts `nodes.render_yaml.output.data.yaml_text`, writes it to `<run_dir>/workflow.yaml`, and starts a new `execute_dag()` on it.
 6. That second execution has its own trace, halts, retries — fully indistinguishable from any other camflow workflow.
+
+When the user runs `camflow run -i "<prompt>"` (interactive plan
+approval):
+
+* Before validating the Planner spec, the runtime patches the
+  `render_yaml` node's `verify` to `{human: "Review the proposed
+  workflow.yaml below..."}`. Everything else is identical.
+* Now `render_yaml` pauses for the user to type `approve` or
+  feedback. `approve` → continue; anything else → reject + retry
+  with the user's feedback as `previous.feedback`.
+
+The builtin Planner workflow.yaml on disk does NOT carry
+`verify: human` on `render_yaml`. The opt-in is purely runtime
+patching — keeps the doctrine clean (default = no human gates).
 
 Planner failure → camflow halts with the Planner's halt.json. User sees what Planner couldn't do, can `camflow resume` to retry from the halt point.
 
@@ -1351,7 +1362,9 @@ camflow run "Fix the TypeError on line 87 of foo.py: 'NoneType' has no attribute
 
 Runtime creates `.camflow/run/`, writes `prompt.txt` with the prompt, starts the **Planner workflow** with that prompt copied into Planner's `context`.
 
-Planner produces (rendered after yaml_writer's render + user approval):
+Planner produces (the compiled workflow.yaml after yaml_writer
+finishes; default `camflow run` doesn't pause for user approval —
+add `-i` if you want a manual gate):
 
 ```yaml
 workflow: bug_fix
@@ -1417,7 +1430,7 @@ nodes:
 > `propose_fix` which need code-reading and synthesis — those must be
 > skills.
 
-The user reviewed `render_yaml`'s output, typed `approve`. Runtime now executes this 3-node workflow:
+Planner's verify-agent confirmed the YAML parses + matches v1.1 schema (or, with `-i`, the user typed `approve`). Runtime now executes this 3-node workflow:
 
 1. `diagnose` → camc spawns analyzer agent → reads context (which carries the original prompt) → produces root_cause + affected_location → schema check passes → default verify-agent approves → done+success.
 2. `propose_fix` → camc spawns code_writer agent → reads upstream's diagnose output (auto-injected) → produces patch → schema check passes → verify-agent (with criterion override) approves → done+success.
