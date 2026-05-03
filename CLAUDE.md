@@ -28,7 +28,8 @@ User-facing CLI mirrors `camc run`: one mandatory prompt, two verbs
    into a `workflow.yaml`. The runtime then executes that. The Planner
    is itself a normal camflow workflow — it goes through the same
    Workflow/Node/retry/halt/trace machinery as any user workflow.
-   There is no non-interactive bypass; every run goes through Planner.
+   Every fresh-prompt run goes through Planner; `resume` and
+   `run --from <node>` re-use the existing compiled workflow.yaml.
 
 2. **Two classes only: `Workflow` and `Node`.**
    - `Workflow` — runtime instance, the scheduler. Has `lifecycle ∈
@@ -46,10 +47,9 @@ User-facing CLI mirrors `camc run`: one mandatory prompt, two verbs
 
 ## Spec is source of truth
 
-[`docs/spec-v1.1.md`](docs/spec-v1.1.md) is the canonical spec
-(~870 lines). 15 doctrine rules at the bottom — any change that
-contradicts those needs an explicit RFC. Read it before changing
-runtime semantics.
+[`docs/spec-v1.1.md`](docs/spec-v1.1.md) is the canonical spec.
+Doctrine rules at the bottom — any change that contradicts those
+needs an explicit RFC. Read it before changing runtime semantics.
 
 Highlights of the v1.1 spec to keep top-of-mind:
 
@@ -136,7 +136,7 @@ camflow/
 │   ├── README.md
 │   └── bug-fix-compiled/              # reference workflow.yaml shape
 ├── examples-v1.0-archive/             # the 6 old hand-authored examples
-└── tests/test_v2.py                   # 67 tests, no LLM cost
+└── tests/test_v2.py                   # full test suite, no LLM cost
 ```
 
 ## How to run
@@ -212,8 +212,8 @@ is fully inspectable as just another camflow run.
 - Read [`docs/spec-v1.1.md`](docs/spec-v1.1.md) before changing
   runtime semantics.
 - Read this file (CLAUDE.md) before adding new files or features.
-- Run `pytest tests/test_v2.py -q` after any runtime change. 67 tests
-  in ~2.5s, no LLM cost.
+- Run `pytest tests/test_v2.py -q` after any runtime change. Fast,
+  no LLM cost.
 - A real `camflow run "<small task>"` smoke test is the right way to
   verify the Planner chain end-to-end — but it does spend LLM credits.
   Only run when explicitly asked.

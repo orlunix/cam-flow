@@ -44,7 +44,7 @@ Mapping to compiler vocabulary:
 | Linker / interpreter | Runtime executor |
 | Build artifacts | `trace.jsonl`, `nodes/<id>/attempt-<n>/output.json` |
 
-There is **no non-interactive bypass** —  every run goes through Planner. If the user wants to skip Planner, they can't. The only way `camflow` runs a workflow is by having Planner produce one (or, on `resume`, replaying a previously-produced one).
+There is **no non-interactive bypass** for fresh-prompt runs — every `camflow run "<prompt>"` goes through Planner. The only way `camflow` compiles a new workflow.yaml is by having Planner produce one. (`camflow resume <run_dir>` and `camflow run --from <node>` operate on an *existing* run dir's compiled workflow.yaml — they do not re-invoke Planner.)
 
 ---
 
