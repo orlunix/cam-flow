@@ -1027,3 +1027,136 @@ class TestStepping:
         # 2 attempts on disk
         attempts = sorted((rd / "nodes" / "x").iterdir())
         assert len(attempts) == 2
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  TestRerun — `camflow rerun <run_dir> <node>` semantics
+# ───────────────────────────────────────────────────────────────────────
+
+class TestRerun:
+    """`rerun` re-executes a specific node + every downstream descendant.
+    Upstream nodes stay as they were (their outputs are preserved)."""
+
+    def _setup_three_node_proj(self, tmp_path: Path) -> Path:
+        proj = tmp_path / "proj"
+        scripts = proj / "scripts"
+        scripts.mkdir(parents=True)
+        for i, name in enumerate(["a", "b", "c"], start=1):
+            make_executable_tool(
+                scripts / f"{name}.sh",
+                envelope_tool_body({"step": i}),
+            )
+        return proj
+
+    def _three_seq_workflow(self) -> dict:
+        return {
+            "workflow": "rerun_demo", "version": "1.0",
+            "nodes": [
+                {"id": "a", "goal": "first", "steps": ["s"],
+                 "run": {"tool": "scripts/a.sh"},
+                 "output_schema": {"step": "integer"},
+                 "verify": {"command": "true"}},
+                {"id": "b", "goal": "second", "steps": ["s"],
+                 "needs": ["a"],
+                 "run": {"tool": "scripts/b.sh"},
+                 "output_schema": {"step": "integer"},
+                 "verify": {"command": "true"}},
+                {"id": "c", "goal": "third", "steps": ["s"],
+                 "needs": ["b"],
+                 "run": {"tool": "scripts/c.sh"},
+                 "output_schema": {"step": "integer"},
+                 "verify": {"command": "true"}},
+            ],
+        }
+
+    def test_rerun_resets_target_and_downstream(self, tmp_path):
+        from runner_v2.runtime import run_workflow, _cmd_rerun
+        proj = self._setup_three_node_proj(tmp_path)
+        wf = self._three_seq_workflow()
+        rd = proj / ".camflow" / "run"
+        # First: full run completes
+        assert run_workflow(wf, rd) == "done"
+        for nid in ("a", "b", "c"):
+            assert (rd / "nodes" / nid / "attempt-1" / "output.json").exists()
+
+        # Now rerun b — b and c should re-execute (attempt-2/), a stays at attempt-1/
+        rc = _cmd_rerun([str(rd), "b"])
+        assert rc == 0
+        # a: still only attempt-1/ (not re-run)
+        assert sorted(p.name for p in (rd / "nodes" / "a").iterdir()) == ["attempt-1"]
+        # b and c: now have attempt-2/
+        assert (rd / "nodes" / "b" / "attempt-2" / "output.json").exists()
+        assert (rd / "nodes" / "c" / "attempt-2" / "output.json").exists()
+
+    def test_rerun_target_only_when_no_downstream(self, tmp_path):
+        from runner_v2.runtime import run_workflow, _cmd_rerun
+        proj = self._setup_three_node_proj(tmp_path)
+        wf = self._three_seq_workflow()
+        rd = proj / ".camflow" / "run"
+        run_workflow(wf, rd)
+
+        # Rerun c (leaf node, no downstream) — only c re-runs
+        _cmd_rerun([str(rd), "c"])
+        assert sorted(p.name for p in (rd / "nodes" / "a").iterdir()) == ["attempt-1"]
+        assert sorted(p.name for p in (rd / "nodes" / "b").iterdir()) == ["attempt-1"]
+        assert (rd / "nodes" / "c" / "attempt-2" / "output.json").exists()
+
+    def test_rerun_unknown_node_errors(self, tmp_path, capsys):
+        from runner_v2.runtime import run_workflow, _cmd_rerun
+        proj = self._setup_three_node_proj(tmp_path)
+        wf = self._three_seq_workflow()
+        rd = proj / ".camflow" / "run"
+        run_workflow(wf, rd)
+
+        rc = _cmd_rerun([str(rd), "nonexistent"])
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "not in workflow" in captured.err
+
+    def test_rerun_with_steps(self, tmp_path):
+        """rerun + --steps halts cleanly mid-rerun."""
+        from runner_v2.runtime import run_workflow, _cmd_rerun
+        proj = self._setup_three_node_proj(tmp_path)
+        wf = self._three_seq_workflow()
+        rd = proj / ".camflow" / "run"
+        run_workflow(wf, rd)
+
+        # Rerun b (which would also redo c) but step-halt after 1 attempt
+        rc = _cmd_rerun([str(rd), "b", "--steps", "1"])
+        assert rc == 2  # halted by step limit
+        halt = json.loads((rd / "halt.json").read_text())
+        assert halt["kind"] == "breakpoint"
+        # b was re-run (attempt-2/), c was NOT yet
+        assert (rd / "nodes" / "b" / "attempt-2" / "output.json").exists()
+        assert not (rd / "nodes" / "c" / "attempt-2").exists()
+
+    def test_rerun_clears_old_halt(self, tmp_path):
+        """Rerunning after a halt clears halt.json before re-executing."""
+        from runner_v2.runtime import run_workflow, _cmd_rerun
+        proj = tmp_path / "proj"
+        scripts = proj / "scripts"
+        scripts.mkdir(parents=True)
+        # Tool that always succeeds — we'll halt via --steps
+        make_executable_tool(scripts / "ok.sh", envelope_tool_body({"x": 1}))
+        wf = {
+            "workflow": "rh", "version": "1.0",
+            "nodes": [
+                {"id": "p", "goal": "g", "steps": ["s"],
+                 "run": {"tool": "scripts/ok.sh"},
+                 "output_schema": {"x": "integer"},
+                 "verify": {"command": "true"}},
+                {"id": "q", "goal": "g", "steps": ["s"],
+                 "needs": ["p"],
+                 "run": {"tool": "scripts/ok.sh"},
+                 "output_schema": {"x": "integer"},
+                 "verify": {"command": "true"}},
+            ],
+        }
+        rd = proj / ".camflow" / "run"
+        # Step-halt mid-flow → halt.json present
+        run_workflow(wf, rd, max_attempts=1)
+        assert (rd / "halt.json").exists()
+        # Now rerun p — should clear the halt.json and complete
+        rc = _cmd_rerun([str(rd), "p"])
+        assert rc == 0
+        assert not (rd / "halt.json").exists()

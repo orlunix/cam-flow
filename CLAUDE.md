@@ -102,6 +102,12 @@ Highlights of the v1.1 spec to keep top-of-mind:
   stay pristine; resume picks up without resetting state. Built on
   the existing halt+resume infrastructure, no new lifecycle states.
   See spec §14.
+- **`camflow rerun <run_dir> <node_id>`** — re-execute a specific
+  node and all its downstream descendants (their inputs depend on it,
+  so they must re-run too). Upstream stays as-is. Works on either a
+  halted or a successfully-completed run. Common use: "I changed
+  SKILL.md for node X, redo from X." Shares ~80% of code with
+  `resume`. See spec §14.
 
 ## Project layout
 

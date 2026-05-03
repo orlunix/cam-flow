@@ -1142,7 +1142,10 @@ class Workflow:
                         if nid in ready_set)
             node.lifecycle = "running"
 
-            attempt_n = node.retry_count + 1
+            # Next attempt number = how many attempts already on disk + 1.
+            # We use len(node.history), not retry_count, so this is robust
+            # after resume / rerun where history is restored from disk.
+            attempt_n = len(node.history) + 1
             envelope = node.execute_attempt(self, attempt_n)
             attempts_run += 1
 
@@ -1368,6 +1371,109 @@ def _builtin_planner_dir() -> Path:
     return _camflow_repo_root() / "builtin" / "planner"
 
 
+def _downstream_set(wf: "Workflow", root_id: str) -> set[str]:
+    """Return {root_id} ∪ all transitive descendants in the DAG.
+
+    Used by `_cmd_rerun` to find every node that must be reset when a
+    given node is re-executed (their inputs depend on the target).
+    """
+    children: dict[str, list[str]] = {nid: [] for nid in wf.nodes_by_id}
+    for n in wf.nodes_by_id.values():
+        for dep in n.needs:
+            children.setdefault(dep, []).append(n.id)
+    result: set[str] = set()
+    stack = [root_id]
+    while stack:
+        cur = stack.pop()
+        if cur in result:
+            continue
+        result.add(cur)
+        stack.extend(children.get(cur, []))
+    return result
+
+
+def _cmd_rerun(argv: list[str]) -> int:
+    """`camflow rerun <run_dir> <node_id>` — re-execute target + downstream."""
+    p = argparse.ArgumentParser(
+        prog="camflow rerun",
+        description=("Re-execute a specific node and all its downstream "
+                     "descendants. Upstream nodes stay as they are."),
+    )
+    p.add_argument("run_dir")
+    p.add_argument("node_id",
+                   help="id of the node to re-run; downstream nodes are "
+                        "automatically reset too (their inputs depend on it)")
+    p.add_argument("--feedback", default="",
+                   help="optional feedback spliced into the target node's "
+                        "last envelope; surfaces as input.previous.feedback")
+    p.add_argument("--steps", type=int, default=None,
+                   help="(debug) halt cleanly after N more node-attempts")
+    args = p.parse_args(argv)
+    if args.steps is not None and args.steps < 1:
+        print("ERROR: --steps must be >= 1", file=sys.stderr)
+        return 1
+
+    rd = Path(args.run_dir)
+    wf_path = rd / "workflow.yaml"
+    if not wf_path.exists():
+        print(f"ERROR: no workflow.yaml at {wf_path}", file=sys.stderr)
+        return 1
+    workflow = yaml.safe_load(wf_path.read_text())
+
+    wf = Workflow(workflow, rd, resume=True)
+
+    # Replay history (same as resume).
+    summary = _summarize_run(rd)
+    for nrec in summary["nodes"]:
+        node = wf.nodes_by_id.get(nrec["id"])
+        if node is None or not nrec["attempts"]:
+            continue
+        node.history = list(nrec["attempts"])
+        last = node.history[-1]
+        node.output = last
+        node.retry_count = len(nrec["attempts"]) - 1
+        node.lifecycle = "done"
+        node.result = "success" if last.get("status") == "success" else "fail"
+
+    if args.node_id not in wf.nodes_by_id:
+        print(f"ERROR: node '{args.node_id}' not in workflow. "
+              f"Known: {sorted(wf.nodes_by_id)}", file=sys.stderr)
+        return 1
+
+    # Reset target + every descendant. They re-execute; their previous
+    # attempts stay on disk under attempt-N/ (new ones append as N+1).
+    targets = _downstream_set(wf, args.node_id)
+    for nid in sorted(targets):
+        node = wf.nodes_by_id[nid]
+        node.lifecycle = "waiting"
+        node.result = None
+        # Splice user feedback into ONLY the explicit target's last attempt
+        # (downstream nodes get automatic upstream injection on next run).
+        if nid == args.node_id and args.feedback and node.history:
+            node.history[-1] = {**node.history[-1],
+                                "feedback": args.feedback}
+            node.output = node.history[-1]
+        # Bump retry_max so the scheduler will actually try again.
+        node.retry_max = max(node.retry_max + 1, node.retry_count + 1)
+
+    wf.lifecycle = "running"
+    halt_path = rd / "halt.json"
+    if halt_path.exists():
+        halt_path.unlink()
+
+    wf.trace("workflow_rerun", node=args.node_id,
+             downstream=sorted(targets - {args.node_id}),
+             feedback_len=len(args.feedback))
+
+    print(f"rerunning {args.node_id}"
+          + (f" (+ {len(targets)-1} downstream)" if len(targets) > 1 else ""),
+          file=sys.stderr)
+    result = run_workflow(workflow, rd, resume_with_run=wf,
+                          max_attempts=args.steps)
+    print(f"result: {result}", file=sys.stderr)
+    return _result_to_exit(result)
+
+
 def _cmd_run(argv: list[str]) -> int:
     """`camflow run "<prompt>"` — spawn Planner, execute its output."""
     p = argparse.ArgumentParser(
@@ -1498,11 +1604,12 @@ def main(argv: list[str] | None = None) -> int:
             "camflow — prompt-driven, multi-agent workflow runner\n"
             "\n"
             "Usage:\n"
-            "  camflow run \"<prompt>\"          compile + run (fire-and-forget)\n"
-            "  camflow run -i \"<prompt>\"       compile + pause for plan approval, then run\n"
-            "  camflow run --steps N \"<...>\"   (debug) halt after N node-attempts\n"
-            "  camflow resume <run_dir>         resume a halted run\n"
-            "  camflow resume <run_dir> --steps N  resume but advance only N more attempts\n"
+            "  camflow run \"<prompt>\"           compile + run (fire-and-forget)\n"
+            "  camflow run -i \"<prompt>\"        compile + pause for plan approval, then run\n"
+            "  camflow run --steps N \"<...>\"    (debug) halt after N node-attempts\n"
+            "  camflow resume <run_dir>          resume a halted run\n"
+            "  camflow resume <run_dir> --steps N   resume but advance only N more attempts\n"
+            "  camflow rerun <run_dir> <node_id> re-execute a specific node + downstream\n"
             "\n"
             "Inspect a run:  cat .camflow/run/trace.jsonl\n"
             "Stop a run:     kill $(cat .camflow/run/runner.pid)\n",
@@ -1514,6 +1621,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_run(argv[1:])
     if cmd == "resume":
         return _cmd_resume(argv[1:])
+    if cmd == "rerun":
+        return _cmd_rerun(argv[1:])
     print(f"ERROR: unknown subcommand '{cmd}'. "
           f"Try `camflow --help`.", file=sys.stderr)
     return 1
