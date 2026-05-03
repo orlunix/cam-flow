@@ -45,13 +45,19 @@ SHIPPED_SKILLS_DIR = ROOT / "skills"
 #
 # These are the dirs where stale v0.x semantics would mislead the
 # runtime, the Planner, or future contributors. `archive/` is exempt
-# (that's literally where deprecated content lives), and the codex
-# review doc itself is exempt (it discusses what to grep for).
+# (that's literally where deprecated content lives); review notes
+# under docs/ that *discuss* deprecated keywords by name are also
+# excluded by file-pattern (see ACTIVE_CONTRACT_FILES below).
 ACTIVE_CONTRACT_FILES = [
     *(BUILTIN_PLANNER_DIR.rglob("*.md")),
     *(BUILTIN_PLANNER_DIR.rglob("*.yaml")),
     *(SHIPPED_SKILLS_DIR.rglob("*.md")),
     ROOT / "docs" / "spec.md",
+    # Top-level project docs are also user-facing contract: a future
+    # contributor reading CLAUDE.md or README.md must see only v1.1
+    # paths and conventions.
+    ROOT / "CLAUDE.md",
+    ROOT / "README.md",
 ]
 
 # Patterns that indicate pre-v1.1 contract leaking into active files.
@@ -66,6 +72,8 @@ DEPRECATED_PATTERNS = [
     r"\bretry\.until\b",      # old retry-expression mechanism
     r"^\s*uses:",             # v0.x `uses: skill.X` syntax
     r'status:\s*"?halted"?',  # status enum value that doesn't exist
+    r"\bverify-N\b",          # run-dir doc residue: it's `verify/`, not `verify-N/`
+    r"verify-<n>",            # ditto, parameterized form
 ]
 
 
@@ -266,6 +274,8 @@ class TestNoDeprecatedSemantics:
             "cannot declare",  # spec phrasing for "this is forbidden"
             "auto-injected",   # cuts-table cells routinely use this
             "is internal counter",  # ditto
+            "all cut",         # CLAUDE.md DO/DON'T phrasing
+            "don't bring back",  # CLAUDE.md DO/DON'T phrasing
         ]
         return any(m in lower for m in negation_markers)
 

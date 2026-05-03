@@ -182,7 +182,7 @@ Every `camflow run` writes to `<project>/.camflow/run/`:
     ├── prompt.txt                     # full prompt sent to camc (skill nodes)
     ├── agent_output.json              # what the agent wrote
     ├── output.json                    # validated envelope
-    └── verify-N/                      # only when verify=agent
+    └── verify/                        # only when verify=agent
         ├── prompt.txt
         ├── agent_output.json
         └── output.json
