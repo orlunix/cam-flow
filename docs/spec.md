@@ -826,7 +826,7 @@ verify-agent reviewing Planner's output:
 │           ├── agent_output.json     # what the agent wrote
 │           ├── output.json           # runtime-validated envelope
 │           ├── agent.id              # camc agent ID (debug)
-│           └── verify-<n>/           # if verify=agent, sub-directory
+│           └── verify/                # if verify=agent, sub-directory
 │               ├── prompt.txt
 │               ├── agent_output.json
 │               └── output.json
@@ -1122,7 +1122,7 @@ cat <run_dir>/halt.json                                            # why we paus
 cat <run_dir>/nodes/<id>/attempt-N/prompt.txt                      # what the agent saw
 cat <run_dir>/nodes/<id>/attempt-N/agent_output.json               # what it wrote
 cat <run_dir>/nodes/<id>/attempt-N/output.json                     # what runtime validated
-cat <run_dir>/nodes/<id>/attempt-N/verify-N/agent_output.json      # verify-agent reasoning
+cat <run_dir>/nodes/<id>/attempt-N/verify/agent_output.json        # verify-agent reasoning
 ```
 
 There is no `camflow inspect` subcommand because there doesn't need

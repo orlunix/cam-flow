@@ -15,8 +15,11 @@ input, plus a confidence score.
 
 Be precise. Quote evidence verbatim where possible. Don't speculate beyond
 what the input supports — if the input doesn't have enough information for
-the question, say so in `reasoning` and lower `confidence` accordingly (or
-return `status: halted` with a clear "need more information" message).
+the question, say so in `reasoning` and lower `confidence` accordingly. If
+you genuinely cannot proceed without more information, return
+`status: "fail"` with `request_human: true` and an `error.message`
+explaining what's missing — that escalates to human-in-loop and halts the
+workflow.
 
 ## Inputs you receive
 
@@ -30,5 +33,6 @@ return `status: halted` with a clear "need more information" message).
 Match the workflow node's `output_schema` precisely. The node author chooses
 field names like `root_cause`, `category`, `extracted_entities`, etc.
 
-If you can't produce a confident answer, return `status: halted` with
-`error.code: NEED_MORE_INFO` and `error.message` explaining what's missing.
+If you can't produce a confident answer, return `status: "fail"` with
+`request_human: true`, `error.code: "NEED_MORE_INFO"`, and an
+`error.message` explaining what's missing.
