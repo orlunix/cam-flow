@@ -1,527 +1,1465 @@
-# Minimal Agent Workflow Spec v0.6
+# camflow spec v1.1
 
-Status: **draft for review**.
-Origin: v0.5 (Huailu) + v0.6 fills (5 must, 4 small, 3 confirms).
-Principles: **local first, stability first, simple first**.
+A self-hosting, prompt-driven workflow runner for multi-agent DAGs.
+**One verb. Two classes. Strict contracts. Same interface as `camc`.**
 
----
-
-## 1. 核心设计原则
-
-- DAG 表达依赖（`needs`），runner 串行执行
-- 不支持 `next` / `goto` / 并行
-- 支持 fan-in / fan-out（在串行下退化为声明顺序）
-- `retry` 是唯一回退机制
-- 所有 node output 统一 envelope
-- trace 记录每一步执行原因
-
-> DAG for dependency modeling, serial runner for execution.
+> Spec version: **1.1**. Workflow authors should declare
+> `version: "1.1"` at the top of their `workflow.yaml`. Runtime
+> currently does not enforce this field, but a future version bump
+> (1.2 / 2.0) may.
 
 ---
 
-## 2. 五种 Component
+## 0. Mental model
 
-| Component | 角色 |
+```
+camc    run "<prompt>"  →  one agent runs alone, hopes for the best
+camflow run "<prompt>"  →  a builtin Planner workflow compiles the prompt
+                           into a DAG of high-quality, verified nodes,
+                           then a Runtime executes that DAG
+```
+
+User-facing CLI is identical in shape: `<verb> "<prompt>"`. The difference is what happens after — camflow self-hosts a Planner that emits a `workflow.yaml`, which the same Runtime then executes node-by-node with retry + verify.
+
+> **camflow uses camflow to compile camflow.** The Planner is not a special
+> path — it's a builtin workflow that goes through the same `Workflow`/`Node`
+> machinery as user workflows. Same retry. Same halt. Same trace. Same camc
+> spawning. If the Planner's nodes fail or halt, you see exactly the same
+> halt.json + trace.jsonl format.
+
+```
+user prompt                       (the only external input)
+   ↓
+Planner workflow                  (camflow/builtin/planner/workflow.yaml)
+   ↓
+workflow.yaml                     (intermediate representation; .camflow/run/workflow.yaml)
+   ↓
+Runtime executor                  (loads the IR; runs each node via camc)
+   ↓
+trace.jsonl + per-attempt outputs
+```
+
+Mapping to compiler vocabulary:
+
+| compiler concept | camflow equivalent |
 |---|---|
-| Workflow | 一次完整任务（goal + state schema + nodes） |
-| Node | 最小执行单元（声明依赖、调用、输入、输出格式、verify、retry） |
-| Skill / Agent / Tool | `uses` 指向的实际执行者 |
-| Verify | Node 内部检查（schema / rule / agent） |
-| Runner | 解析 DAG、选 ready node、串行执行、写 output / trace |
+| Source code | user prompt |
+| Compiler | Planner workflow |
+| IR (intermediate representation) | `.camflow/run/workflow.yaml` |
+| Linker / interpreter | Runtime executor |
+| Build artifacts | `trace.jsonl`, `nodes/<id>/attempt-<n>/output.json` |
+
+There is **no non-interactive bypass** for fresh-prompt runs — every `camflow run "<prompt>"` goes through Planner. The only way `camflow` compiles a new workflow.yaml is by having Planner produce one. (`camflow resume <run_dir>` and `camflow run --from <node>` operate on an *existing* run dir's compiled workflow.yaml — they do not re-invoke Planner.)
 
 ---
 
-## 3. Workflow 格式
+## 1. The DAG — Workflow and Node
+
+camflow is two cooperating classes:
+
+```python
+class Workflow:
+    # static (from YAML)
+    name           : str
+    goal           : str | None
+    context        : str | None        # shared prompt injected into every node
+    nodes          : list[Node]        # children, in declaration order
+
+    # runtime (mutated during execute_dag)
+    lifecycle      : "running" | "done" | "halted"
+    step_n         : int               # trace event counter
+    run_id         : str
+    tag            : str               # camc crash-safety tag
+
+    # I/O paths
+    run_dir, trace_path, pid_path, project_root
+
+    # behavior — schedules; does NOT itself run or verify
+    def execute_dag()        -> "done" | "halted"
+    def expr_ctx()           -> dict
+    def trace(event, **f)    -> None
+    def halt(node, reason, env) -> None
+    def cleanup()            -> None
+```
+
+```python
+class Node:
+    # static (from YAML)
+    id              : str
+    goal            : str
+    steps           : list[str]
+    needs           : list[str]
+    output_schema   : dict             # field → type
+    retry_max       : int              # default 1 = no retry
+    run_config      : {"skill": str} | {"tool": str}    # XOR; skill is default (see §10)
+    verify_config   : None
+                    | {"criterion": str}     # agent verify with override
+                    | {"command": str, "timeout"?: int}
+                    | {"human": str}         # 
+
+    # runtime (mutated by execute_attempt)
+    lifecycle       : "waiting" | "running" | "done"
+    result          : "success" | "fail" | None
+    retry_count     : int
+    output          : envelope | None
+    history         : list[envelope]
+
+    # behavior
+    def run(workflow, attempt_n)         -> envelope
+    def verify(workflow, envelope)       -> (ok, feedback)
+    def execute_attempt(workflow, n)     -> envelope    # = run + verify + persist
+    def is_ready(all_nodes)              -> bool
+    def is_done()                        -> bool
+```
+
+### Why Workflow and Node don't share methods
+
+Different layers, different semantics:
+
+| | `run` does | `verify` does |
+|---|---|---|
+| Node | runs a skill (camc-spawned agent) — or a tool (shell script) for narrow mechanical cases — does the actual work | checks one envelope (schema + criterion / command / human) |
+| Workflow | **doesn't exist** — Workflow has `execute_dag` (scheduler), not `run` | **doesn't exist** — Workflow's correctness = aggregate of children |
+
+They share **data vocabulary** (`goal`, `lifecycle`, `result` as attribute names) but **not behavior**. Workflow is a composer; Node is an executor.
+
+### DAG scheduling
+
+`Workflow.execute_dag()` is a serial loop:
+
+```
+while workflow.lifecycle == "running":
+    ready = [n for n in workflow.nodes if n.is_ready(all_nodes)]
+    if not ready:
+        if all done       → workflow.lifecycle = "done"; return "done"
+        else              → deadlock; halt and return "halted"
+    pick first ready by YAML declaration order
+    envelope = node.execute_attempt(workflow, attempt_n)
+    if envelope.success:                node done+success; continue
+    if envelope.request_human:          workflow halt (skip retry)
+    if node.retry_count < retry_max:    retry_count++; continue (loop picks same node next iter)
+    else:                                workflow halt
+```
+
+No parallelism in this spec. One node at a time, deterministic order.
+
+---
+
+## 2. State machines
+
+### Workflow.lifecycle
+
+```
+Workflow.lifecycle ∈ { running, done, halted }
+```
+
+| value | meaning | exit code |
+|---|---|---|
+| `running` | at least one node hasn't reached `done` | — |
+| `done` | all nodes are `done+success` | 0 |
+| `halted` | a node ended `done+fail` (retry exhausted) OR `request_human=true` | 2 |
+
+A `halted` workflow is recoverable via `camflow resume <run_dir>`.
+
+### Node.lifecycle + Node.result
+
+```
+Node.lifecycle ∈ { waiting, running, done }
+Node.result    ∈ { success, fail }   (only when lifecycle=done)
+```
+
+| state | meaning |
+|---|---|
+| `waiting` | not yet started, or some `needs` not yet `done+success` |
+| `running` | currently executing (between-retry transitions stay `running`) |
+| `done+success` | run + verify both passed |
+| `done+fail` | retry exhausted, or run set `request_human=true` |
+
+Internal counters:
+
+```
+Node.retry_count : int   # 0 on first attempt, ++ on each retry
+Node.retry_max   : int   # from YAML, default 1 (no retry)
+```
+
+`Node.lifecycle` does **not** have a `halted` state — only Workflow halts.
+
+---
+
+## 3. Top-level workflow YAML
 
 ```yaml
-workflow: fix_error
-version: 0.6
+workflow: <name>                  # display name
+version: "1.1"                    # spec version this workflow targets
 
-goal: |
-  Diagnose the provided error, propose a minimal safe fix,
-  validate the fix, and summarize the result.
+goal: |                           # optional, top-level intent (planner often fills this)
+  ...
 
-state:
-  error:
-    type: string
-    required: true
-  max_attempts:
-    type: integer
-    default: 3
+context: |                        # optional, shared prompt injected into every node
+  Free-form text. Planner typically writes this section to encode:
+  - the original user prompt (so every downstream node sees it)
+  - run-constants (tree names, paths, tools available, conventions)
+  - any inferred preconditions or constraints
+  Becomes a `# Workflow Context` block above each node's `# Goal`.
 
 nodes:
-  - id: analyze
-    goal: Identify the root cause.
-    uses: skill.analyze
-    input:
-      error: "{{state.error}}"
+  - <Node>
+  - ...
+```
+
+There is **no `inputs:` section, no `state:` section**. The only external input to a camflow run is the user prompt, which Planner consumes. After Planner is done, the workflow.yaml is fully self-contained — all its variability has been encoded into nodes' goals/steps and the `context` block.
+
+### `context:` semantics
+
+`context` is a literal string injected verbatim into every Node's run-prompt and verify-prompt, between the skill template and the node's `# Goal`. It is **not** templated, **not** mutable.
+
+Use `context` for prompt-shared facts — including the original user prompt, which Planner writes here.
+
+---
+
+## 4. Node YAML schema
+
+```yaml
+- id: <string>                    # REQUIRED, unique within workflow
+  goal: <string>                  # REQUIRED, one-line intent
+  steps:                          # REQUIRED, list[string]
+    - "step 1"                    # ← shared between run prompt + verify checklist
+    - "step 2"
+  needs: [<node_id>, ...]         # optional, default []
+
+  run:                            # REQUIRED — exactly one of:
+    skill: <skill_name>           # default and strongly preferred (see §10)
+    # OR
+    tool: <path>                  # narrow escape hatch — only if ALL 5 criteria
+                                   # in §10 hold. Stdin=input.json; stdout=envelope.
+                                   # NOTE: no `input:` field; upstream is auto-injected.
+
+  output_schema:                  # optional but recommended
+    field_name: <type>            # type ∈ {string, integer, number, boolean, array}
+
+  verify:                         # optional; default = agent + steps as criterion
+    criterion: <override>         # OR command: <bash>  OR human: <prompt>
+    timeout: <int>                # only with command, default 60
+
+  retry: <int>                    # optional, default 1 (first attempt only, no retry)
+```
+
+### Required vs optional
+
+| field | required | default |
+|---|---|---|
+| `id` | ✅ | — |
+| `goal` | ✅ | — |
+| `steps` | ✅ | — |
+| `run` | ✅ | — |
+| `run.skill` or `run.tool` | ✅ (one of) | — |
+| `needs` | ❌ | `[]` |
+| `output_schema` | ❌ | `{}` (no field-presence check) |
+| `verify` | ❌ | implicit `agent + steps` |
+| `retry` | ❌ | `1` |
+
+### Phase rules
+
+- **Run phase**: every node has exactly **one** of:
+  - `run: { skill: <name> }` — **default and strongly preferred** (see §10).
+  - `run: { tool: <path> }` — narrow escape hatch with hard criteria (see §10).
+- **Verify phase**: at most one of `verify.criterion` / `verify.command` /
+  `verify.human`. `verify.command` is the canonical deterministic gate.
+
+`run.skill XOR run.tool` (exactly one). The two are mutually exclusive.
+
+> **Why two run options?** Real workflows have two kinds of work:
+> *integrative* (read code, interpret output, decide next step) and
+> *mechanical* (run pytest, format file). Skills do the first well but
+> are slow + expensive for the second. Tool is the escape hatch for
+> the second — see §10 for the hard criteria gating its use.
+
+### No `run.input` field
+
+A node cannot declare `run.input: { key: "{{...}}" }` to template per-run user input into its prompt:
+
+* User-supplied per-run state doesn't exist (no `inputs:`/`state:` mechanism).
+* Cross-node data flow is automatic: every `needs` node's output is injected into the consumer's prompt as `# Upstream Outputs` (see §8).
+* Templating still exists, but only inside `verify.command` (see §7).
+
+---
+
+## 5. Envelope shape (Node output)
+
+Every `Node.execute_attempt` produces one envelope:
+
+```json
+{
+  "status":         "success" | "fail",
+  "data":           { ... },
+  "error":          null | { "code": "...", "message": "..." },
+  "feedback":       null | "...",
+  "request_human":  false
+}
+```
+
+### Field rules
+
+| field | when required | who writes |
+|---|---|---|
+| `status` | always | run agent / tool |
+| `data` | when `status=success`, must satisfy `output_schema` | run |
+| `error` | when `status=fail`, must have `{code, message}` | run, OR runtime (on verify-fail) |
+| `feedback` | when verify ran | verify (runtime, agent, command, or human) |
+| `request_human` | optional, default `false` | run or verify |
+
+### Status values
+
+```
+"success"   = run produced data per schema AND verify passed
+"fail"      = run failed, OR verify rejected, OR run timed out
+```
+
+No `"halted"`, `"skipped"`, `"ok"`, `"done"`, `"completed"`, etc.
+Runtime treats unknown status as fail with `error.code = "BAD_STATUS"`.
+
+### Halt triggers
+
+Workflow halts when **any** of:
+
+1. A Node ends `done+fail` (retry exhausted or no retry configured).
+2. A Node sets `request_human=true` in its envelope (skips retry).
+
+Halt writes `<run_dir>/halt.json` and propagates downstream nodes to `done+fail`.
+
+---
+
+## 6. Per-attempt sequence
+
+`Node.execute_attempt(workflow, attempt_n) -> envelope`:
+
+```
+1. node.lifecycle = "running"
+2. Build attempt input by collecting:
+     - upstream outputs (one entry per `needs` id, full envelope)
+     - on retry (n>1), `previous` = last attempt's envelope
+   Write attempt-N/input.json
+3. Call node.run(workflow, attempt_n) → returns envelope
+     - skill: spawn camc agent with the assembled prompt (see §8); agent
+       writes envelope to agent_output.json and exits
+     - tool:  subprocess; stdin=input.json, stdout=envelope JSON
+4. If envelope.status == "fail" → return envelope (caller decides retry/halt)
+5. If envelope.status == "success":
+     a. auto_schema_check(envelope, output_schema)
+        if fails → status="fail", error=VERIFY_FAIL, return
+     b. node.verify(workflow, envelope) → (ok, feedback)
+        - {command}: bash exit-code
+        - {human}: stdin Q&A (see §9)
+        - {criterion} or default: spawn evaluator agent
+        if not ok → status="fail", error=VERIFY_FAIL, feedback=<reason>, return
+6. node.lifecycle="done", node.result="success"
+7. Persist envelope → attempt-N/output.json
+8. Return envelope
+```
+
+### Retry feedback channel
+
+On retry, runtime auto-injects `previous` into next attempt's input:
+
+```json
+// attempt-2/input.json
+{
+  "upstream": { ... },                   // same as attempt-1
+  "previous": {                          // auto-injected on retry
+    "status": "fail",
+    "data": {...},
+    "error": {...},
+    "feedback": "<verify's reason — could be from agent, command, OR human>"
+  }
+}
+```
+
+The agent reads `input.previous.feedback` to know what went wrong. Particularly important when the previous attempt was rejected by a `verify=human` — the human's complaint becomes the next attempt's feedback.
+
+---
+
+## 7. Templates
+
+Templating is deliberately minimal. Only one place uses it:
+
+### Allowed location
+
+- `verify.command` string body (bash interpolation).
+
+### Namespaces
+
+| namespace | meaning | example |
+|---|---|---|
+| `nodes.<id>.output.X` | upstream node's data | `{{nodes.diagnose.output.data.cause}}` |
+| `output.X` | the current envelope being verified (verify.command only) | `{{output.data.passed}}` |
+
+`output.X` is exposed only inside `verify.command`. Outside that (e.g. in any future template-bearing field), only `nodes.X.output` is visible.
+
+### Removed
+
+- `{{state.X}}` — there's no state/inputs concept anymore.
+- `{{inputs.X}}` — same.
+- `.latest`, `.attempts[N]`, `retry.*` — not supported, not planned.
+
+### Expression operators (verify.command only)
+
+`==`, `!=`, `<`, `<=`, `>`, `>=`, `and`, `or`, `not`, attribute chain, `[index]`.
+
+---
+
+## 8. Run prompt structure (auto-built by runtime)
+
+```
+[skill template / SKILL.md content]    ← from skills/<name>/SKILL.md
+
+# Workflow Context                     ← only if workflow.context is non-blank
+<workflow.context>
+                                        (Planner usually writes the original
+                                         user prompt + run-constants here.)
+
+# Goal
+<node.goal>
+
+# Steps (you MUST do these in order)
+1. <node.steps[0]>
+2. <node.steps[1]>
+...
+
+# Upstream Outputs                     ← only if node.needs is non-empty
+## <upstream_node_id_1>
+<JSON of that node's envelope>
+
+## <upstream_node_id_2>
+<JSON of that node's envelope>
+...
+
+# Note: previous attempt failed       ← only on retry (attempt_n > 1)
+Inputs include `previous` with the last attempt's envelope. Read
+`previous.feedback` to know what went wrong; address it this time.
+
+# Output
+Write a single JSON envelope to `agent_output.json` in cwd:
+{
+  "status": "success" | "fail",
+  "data": {...matching output_schema},
+  "error": null | {"code": "...", "message": "..."},
+  "feedback": null,
+  "request_human": false
+}
+
+## data shape (required when status=success)
+<output_schema rendered as field: type list>
+
+## Rules
+- status MUST be "success" or "fail" (not "ok"/"done"/etc).
+- success → data contains all schema fields with correct types.
+- fail → error MUST have non-empty code + message.
+- request_human=true to escalate (skips retry, halts workflow).
+- Don't print to stdout; only write the file. Don't use markdown fences.
+```
+
+For `run.tool:`: the prompt is N/A. The tool subprocess receives
+`input.json` (containing `upstream` + `previous`) on stdin and is
+required to write the envelope JSON to stdout.
+
+---
+
+## 9. Verify types
+
+Three mutually-exclusive verify configurations, plus a default:
+
+### Default: `verify=agent` (criterion = node.steps as checklist)
+
+If `verify` is omitted, runtime spawns an evaluator agent that reads node.steps as the implicit checklist. Evaluator's data shape is fixed:
+
+```json
+{
+  "approved": true | false,
+  "step_results": [
+    {
+      "step": 1,
+      "passed": true | false,
+      "evidence": "<verbatim quote / file:line / cmd output>",
+      "reasoning": "<one sentence why this step passed or failed>"
+    },
+    ...
+  ],
+  "reasoning": "<one sentence overall>"
+}
+```
+
+`step_results` length = `len(node.steps)`. On reject, the full
+step_results entries (including `evidence`) are concatenated into the
+feedback string for the next retry — so the run agent sees both what
+verify objected to AND what verify did or didn't look at.
+
+#### Evidence protocol (no hollow approves)
+
+The verify-agent prompt is built with an explicit evidence protocol
+to prevent rubber-stamp approves. For every step marked
+`passed: true`, the agent MUST cite concrete evidence in the
+`evidence` field — not vibes, not echoed step text, not "the envelope
+says it was done".
+
+Acceptable evidence:
+
+* a verbatim quote from `envelope.data.<field>` ("data.root_cause = ...")
+* a file path + line range the agent inspected via Read/Bash, with the
+  relevant lines quoted
+* literal output of a check command the agent ran in the attempt
+  directory ("pytest -q" → "5 passed in 0.3s")
+
+If the agent can't find concrete evidence for a step, it must mark it
+`passed: false` and explain what's missing in `reasoning`. Better to
+bounce work back to the run agent with specific feedback than to
+rubber-stamp.
+
+This is enforced via the prompt only — no runtime check rejects an
+approved-with-empty-evidence response. The principle is to make hollow
+approves uncomfortable to write rather than impossible. If you observe
+the verify-agent gaming this in practice, file an issue and we
+consider runtime enforcement.
+
+### `verify: { criterion: <text> }`
+
+Same as default-agent but with an override criterion text. The evaluator considers steps + criterion together.
+
+### `verify: { command: <bash>, timeout?: <int> }`
+
+```bash
+bash -c <command-template-after-rendering>
+```
+
+Run in the attempt directory. Exit 0 → approved. Non-zero → rejected; feedback = stderr/stdout snippet (≤300 chars). Default timeout 60s.
+
+### `verify: { human: <prompt-text-shown-to-user> }`
+
+Human approval has **two opt-in mechanisms**, both off by default:
+
+**1. Plan-level approval (review the compiled workflow.yaml).**
+Triggered by the `-i` / `--interactive` flag on `camflow run`. When set,
+the runtime patches Planner's `render_yaml` node at startup to use
+`verify: { human: ... }` — after Planner finishes designing, the user
+sees the compiled workflow.yaml and must type `approve` before the
+runtime executes it (or describe a change to drive a Planner revision).
+**Default (no `-i`)**: Planner's `render_yaml` uses its declared
+agent-criterion verify and the runtime executes whatever passes that —
+fire-and-forget.
+
+**2. In-flow approval (review a specific user-workflow node's
+output mid-execution).** Planner inserts `verify: { human: ... }` on a
+user-workflow node only when the user's *prompt itself* explicitly
+asked for in-flow review on that step ("show me the patch before
+applying", "let me sanity-check the regex"). Inserting it on nodes
+the user didn't ask about is a UX regression — it stalls the workflow.
+
+In both cases, the runtime mechanic is identical. The question is
+*who decides to insert it*:
+
+| context | default | how to opt-in |
+|---|---|---|
+| Plan-level (`render_yaml`) | absent — fire-and-forget | `camflow run -i "<prompt>"` |
+| User-workflow node | absent | user mentions in-flow review in the prompt; Planner's `workflow_designer` skill detects it |
+
+Note: `-i` flag controls only the plan-level gate. It does NOT cause
+the Planner to sprinkle `verify: human` across user-workflow nodes.
+
+Runtime prints to stdout:
+
+```
+─── Human verify required: <node.id> ───
+<envelope.data rendered as JSON, indented>
+
+<the human prompt-text>
+
+Type 'approve' to accept, or describe what to change:
+> _
+```
+
+Reads one line from stdin:
+
+* If line equals `"approve"` (case-insensitive, whitespace-trimmed) → approved → node done+success.
+* Anything else → rejected; that line becomes the feedback for retry.
+* EOF / no-TTY (stdin not connected to a terminal) → reject with feedback `"no TTY available for human verify"`. The next attempt fails the same way unless the user runs `camflow resume` from a TTY.
+
+The retry mechanic is identical to other verify types: rejection → `previous.feedback` on next attempt → run agent regenerates with that feedback. retry_max applies normally.
+
+---
+
+## 10. Skills — registry, layout, lifecycle
+
+A **skill** is a directory containing a `SKILL.md` markdown file. The
+file is opaque from the runtime's perspective: it gets injected
+verbatim as the first section of every node prompt that references the
+skill. SKILL.md content gives the agent its identity, conventions,
+output contract, and recovery rules.
+
+### Layout
+
+```
+<dir>/skills/<skill_name>/SKILL.md          ← the only required file
+                          │
+                          └─ optionally accompanied by examples,
+                             reference data, or sub-skill files
+                             that the SKILL.md itself references
+```
+
+### Resolution order
+
+`run.skill: <name>` is searched in this order at workflow-load:
+
+| order | path | who owns |
+|---|---|---|
+| 1 | `<project>/skills/<name>/SKILL.md` | the project (workflow author) |
+| 2 | `<camflow_repo>/skills/<name>/SKILL.md` | shipped with camflow |
+| 3 | `<camflow_repo>/builtin/<name>/skills/<name>/SKILL.md` | builtin-workflow-private (only when the running workflow IS the builtin, e.g. Planner) |
+
+The first match wins. The Planner's project_root is overridden to its
+own builtin directory so its private skills (`prompt_analyzer`,
+`workflow_designer`, `yaml_writer`) don't pollute the global namespace.
+
+### Strict registry (load-time enforcement)
+
+* **Workflow load fails if any referenced skill is missing.** No dynamic
+  creation, no fallback, no fuzzy matching. If Planner emits
+  `skill: my_new_idea` and `skills/my_new_idea/SKILL.md` doesn't exist,
+  the run never starts — fail-fast with a clear error.
+* This is a doctrine choice (rule #6): skills are checked-in artifacts,
+  not LLM-generated at runtime. Planner has to design within the
+  available skill set; it cannot invent skills mid-run.
+
+### Adding / managing skills
+
+To make a new skill `foo` available:
+
+```
+mkdir -p skills/foo
+cat > skills/foo/SKILL.md <<'EOF'
+# Skill: foo
+You are <identity>. Your job is <X>. ...
+EOF
+```
+
+That's it. The next workflow that references `skill: foo` resolves it.
+There's no manifest, no register-call, no tooling. The directory's
+existence + presence of `SKILL.md` is the registration.
+
+To remove a skill: delete the directory. Workflows that referenced it
+will fail to load (which is the desired behavior — silent drift is
+worse than a hard error).
+
+To version a skill: just edit `SKILL.md`. The old version is in git
+history. There's no in-tree multi-version mechanism (don't add one
+without RFC).
+
+### What SKILL.md should contain
+
+There is no schema; this is a recommendation:
+
+* **Identity** — "You are X. Your job is Y."
+* **Conventions** — coding style, output format, idioms expected.
+* **Process** — numbered steps for the typical case (mirrors the node's
+  own `steps:` checklist; redundancy is fine).
+* **Output contract** — the envelope shape, what `data` fields the
+  agent must produce. Runtime also injects this automatically, but
+  having it in SKILL.md helps the agent self-correct without re-reading
+  the auto-injection.
+* **On retry** — what to do when `previous.feedback` is present.
+
+### Worked example: `skills/code_writer/SKILL.md`
+
+A complete, realistic skill — given a function spec from upstream,
+emit Python code + pytest tests on disk. This is canonical *skill*
+territory (judgment, integration, retry-aware) — it could not be a
+tool node, since the script would have nothing to do beyond echoing.
+
+```markdown
+# Skill: code_writer
+
+You are a Python code writer. Given a function specification — passed
+in as upstream output from a design node — you produce the function
+plus pytest tests on disk.
+
+## Conventions
+
+- Append, don't overwrite. If `util.py` or `test_util.py` already
+  exist (created by earlier nodes in the DAG), append to them; other
+  functions and tests must keep working.
+- Standard library only. No external dependencies.
+- Type hints + docstrings on every function.
+- Tests use plain `def test_xxx():` (pytest), importing from `util`.
+
+## Inputs you'll see
+
+The runtime auto-injects these into your prompt:
+
+- `# Workflow Context` — project-wide conventions, output paths.
+- `# Upstream Outputs` — typically `upstream.design.data` carries the
+  function signature, behavior description, and edge cases to cover.
+- `# Steps` — this node's checklist, in order.
+
+There is no `run.input:` ; everything you need is above.
+
+## Process
+
+1. Read upstream's spec under `upstream.<id>.data`.
+2. Append the function to `<output_path>/util.py` (create if missing).
+3. Append the tests to `<output_path>/test_util.py` (create if missing).
+4. Optionally run pytest locally to sanity-check; the node's
+   `verify.command` will run it authoritatively.
+5. Write the envelope JSON and stop.
+
+## Output contract
+
+Match the node's `output_schema` exactly. Typical fields:
+
+- `summary` (string) — one sentence on what was added.
+- `func_name` (string) — the function name written.
+- `lines_added` (integer) — number of lines appended.
+
+On failure: `status = "fail"`, `error.code` ∈
+{`FILE_WRITE`, `AMBIGUOUS_SPEC`, `CONFLICT_WITH_EXISTING`}, plus an
+explanatory `error.message`.
+
+## On retry
+
+If `previous.feedback` is present in the input, read it carefully.
+Common reasons the previous attempt was rejected:
+
+- code didn't pass `verify.command` (pytest)
+- overwrote existing functions instead of appending
+- signature drifted from `upstream.design.data.signature`
+- missing edge-case tests called out in the design
+
+Address the specific feedback this attempt — do not re-emit the same
+code unchanged.
+```
+
+This skill is exercised by the worked workflow in Appendix A.
+
+### Tools available to skill agents
+
+A skill agent runs as `claude` spawned by camc, which by default grants
+Bash / Edit / Read / Write / Glob / Grep / WebFetch / TodoWrite. There
+is no per-skill tool-grant mechanism in camflow itself — that would
+require a runtime extension and an RFC. If you need a non-standard tool
+set, that's currently out of scope.
+
+### When to use `run.tool:` (hard rules)
+
+`run.tool: <path>` runs a shell script directly as the node's executor:
+stdin = `input.json` (with `upstream` + `previous`), stdout = envelope
+JSON. Workflow-load resolves it to `<project>/<path>` and fails if the
+file isn't `-x`.
+
+**Tool nodes are an escape hatch, not a coequal alternative to skills.**
+Use tool **only if ALL FIVE of these hold**:
+
+1. **Known command, no judgment.** The work is "run *this exact*
+   command" — pytest, prettier, terraform plan, make. There is no
+   decision to make about *what* to run.
+2. **Inputs are fully determined.** Everything the script needs is
+   already in `input.json` (i.e., from upstream envelopes); no extra
+   context-reading, no "look around the project to figure it out".
+3. **Output is structured by the script itself.** The script writes a
+   well-formed envelope. No LLM is needed to *interpret* command output
+   into `data` fields.
+4. **Idempotent and side-effect-bounded.** Re-running it is safe; the
+   side effects are confined to a known location (a build dir, a
+   formatter overwriting files, etc.).
+5. **Cost or speed actually matters.** This step runs often enough, or
+   in a loop, that the LLM startup overhead (10–30s + tokens per spawn)
+   is meaningful.
+
+**If ANY of those don't hold → use a skill.** In particular, use a
+skill when:
+
+* The node needs to **read multiple files and reason** about them.
+* The node needs to **handle cases** ("try X, if it fails apply Y").
+* The node needs to **interpret stdout/stderr** into structured data.
+* The node needs to **integrate `workflow.context`** into its action
+  (e.g., "respect the conventions stated in context").
+* The output requires **synthesis** of more than what the script
+  literally prints.
+* You're unsure. **Default to skill.**
+
+A skill agent can always shell out via Bash, so anything a tool can
+do, a skill can do — slower and more expensive, but also more
+adaptable. The Planner's job is to pick the right one per node. See
+the workflow_designer SKILL.md for the operational rules it follows.
+
+### When NOT to use a tool node
+
+Anti-patterns — these are tool misuse and will be flagged by the
+verify-agent reviewing Planner's output:
+
+* "Tool that wraps a Python one-liner that imports json and post-processes
+  upstream output." → that's interpretation, use a skill.
+* "Tool that conditionally chooses between two commands based on
+  upstream data." → that's judgment, use a skill.
+* "Tool that runs `git status` and tries to decide if the working tree
+  is clean." → that's reading + reasoning, use a skill.
+* Stacking three tool nodes in a row to chain shell pipelines. → if it's
+  truly mechanical, write one tool that does the whole pipeline; if any
+  step needs interpretation, use a skill for the chain.
+
+---
+
+## 11. Run dir layout
+
+```
+<project>/.camflow/
+├── run/                              # current run (always here, single)
+│   ├── workflow.yaml                 # IR — what Planner produced (or what's resuming)
+│   ├── prompt.txt                    # the original user prompt
+│   ├── trace.jsonl                   # event stream
+│   ├── runner.pid                    # while running; deleted on exit
+│   ├── halt.json                     # only if halted
+│   ├── planner/                      # Planner's own run dir (recursive: same shape)
+│   │   ├── workflow.yaml             # = camflow/builtin/planner/workflow.yaml
+│   │   ├── trace.jsonl
+│   │   └── nodes/...
+│   └── nodes/<node_id>/              # nodes of the user-facing workflow
+│       └── attempt-<n>/
+│           ├── input.json            # upstream + previous (no user inputs)
+│           ├── prompt.txt            # full prompt sent to camc (skill nodes)
+│           ├── agent_output.json     # what the agent wrote
+│           ├── output.json           # runtime-validated envelope
+│           ├── agent.id              # camc agent ID (debug)
+│           └── verify-<n>/           # if verify=agent, sub-directory
+│               ├── prompt.txt
+│               ├── agent_output.json
+│               └── output.json
+│
+└── archives/                         # past runs (auto-archived on next run start)
+    ├── <timestamp>-success/
+    ├── <timestamp>-halted/
+    └── ...
+```
+
+`runner.pid` lets `kill $(cat .camflow/run/runner.pid)` stop a running workflow.
+
+The Planner sub-directory makes Planner's own execution **fully inspectable as just another camflow run** — same trace.jsonl, same per-attempt outputs, same halt.json on Planner failure.
+
+---
+
+## 12. CLI
+
+```
+camflow run "<prompt>"                  # fire-and-forget: Planner compiles, runtime executes
+camflow run -i "<prompt>"               # interactive: pause for plan approval before execution
+camflow run --steps N "<prompt>"        # debug: halt after N node-attempts
+camflow resume <run_dir>                # resume a halted run
+camflow resume <run_dir> --steps N      # resume but advance only N more attempts
+camflow run --from <node_id>            # re-execute a node + downstream
+```
+
+| command | behavior | exit codes |
+|---|---|---|
+| `run "<prompt>"` | mandatory prompt; runs Planner → executes generated workflow.yaml | 0 done / 1 invocation error / 2 halted |
+| `run -i "<prompt>"` | same, plus a plan-approval gate after Planner finishes (see §9) | 0 / 1 / 2 |
+| `run --steps N "<prompt>"` | runs but halts after N node-attempts (debug breakpoint, see §14) | 0 / 1 / 2 |
+| `run` (no prompt) | print error and exit | 1 |
+| `resume <run_dir> [--feedback "<text>"] [--steps N]` | resume a halted run. See §13. | 0 / 1 / 2 |
+| `run --from <node_id> [--run-dir <path>] [--feedback "<text>"] [--steps N]` | re-execute target + downstream on existing run dir. See §14. | 0 / 1 / 2 |
+
+`-i` / `--interactive` patches Planner's `render_yaml` node at startup
+to require human approval of the compiled `workflow.yaml`. Without
+`-i`, Planner finishes and runtime executes the result with no pause.
+
+Inspecting in-progress: `cat .camflow/run/trace.jsonl` (no `camflow status` subcommand).
+
+There is no `camflow exec workflow.yaml`, no `--validate`, no `--inputs`. The only way to run a workflow is via `camflow run "<prompt>"` — Planner is mandatory, prompt is mandatory.
+
+---
+
+## 13. Resume
+
+After a workflow halts, the user can fix what went wrong and continue
+where they left off via `camflow resume <run_dir>`. Resume is the
+manual recovery counterpart to retry — retry happens automatically
+within a node (bounded by `retry_max`); resume is the human-driven
+escape hatch at workflow level after retries are exhausted.
+
+### Pre-conditions
+
+```bash
+camflow resume <run_dir> [--feedback "<text>"]
+```
+
+* `<run_dir>/halt.json` MUST exist. If absent → CLI prints
+  `ERROR: not halted` and exits 1.
+* `<run_dir>/workflow.yaml` MUST exist (the compiled IR is intact).
+* `<run_dir>` may be the user's main run dir (`./.camflow/run/`) OR
+  a Planner sub-run dir (`./.camflow/run/planner/`) when it was
+  Planner that halted. The same code path handles both.
+
+### What gets restored from disk
+
+The runtime walks `<run_dir>/nodes/` and rebuilds per-node state by
+replaying attempt directories:
+
+| Node had on disk | Post-restore state |
+|---|---|
+| `attempt-N/output.json` files | `history` = list of envelopes, `output` = last envelope, `retry_count` = N − 1, `lifecycle = "done"`, `result` = `success`/`fail` per last envelope |
+| no attempt directory | default fresh state (`lifecycle = "waiting"`, `retry_count = 0`) — these are downstream nodes that were marked done+fail by halt propagation but never executed |
+
+This restoration is precise: a workflow that was halfway through a
+DAG has its successful upstream nodes preserved as `done+success`
+(they don't re-run), and its yet-to-run downstream nodes left as
+`waiting` (they'll execute as the DAG progresses).
+
+### Where execution restarts
+
+The single halted node — identified by `halt.json`'s `halted_node`
+field — is reset:
+
+```
+node.lifecycle = "waiting"
+node.result    = None
+node.retry_max = max(node.retry_max + 1, node.retry_count + 1)
+                       └────────┬────────┘
+                       grants exactly one more attempt
+```
+
+`retry_count` is **not** reset; it stays at the count from the
+original run. Combined with the bumped `retry_max`, this means resume
+gives **one fresh attempt**, not a full retry budget. If that
+attempt also fails (for the same or different reason), the workflow
+halts again — and the user can `resume` again, granting one more.
+
+The runtime then re-enters `Workflow.execute_dag()`. The DAG
+scheduler picks up the now-ready halted node, runs it, and proceeds
+forward — any downstream nodes become ready in turn if it succeeds.
+
+### Feedback channel (`--feedback "<text>"`)
+
+When the user wants to *steer* the next attempt (not just retry it
+identically), `--feedback` injects guidance:
+
+```bash
+camflow resume .camflow/run --feedback \
+  "the test was looking at the wrong file; check src/auth.py instead"
+```
+
+Mechanics — uses the same channel as agent-rejected retries:
+
+```
+1. Splice text into halted node's last envelope on disk:
+       node.history[-1].feedback = "<text>"
+
+2. On the next attempt, runtime auto-injects `previous` into the
+   input dict (per §6 retry feedback channel):
+       attempt-(N+1)/input.json
+         {
+           "upstream": {...},
+           "previous": {
+             "status": "fail",
+             "data":   {...},
+             "error":  {...},
+             "feedback": "the test was looking at the wrong file..."
+           }
+         }
+
+3. Skill agent reads input.previous.feedback as the actionable
+   directive; SKILL.md should already document the "On retry" path
+   that consults previous.feedback.
+```
+
+So `--feedback` is the user's hand-typed equivalent of the verify
+agent's reject reasoning. Same field, same plumbing.
+
+### Halt scenarios and what resume does to each
+
+| Halt cause | Resume behavior |
+|---|---|
+| Verify-agent rejected; retries exhausted | One more attempt; user can pass `--feedback` to redirect |
+| `verify.command` failed; retries exhausted | One more attempt; if the issue is transient, plain resume; if it's substantive, fix the cause + `--feedback` |
+| `verify.human` rejected and retry budget consumed | One more attempt; user can be more decisive on next try (or pass `--feedback` describing what to do differently) |
+| Node returned `request_human=true` | One more attempt; the human is expected to have resolved the underlying issue (e.g. unstuck a stale credential, fixed a file) before resuming |
+| Planner halted (couldn't compile valid yaml) | Resume `<run_dir>/planner/`; one more shot at the failing Planner node, optionally with `--feedback` steering the regeneration |
+
+### `-i` flag and resume
+
+`-i` / `--interactive` is a `run`-time flag only. Once a workflow.yaml
+has been compiled (and possibly approved via `-i` on the original
+`run`), the *same* compiled yaml is reused on every resume — plan
+approval does NOT re-trigger. The user already approved the plan; now
+they're just unsticking individual nodes.
+
+### What resume cannot do
+
+* Cannot resume a workflow that completed successfully (no halt.json).
+* Cannot un-run a node that already succeeded — `success` is permanent
+  within a run.
+* Cannot reorder, insert, or delete nodes — the DAG is fixed once
+  Planner has compiled. If the user wants a fundamentally different
+  plan, they should start a fresh `camflow run`.
+* Cannot re-prompt the Planner mid-run for a different design;
+  Planner is upstream of execution, not interactive with it.
+
+### Trace event on resume
+
+```jsonl
+{"step": N, "ts": "...", "event": "workflow_resumed",
+ "node": "<halted_id>", "retry_count": <count>, "feedback_len": <len>}
+```
+
+The trace's continuity (step counter monotonic across original-run +
+resume) makes resumed runs distinguishable from fresh ones in
+post-mortem analysis without extra tooling.
+
+---
+
+## 14. Debugging (`--steps N` breakpoints)
+
+For debugging, both `camflow run` and `camflow resume` accept an
+optional `--steps N` flag (N ≥ 1) that halts the workflow cleanly
+after N node-attempts have completed. This is camflow's debug
+breakpoint — useful for inspecting state mid-flow without burning
+through the whole DAG.
+
+```bash
+camflow run --steps 1 "<prompt>"           # halt after 1st node-attempt
+camflow resume <run_dir> --steps 1         # advance one more attempt, halt again
+camflow resume <run_dir> --steps 5         # advance up to 5, halt if not yet done
+camflow resume <run_dir>                   # no --steps → run to natural completion
+```
+
+Typical single-step session:
+
+```bash
+$ camflow run --steps 1 "fix the bug in foo.py"
+# Planner compiles, runtime halts after first user-workflow node attempt
+$ ls .camflow/run/nodes/             # inspect what happened
+$ cat .camflow/run/halt.json         # kind: "breakpoint"
+$ camflow resume .camflow/run --steps 1     # next step
+$ ...                                # iterate
+$ camflow resume .camflow/run        # finally, run to end
+```
+
+### Halt artifacts
+
+Step halts and real halts both write `halt.json`, but they're
+clearly distinguishable:
+
+| field | step halt | real halt |
+|---|---|---|
+| `kind` | `"breakpoint"` | `"halt"` |
+| `reason` | `"step limit reached (N attempts)"` | retry exhausted / request_human / deadlock / verify-fail |
+| trace event | `workflow_paused` | `workflow_halted` |
+| downstream nodes | **untouched** (still `waiting` / not yet executed) | **marked `done+fail`** with `error.code = "UPSTREAM_HALTED"` |
+
+The downstream-untouched property is crucial: it's what makes
+resume-after-step seamless. If step halts propagated fail like real
+halts do, resume would refuse to run the downstream nodes (they'd be
+`done+fail`). The runtime `Workflow.halt(propagate_fail=False)` keeps
+those nodes pristine.
+
+### How `resume` treats a step halt differently
+
+When `halt.json["kind"] == "breakpoint"`, `_cmd_resume`:
+
+* **Generally does NOT reset the halted node to `waiting`** — the
+  step-halt may have fired right after a successful attempt, in which
+  case the node is correctly `done+success` and should not re-run.
+* **Does NOT bump `retry_max += 1`** — the node didn't truly fail.
+* Detects an important sub-case: **mid-retry pause**. If the
+  breakpoint fired immediately after a *failed* attempt that still
+  had retry budget left (`retry_triggered` already incremented
+  `retry_count`, but the next attempt didn't run because we paused),
+  the on-disk last-envelope is fail but the node is NOT done. Resume
+  detects this by comparing `halt.json["retry_count"]` against
+  `len(history) - 1`; if the halt-time count is higher, retry was
+  triggered but didn't yet run, so resume sets `lifecycle = "waiting"`
+  and `retry_count = halt_rc` so the scheduler picks the node up
+  again. `--feedback` IS honored in this case (same channel as a
+  real-halt resume — splices into `history[-1].feedback`).
+* For breakpoints that fired after a success or before any attempt,
+  `--feedback` is ignored with a stderr warning (no in-flight failed
+  attempt to inject into).
+
+The `_cmd_resume` body is otherwise identical: replay history from
+disk, set `workflow.lifecycle = "running"`, delete `halt.json`,
+re-enter `execute_dag()`.
+
+### What counts as one step
+
+One `Node.execute_attempt()` call. So:
+
+* A node that succeeds first try = **1 step**.
+* A node that fails + retries 2 times before succeeding = **3 steps**.
+* A node that exhausts `retry_max` = **`retry_max + 1` steps**, then
+  halts naturally (`--steps` is a no-op on top of natural halt;
+  whichever fires first wins).
+
+Pick `--steps` values accordingly: usually `--steps 1` for true
+single-step, larger N when you've inspected and want to skip ahead
+to the next interesting point.
+
+### What `--steps` does NOT do
+
+* Doesn't reset or modify any node state. Pure read-then-pause.
+* Doesn't change Planner behavior — Planner always runs to completion
+  before user-workflow execution starts. `--steps` only counts
+  attempts in the **user workflow** (the compiled DAG), not Planner's
+  internal nodes.
+* Doesn't combine with `-i`. They're orthogonal: `-i` gates plan
+  approval (before user workflow execution), `--steps` gates each
+  attempt within user-workflow execution. You can use both:
+  `camflow run -i --steps 1 "<prompt>"` first asks for plan approval,
+  then runs only the first user-node attempt.
+* Doesn't alter `retry_max` or any node-level config — it's purely a
+  runtime instrumentation knob.
+
+### What to inspect during a pause
+
+The `<run_dir>` is just files; everything is plainly readable:
+
+```bash
+cat <run_dir>/trace.jsonl                                          # event stream
+cat <run_dir>/halt.json                                            # why we paused
+cat <run_dir>/nodes/<id>/attempt-N/prompt.txt                      # what the agent saw
+cat <run_dir>/nodes/<id>/attempt-N/agent_output.json               # what it wrote
+cat <run_dir>/nodes/<id>/attempt-N/output.json                     # what runtime validated
+cat <run_dir>/nodes/<id>/attempt-N/verify-N/agent_output.json      # verify-agent reasoning
+```
+
+There is no `camflow inspect` subcommand because there doesn't need
+to be — these files are designed to be readable. If a future use case
+warrants pretty-formatting, that's a `camflow inspect` candidate;
+it doesn't ship it.
+
+### Re-executing a specific node — `camflow run --from`
+
+`--steps` lets you pause; `--from` lets you go back. Same `run`
+subcommand, different mode (mutex with prompt):
+
+```bash
+camflow run --from <node_id> [--run-dir <path>] [--feedback "<text>"] [--steps N]
+```
+
+`--run-dir` defaults to `./.camflow/run/`. The presence of `--from`
+(without a prompt) tells `run` to operate on the existing run dir
+instead of compiling a fresh one.
+
+> **Important:** with `--from`, the runtime does NOT archive the
+> existing run dir. Archiving is only done by fresh-prompt runs
+> (which need a clean slate). `--from` operates in-place — that's
+> the data it needs to work with.
+
+Use cases:
+
+* You changed `skills/<X>/SKILL.md` and want to verify by re-running
+  just node `X` (and the downstream nodes that consume X's output).
+* The user-workflow halted at node `Y`, but on inspection you realize
+  it's node `X` (upstream of `Y`) that produced the wrong thing.
+  `camflow run --from X` restarts from X.
+* You want to A/B compare an alternative skill output for a specific
+  node, holding everything upstream constant.
+
+### Semantics
+
+```
+camflow run --from <node_id> [--run-dir <run_dir>]:
+
+1. Reload Workflow + every node's history from <run_dir>/nodes/
+   (same restoration as `resume`).
+
+2. Compute the descendant set in DAG order:
+       targets = {<node_id>} ∪ all transitive downstream
+   (computed by walking the `needs` edges forward.)
+
+3. For every node in `targets`:
+     lifecycle  = "waiting"
+     result     = None
+     retry_max  = max(retry_max + 1, retry_count + 1)   # one more try
+     # retry_count stays — its history on disk is preserved as-is;
+     # next attempt becomes attempt-(len(history)+1).
+
+4. Splice `--feedback "<text>"` (if given) into the target node's
+   history[-1].feedback (only the explicit target, not downstream —
+   downstream nodes get fresh upstream injection on their re-run).
+
+5. Set workflow.lifecycle = "running"; delete halt.json if present;
+   re-enter execute_dag().
+```
+
+### What stays vs what changes
+
+| node | upstream of target | target | downstream of target |
+|---|---|---|---|
+| lifecycle | `done` (untouched) | reset to `waiting` | reset to `waiting` |
+| history on disk | preserved | preserved (new attempt appends) | preserved (new attempt appends) |
+| `retry_count` | preserved | preserved | preserved |
+| `retry_max` | preserved | bumped (+1) | bumped (+1) |
+| `feedback` | n/a | optionally spliced from `--feedback` | n/a |
+
+### vs. `resume`
+
+| | `camflow resume` | `camflow run --from` |
+|---|---|---|
+| precondition | halt.json must exist | run_dir + workflow.yaml must exist (halt.json optional) |
+| node to restart | the halted one (per halt.json) | user-chosen |
+| downstream | untouched (will run after halted node clears) | **also reset** to re-run |
+| typical use | "fix the failing point and continue" | "I changed something upstream; redo from there" |
+
+`run --from` is fully reusable — you can call it on a successfully
+completed run as well as on a halted one, since it only depends on the
+on-disk state being intact.
+
+### Implementation note
+
+`--steps` is built purely on the existing halt+resume infrastructure:
+
+* `Workflow.execute_dag(max_attempts=None)` accepts an optional limit.
+* `Workflow.halt(..., propagate_fail=False)` writes a breakpoint-kind
+  halt without touching downstream nodes.
+* `_cmd_resume` branches on `halt.json["kind"]` to skip the
+  retry-bump path.
+
+No new lifecycle states, no new subcommands, no new envelope fields.
+The whole feature is ~30 lines of runtime change + 5 tests.
+
+---
+
+## 15. The builtin Planner workflow
+
+Lives at `camflow/builtin/planner/`:
+
+```
+camflow/builtin/planner/
+├── workflow.yaml
+└── skills/
+    ├── prompt_analyzer/SKILL.md
+    ├── workflow_designer/SKILL.md
+    └── yaml_writer/SKILL.md
+```
+
+A reference shape (subject to evolution as we improve quality):
+
+```yaml
+workflow: planner
+version: "1.1"
+
+context: |
+  You are a multi-step planner. Given a user prompt, produce a workflow.yaml
+  that decomposes the task into a DAG of nodes (skills by default,
+  tools only for narrow mechanical cases — see §10), each with
+  explicit goals, steps, dependencies, and verification.
+  
+  Output format MUST conform to camflow spec (no inputs:, no run.input,
+  context for shared facts, verify for each non-trivial node).
+
+nodes:
+  - id: understand
+    goal: "Parse user prompt into a structured task statement"
+    steps:
+      - "Extract the explicit goal stated by the user"
+      - "Identify any constraints, preconditions, success criteria"
+      - "Note ambiguities that may need user clarification later"
+    run: { skill: prompt_analyzer }
+    output_schema:
+      task_statement: string
+      constraints: array
+      ambiguities: array
+    verify:
+      criterion: "Task statement covers everything stated in the prompt"
+    retry: 2
+
+  - id: design_dag
+    goal: "Design a DAG of nodes whose successful execution accomplishes the task"
+    needs: [understand]
+    steps:
+      - "Pick a skill from the strict registry. Use a tool ONLY if all 5 §10 criteria hold; otherwise skill."
+      - "Order them by dependency"
+      - "Decide retry/verify for each — high-stakes work gets verify=agent or verify=command"
+      - "Identify shared facts that should go in workflow.context"
+    run: { skill: workflow_designer }
+    output_schema:
+      dag: array         # list of {id, goal, steps, needs, run, verify, retry}
+      context: string
+    verify:
+      criterion: "DAG covers all task steps; needs are consistent; no orphans/cycles"
+    retry: 3
+
+  - id: render_yaml
+    goal: "Emit a syntactically valid camflow workflow.yaml"
+    needs: [design_dag]
+    steps:
+      - "Serialize the DAG and context to YAML following the spec"
+      - "Include the original user prompt in workflow.context"
+      - "Ensure yaml_text is a single string suitable for writing to workflow.yaml"
+    run: { skill: yaml_writer }
+    output_schema:
+      yaml_text: string
+    verify:
+      criterion: "yaml_text parses as YAML and matches camflow schema (no inputs:/state:/run.input; nodes have id+goal+steps+run)"
+    retry: 3
+```
+
+When the user runs `camflow run "<prompt>"` (default, no `-i`):
+
+1. Runtime starts the Planner workflow with the user prompt copied into Planner's `workflow.context` (so Planner's nodes can read it like any other node reads context).
+2. Planner runs: understand → design_dag → render_yaml.
+3. `render_yaml`'s verify is `criterion`-based — an evaluator agent checks the produced YAML parses + matches the schema. **No human pause.**
+4. If verify rejects, retry kicks in: `yaml_writer` regenerates with `previous.feedback`. Up to retry=3 cycles.
+5. On verify success, Planner workflow ends `done+success`. Runtime extracts `nodes.render_yaml.output.data.yaml_text`, writes it to `<run_dir>/workflow.yaml`, and starts a new `execute_dag()` on it.
+6. That second execution has its own trace, halts, retries — fully indistinguishable from any other camflow workflow.
+
+When the user runs `camflow run -i "<prompt>"` (interactive plan
+approval):
+
+* Before validating the Planner spec, the runtime patches the
+  `render_yaml` node's `verify` to `{human: "Review the proposed
+  workflow.yaml below..."}`. Everything else is identical.
+* Now `render_yaml` pauses for the user to type `approve` or
+  feedback. `approve` → continue; anything else → reject + retry
+  with the user's feedback as `previous.feedback`.
+
+The builtin Planner workflow.yaml on disk does NOT carry
+`verify: human` on `render_yaml`. The opt-in is purely runtime
+patching — keeps the doctrine clean (default = no human gates).
+
+Planner failure → camflow halts with the Planner's halt.json. User sees what Planner couldn't do, can `camflow resume` to retry from the halt point.
+
+---
+
+## 16. Reserved / Reserved / forbidden
+
+| Cut | Why |
+|---|---|
+| `Run` class | Folded into `Workflow`. Workflow IS the runtime instance. |
+| `state:` / `inputs:` YAML section | Per-run inputs don't exist. Prompt is the input; Planner compiles. |
+| `--state` / `--inputs` CLI | Same as above. |
+| `{{state.X}}` / `{{inputs.X}}` templates | Same as above. |
+| `state.X.default` | Workflow author doesn't pre-fill values. Anything constant goes in `workflow.context`. |
+| `run.input:` field | Upstream outputs are auto-injected; no per-node user input. |
+| `camflow exec workflow.yaml` | No bypass of Planner. |
+| `camflow --validate` | No bypass of Planner. |
+| `agent.X` autonomous executor | Multi-step work goes into multi-node DAG. |
+| `when:` conditional skip | Branches are explicit DAG paths. No skipped status. |
+| `output_schema` rule type | Use `verify.command` for value checks. |
+| `?` optional template marker | Strict mode: missing field is ExprError. |
+| `retry.until`, `retry.feedback` template | Retry is internal counter; feedback auto-injected as `input.previous`. |
+| `nodes.X.attempts[N]` template subscript | Only `output` (latest) is exposed. |
+| Skip propagation, `node.lifecycle=skipped` | Halt is the only "node didn't succeed" path. |
+| `metrics`, `artifacts` envelope fields | Camc archives cost; writing files is not envelope's job. |
+| Multiple concurrent runs per project | One run at a time. Archives hold history. |
+| `camflow status / trace / stop` subcommands | `cat trace.jsonl` / `kill $(cat runner.pid)`. |
+| `Workflow.run()` / `Workflow.verify()` | Workflow doesn't run or verify. It schedules. |
+| Workflow-as-Node (sub-workflow at user level) | The Planner-bootstraps-Runtime relationship is the only nesting. Agents do not kick off workflows. |
+
+---
+
+## 17. Doctrine (rules for changing this spec)
+
+1. **Two classes only: `Workflow` and `Node`.** No third runtime class.
+2. **Workflow doesn't run or verify.** It only schedules.
+3. **Status is always 2 values: `success` and `fail`.** No third, ever.
+4. **Halt is workflow-level only.** Nodes don't have a halted state.
+5. **`steps` is the design+QA contract.** Don't introduce a separate "verify criterion list".
+6. **Skills must pre-exist.** No dynamic creation. Workflow load fails on unresolved skill.
+7. **Retry is a counter, not an expression.** No `retry.until`, no `retry.feedback`.
+8. **Template has 1 namespace** (`nodes.<id>.output`), used in 1 place (`verify.command`). Plus `output.X` inside verify.command for the envelope under verification.
+9. **Every LLM invocation goes through `camc_lib.run_and_collect`.** No `claude -p`, no SDK.
+10. **Runtime contract for envelope is enforced via prompt injection** — every agent gets the explicit shape, schema, and rules.
+11. **`camflow run "<prompt>"` always invokes Planner.** No bypass for fresh-prompt compilation. (`camflow run --from <node>` and `camflow resume` operate on an existing run dir and skip Planner — they're not "fresh runs".) The fresh-run CLI shape mirrors `camc run`.
+12. **Adding a verify type requires RFC.** Currently: agent (default), command, human.
+13. **Skill is the default run executor.** `run.tool:` is allowed only when ALL FIVE hard criteria in §10 hold (known command + fully-determined inputs + script-structured output + idempotent + cost matters). When in doubt, use skill. Adding a new run-phase executor type beyond skill / tool requires RFC.
+14. **Verify phase carries the deterministic gate.** `verify.command` (bash exit code) is the canonical place for "did the test pass / did the file parse / did the patch apply" checks. Verify-side commands are unconstrained — they're already deterministic by design. The hard rules in #13 are about RUN-phase tools, not verify.
+15. **`verify: human` is opt-in via two distinct mechanisms.** Plan-level approval is opted into via the `-i` / `--interactive` CLI flag (runtime patches Planner's `render_yaml`); in-flow node approval is opted into via the user's prompt language (Planner's `workflow_designer` detects requests like "show me X before doing Y"). Both default to off — `camflow run "<prompt>"` is fire-and-forget. Adding human gates the user didn't request is a UX regression.
+
+Breaking any of these without explicit reason is a regression.
+
+---
+
+## Appendix A: complete example trace
+
+User runs:
+
+```bash
+camflow run "Fix the TypeError on line 87 of foo.py: 'NoneType' has no attribute 'split'"
+```
+
+Runtime creates `.camflow/run/`, writes `prompt.txt` with the prompt, starts the **Planner workflow** with that prompt copied into Planner's `context`.
+
+Planner produces (the compiled workflow.yaml after yaml_writer
+finishes; default `camflow run` doesn't pause for user approval —
+add `-i` if you want a manual gate):
+
+```yaml
+workflow: bug_fix
+version: "1.1"
+
+context: |
+  Original task (from user): Fix the TypeError on line 87 of foo.py:
+  'NoneType' has no attribute 'split'.
+  
+  Codebase: src/ (Python). Tests: tests/ (pytest only).
+
+nodes:
+  - id: diagnose
+    goal: "Identify the bug's root cause from the report"
+    steps:
+      - "Read foo.py around line 87 and understand context"
+      - "Identify the variable that is None when 'split' is called"
+      - "Determine why that variable is None at that point"
+      - "Write a one-sentence root cause"
+    run: { skill: analyzer }
     output_schema:
       root_cause: string
-      evidence: array
-      confidence: number
+      affected_location: string
+    retry: 2
 
-  - id: fix
-    goal: Produce a minimal patch.
-    needs: [analyze]
-    uses: skill.fix
-    input:
-      error: "{{state.error}}"
-      root_cause: "{{nodes.analyze.latest.output.data.root_cause}}"
-      feedback: "{{retry.feedback?}}"
+  - id: propose_fix
+    goal: "Write a minimal patch addressing the root cause"
+    needs: [diagnose]
+    steps:
+      - "Read diagnose's root_cause and affected_location"
+      - "Produce a unified-diff patch touching only the affected lines"
+      - "Provide a one-sentence explanation"
+    run: { skill: code_writer }
     output_schema:
       patch: string
       explanation: string
     verify:
-      - type: schema
-      - type: rule
-        assert: "output.data.patch != ''"
+      criterion: "patch directly addresses root_cause + minimal change"
+    retry: 3
 
-  - id: test
-    goal: Validate the patch.
-    needs: [fix]
-    uses: skill.test
-    input:
-      patch: "{{nodes.fix.latest.output.data.patch}}"
+  - id: run_tests
+    goal: "Apply the patch and run pytest"
+    needs: [propose_fix]
+    steps:
+      - "Apply upstream.propose_fix.data.patch"
+      - "Run python -m pytest"
+      - "Capture pass/fail"
+    run: { tool: scripts/apply_and_test.sh }    # OK to use tool here:
+                                                 # known command, no judgment,
+                                                 # script writes envelope itself
     output_schema:
       passed: boolean
-      feedback: string
-      test_log: string
-    retry:
-      target: fix
-      until: "nodes.test.latest.output.data.passed == true"
-      max_attempts: "{{state.max_attempts}}"
-      feedback: "{{nodes.test.latest.output.data.feedback}}"
-
-  - id: summarize_success
-    goal: Summarize successful solution.
-    needs: [analyze, fix, test]
-    when: "nodes.test.latest.output.data.passed == true"
-    uses: skill.summarize
-    input:
-      root_cause: "{{nodes.analyze.latest.output.data.root_cause}}"
-      patch: "{{nodes.fix.latest.output.data.patch}}"
-
-  - id: summarize_failure
-    goal: Summarize why the workflow failed.
-    needs: [analyze, fix, test]
-    when: "nodes.test.latest.output.data.passed == false"
-    uses: skill.summarize
-    input:
-      message: "Failed after max attempts"
-      last_feedback: "{{nodes.test.latest.output.data.feedback}}"
+      tests_run: integer
+    verify:
+      command: "test $(jq -r .data.passed agent_output.json) = 'true'"
+    retry: 1
 ```
+
+> Note `run_tests` legitimately uses `run.tool:` — it's a known
+> command (apply patch + pytest), inputs are fully determined by
+> upstream, the script structures its own output, and the operation is
+> idempotent. All five §10 criteria hold. Compare to `diagnose` and
+> `propose_fix` which need code-reading and synthesis — those must be
+> skills.
+
+Planner's verify-agent confirmed the YAML parses + matches the schema (or, with `-i`, the user typed `approve`). Runtime now executes this 3-node workflow:
+
+1. `diagnose` → camc spawns analyzer agent → reads context (which carries the original prompt) → produces root_cause + affected_location → schema check passes → default verify-agent approves → done+success.
+2. `propose_fix` → camc spawns code_writer agent → reads upstream's diagnose output (auto-injected) → produces patch → schema check passes → verify-agent (with criterion override) approves → done+success.
+3. `run_tests` → tool runs `scripts/apply_and_test.sh` with patch from upstream → produces `passed: true` → verify=command checks bash → exit 0 → done+success.
+
+Workflow lifecycle: running → done. Exit 0.
 
 ---
 
-## 4. Node 格式
-
-```yaml
-- id: string                # required, unique
-  goal: string              # optional, short purpose
-  needs: [node_id]          # optional
-  when: expression          # optional, evaluated when ready
-  uses: string              # required, "skill.X" / "agent.X" / "tool.X"
-  input: object             # optional, template-rendered
-  output_schema: object     # recommended; auto-checked by runner after every success
-  verify: [verify_rule]     # optional, EXTRAS only (rules / file / command / agent)
-  retry: retry_policy       # optional, see §5
-```
-
-**Auto-schema 规则**：节点跑 success 之后，runner **自动**对 `data` 做 schema 检查（每个 `output_schema` 字段必须出现在 `data` 里）。Schema 失败 → 节点状态翻 failure → 进入 retry / halt 路径。
-
-→ **用户在 `verify:` 里不再需要写 `{type: schema}`**。仍允许写（兼容老用法），但是 no-op。
-
-→ `verify:` 字段只用于"schema 之外的额外检查"——`type: rule` 表达式断言、`type: agent`（v0.7+）、未来的 `type: file` / `type: command`。
-
-v0.6 故意**不**收录的字段：`timeout` / `allowed_tools` / `model`。
-- timeout 由 runner 全局控制 + retry.max_attempts 兜底
-- allowed_tools 是 skill 层职责
-- model 写进 skill 定义里
-
----
-
-## 5. Retry 格式
-
-```yaml
-retry:
-  until: <expression>                # required, success condition
-  max_attempts: <int or template>    # required
-  feedback: <expression or template> # optional, exposed to next attempt as {{retry.feedback}}
-```
-
-**语义（v0.6 简化模型）**：
-
-1. **retry 只重跑当前节点。** 没有 `target` 字段。要影响多个节点的重跑，把它们合并成一个 skill / agent。
-2. 触发条件（任一）：
-   - 节点 `status: success` 但 `until` 为 false
-   - 节点 `status: failure`（节点崩了或 verify 失败）—— retry 自动尝试自我修复
-3. 每次 retry 在当前节点上生成新 attempt（per-node 计数，从 1 起）。历史 attempts 全保留，可通过 `nodes.<id>.attempts[n]` 访问。
-4. `max_attempts` 是**当前节点**的 attempt 总数上限。
-5. 达到 `max_attempts` 仍未达标 → 触发 `retry_exhausted` + `workflow_halted`，等 human/orchestrator 介入（见 §16）。
-6. `feedback` 在每次 retry 触发时 render，然后作为 `{{retry.feedback}}` 注入下次 attempt 的 input 模板。
-
-**Trace 示例（test 节点自我重试 3 次后通过）**：
-
-```
-analyze#1
-fix#1
-test#1 (passed=false → retry self with feedback)
-test#2 (passed=false → retry self with feedback)
-test#3 (passed=true)
-summarize#1
-```
-
-**Trace 示例（retry 用尽 → halt）**：
-
-```
-collect#1
-validate#1 (ok=false → retry with feedback)
-validate#2 (ok=false → retry_exhausted, max_attempts=2)
-node_skipped: publish (upstream_halted)
-workflow_halted
-```
-
----
-
-## 6. Output Envelope
-
-所有 node attempt 必须产出统一 envelope：
-
-```yaml
-output:
-  status: success | failure | skipped | halted
-  data: {}        # 业务产物，符合 output_schema
-  error: null     # 失败时填
-  metrics: {}     # 可选数值指标
-  artifacts: []   # 可选大文件引用
-```
-
-**`status: halted`** 用于 skill / tool 主动表示"我尽力了，需要外部介入"。runtime 看到这个会立刻 halt 整个 workflow（不重试，不继续），见 §16。
-
-**`status: skipped`** 用于 `when: false` 的节点。Skipped envelope 形如：
-
-```yaml
-output:
-  status: skipped
-  data: {}
-  error: null
-  metrics: {}
-  artifacts: []
-```
-
-Skipped 节点也写 output（保证 `nodes.X.latest.output` 引用永远合法）。
-
-**失败 envelope**：
-
-```yaml
-output:
-  status: failure
-  data:
-    feedback: "Unit test test_parser_null_input failed"   # 可选反馈
-  error:
-    code: TEST_FAILED
-    message: "Validation failed"
-    details: { ... }
-  artifacts:
-    - name: test.log
-      uri: "artifact://run-123/test/1/test.log"
-      type: text/plain
-```
-
----
-
-## 7. Data 规则
-
-- `data` 必须符合 `output_schema`
-- `data` 只放结构化小数据
-- 大文件放 `artifacts`
-- 错误信息优先 `error`；可执行反馈可放 `data.feedback`
-
----
-
-## 8. State 格式
-
-State 是 workflow 级共享变量。
-
-**Schema 声明**（workflow 顶层）：
-
-```yaml
-state:
-  error:
-    type: string
-    required: true
-  max_attempts:
-    type: integer
-    default: 3
-```
-
-**运行时值**（注入自外部，例如 CLI 参数）：
-
-```yaml
-state:
-  error: "Build failed with linker error"
-  max_attempts: 3
-```
-
-**v0.6 规则**（**变化点**）：
-
-- State 在 workflow 启动时注入，**启动后只读**。
-- Node 不能写 state；node 之间共享数据用 `nodes.<id>.latest.output` 而不是 state。
-- 这意味着旧 DSL 的 `set:` 字段**彻底废弃**。
-- State 只存"workflow 启动时已知的常量"（错误描述、配额、外部传入参数）。
-
----
-
-## 9. Trace 管理
-
-Trace 是 runner 每一步的事实记录，写到 `.camflow/runs/<run_id>/trace.jsonl`，每行一个 event。
-
-**事件 schema**：
-
-```yaml
-event:
-  step: integer            # 全局递增
-  ts: ISO8601
-  event: <event_type>
-  node: string | null
-  attempt: integer | null  # per-node, 1-indexed
-  status: string | null
-  reason: string           # human-readable why
-  extra: {}                # event-specific fields
-```
-
-**事件类型（穷举）**：
-
-```
-workflow_started
-node_ready
-node_started
-node_completed
-node_failed
-node_skipped
-node_halted          # 节点 envelope status=halted，或失败无 retry
-verify_started
-verify_completed
-verify_failed
-retry_triggered
-retry_exhausted
-workflow_completed   # 全绿
-workflow_halted      # 任何节点 halt → 等 resume
-workflow_failed      # 死锁 / 表达式异常 / 不可恢复
-```
-
----
-
-## 10. Runner 选择规则
-
-每一轮：
-
-1. 找出所有 ready nodes：
-   - 该 node 还没被执行过 OR 被 retry 标记需要重跑
-   - 所有 `needs` 节点 status 都是 `success` 或 `skipped`
-2. 对每个 ready node 评估 `when`（缺省视为 true）。
-   - `when` 为 false → 该 node 立即写入 skipped envelope，不执行 body
-   - `when` 为 true → 进入候选列表
-3. **多个候选时，按 `nodes:` 声明顺序选第一个**（确定性 tiebreak）。
-4. 串行执行选中 node。完成后写 output + trace，回到第 1 步。
-5. 没有 ready node 时：
-   - 所有 node 都终态（success / failure / skipped） → workflow 终态（见 §16）
-   - 否则视为 deadlock → workflow_failed (extra.reason = "no ready nodes")
-
-**Fan-in/fan-out 例子**：
-
-```
-A → B → D
- ↘ C ↗
-```
-
-执行顺序：`A → B → C → D`（B 在 C 之前，因为先声明）。
-
----
-
-## 11. Prompt Compiler
-
-Node 不写完整 prompt。Compiler 拼装：
-
-```
-[system]
-Workflow goal: {{workflow.goal}}
-Node goal:     {{node.goal}}
-
-[user]
-{{skill.template, rendered with input + retry context}}
-
-Return a JSON object matching this schema:
-{{output_schema}}
-```
-
-**约定**：
-- `output_schema` 由 compiler 自动追加到 user prompt 末尾，skill template **不要**自己写
-- skill template 通过 `{{input.X}}` 访问 node input；通过 `{{retry.feedback}}` 访问 retry 反馈
-- compiler 只是字符串拼装，不做 LLM 调用
-
-Skill 定义形如（落到磁盘）：
-
-```yaml
-# skills/fix.yaml
-id: skill.fix
-template: |
-  Error:
-  {{input.error}}
-
-  Root cause:
-  {{input.root_cause}}
-
-  {%- if retry.feedback %}
-  Previous attempt feedback:
-  {{retry.feedback}}
-  {%- endif %}
-
-  Generate a minimal safe fix.
-```
-
----
-
-## 12. 最终一句话定义
-
-> 这个 spec 是一个支持 DAG 依赖的串行 Agent Workflow：`needs` 管依赖，runner 管顺序，`output` 管结果，`state` 管启动期共享变量，`trace` 管可观测性，`retry` 是唯一受控回退机制。
-
----
-
-# 附录 A — Expression Grammar
-
-`when`、`verify[].assert`、`retry.until`、`retry.feedback`（如果是表达式形式）使用同一个表达式语言。
-
-**v0.6 子集（最小够用）**：
-
-| 类别 | 支持 |
-|---|---|
-| 字面量 | string (单/双引号), int, float, bool, null |
-| 标识符 | `state`, `nodes`, `inputs`, `output`, `retry` 根；任意 `.field` 链；任意 `[n]` 下标 |
-| 比较 | `==` `!=` `<` `<=` `>` `>=` |
-| 布尔 | `and` `or` `not` |
-| 括号 | `(...)` |
-| 可空标记 | 标识符末尾 `?` 表示"不存在时返回空字符串"，**只在 input 模板里允许** |
-
-**不支持**（v0.6 故意省）：算术、字符串拼接、函数调用、列表/字典字面量、ternary。
-
-**实现策略**：用 Python `ast` 解析 + 白名单 walk，**不用** `eval`。约 50 行 Python。
-
----
-
-# 附录 B — Template Namespaces
-
-模板 `{{...}}` 在 4 个地方出现：node `input`、`when`、`verify[].assert`、`retry.*`。
-
-可见的命名空间：
-
-| 命名空间 | 内容 | 何时可见 |
-|---|---|---|
-| `state.X` | workflow 启动时注入的只读 state | 始终 |
-| `nodes.X.latest.output.*` | X 的最新 attempt 的 envelope | X 已执行过 |
-| `nodes.X.attempts[n].output.*` | X 的第 n 次 attempt（n 从 1 起） | X 至少跑过 n 次 |
-| `output.*` | 当前节点本次 attempt 的 envelope | **只在 verify[].assert 中可见** |
-| `retry.feedback` / `retry.attempt` | retry 上下文 | **只在被 retry 重跑的 target node input 中可见** |
-
-`{{retry.feedback?}}` 的 `?` 让模板在第一次执行（非 retry）时安全回退到空字符串。
-
----
-
-# 附录 C — Local Artifact Storage
-
-v0.6 只支持本地文件系统。
-
-**路径布局**：
-
-```
-<project>/.camflow/runs/<run_id>/
-  ├── workflow.yaml             # 当时的 workflow 快照
-  ├── state.json                # 启动时注入的 state
-  ├── trace.jsonl               # 所有 event
-  ├── halt.json                 # 仅在 halted 时写：halted_node + reason + envelope
-  ├── runner.pid                # runner 运行期间存在；正常退出/halt 后清理
-  ├── nodes/
-  │   └── <node_id>/
-  │       └── attempt-<n>/
-  │           ├── output.json   # 节点的 envelope（runner-managed）
-  │           └── workspace/    # agent 的工作目录（节点视角）
-  │               ├── input.json     # 渲染后的 inputs
-  │               ├── prompt.txt     # 编译好的 prompt（skill / agent only）
-  │               ├── response.txt   # LLM 原始回答（skill / agent only）
-  │               ├── raw_stdout.txt # tool 原始 stdout (tool only)
-  │               ├── raw_stderr.txt # tool 原始 stderr (tool only)
-  │               └── <agent-created files>   # agent.X 在 v0.8 自由写
-```
-
-`workspace/` 是节点的"工作区"——所有 agent / tool 看到的都在这里：
-- 工具子进程的 cwd 设为 `workspace/`，并通过 `CAMFLOW_WORKSPACE` 环境变量暴露绝对路径
-- skill / agent 的 prompt + inputs 落到 workspace/，方便 debug 也方便未来传给 camc agent
-- agent.X (v0.8) 通过 camc spawn 时，camc 的 cwd 会是 `workspace/`，agent 写出来的文件就留在这里
-
-**Artifact URI 解析**：`artifact://<run_id>/<node>/<attempt>/<name>` →
-`<project>/.camflow/runs/<run_id>/nodes/<node>/attempt-<attempt>/workspace/<name>`
-
-`<run_id>` 由 runner 启动时生成（建议 ISO 时间戳 + 短随机：`20260428-173812-a1b2`）。
-
----
-
-# 附录 D — Failure & Skip Propagation
-
-| 触发 | 行为 |
-|---|---|
-| node status=success 但 `until` 为 false（有 retry） | 触发 retry，**重跑当前节点** |
-| node status=failure（有 retry） | 触发 retry，**重跑当前节点** |
-| node retry max_attempts 用完 | `retry_exhausted` + **`workflow_halted`**：所有未执行节点写 skipped envelope（`code: UPSTREAM_HALTED`），写 `halt.json`，runner 退出（exit 2） |
-| node status=failure 且**无** retry | 直接 **`workflow_halted`**（不是 failed）：让 human/orchestrator 看一眼，可能 resume |
-| node status=halted（skill/tool 主动返回） | 立即 **`workflow_halted`**：halt.json 记下 envelope，下游 skipped |
-| `when` 为 false | 节点写 skipped envelope，不执行 body，下游 needs 视它为已满足 |
-| 上游 node skipped | 下游照常评估 needs（skipped 算"满足"），但若该上游是核心数据来源，下游 input 模板渲染时会拿到 skipped envelope —— 由 node 的 `when` 自己处理这种情况 |
-
-**全局终态 + exit code**：
-
-| 终态 | 条件 | exit |
-|---|---|---|
-| `workflow_completed` (success) | 所有节点 success 或 skipped | 0 |
-| `workflow_halted` | 任何节点 halt 或 retry 耗尽 → 等 resume | **2** |
-| `workflow_failed` | 死锁 / 表达式异常 / 不可恢复错误 | 1 |
-
-**halt vs failed 的区别**：halt 是"暂停，可能能恢复"——human/orchestrator 看 trace + halt.json + state.json 后可以编辑 state、改 workflow、或者 resume。failed 是"真坏了，重跑也没用"——比如表达式写错、死锁、内部 bug。
-
-**halt.json**：halted 时在 run dir 顶层写一个 sidecar：
-
-```json
-{
-  "halted_node": "<node_id>",
-  "halted_attempt": <int>,
-  "reason": "<human-readable>",
-  "envelope": { ... },     // 该节点最后一次 attempt 的 envelope
-  "trace_step": <int>      // workflow_halted 事件在 trace 里的 step
-}
-```
-
----
-
-# 附录 E — v0.5 → v0.6 变更
-
-| # | 变更 | 位置 |
-|---|---|---|
-| 1 | 表达式语法明确（最小子集） | 附录 A |
-| 2 | 4 个 template namespace + `?` 后缀语义 | 附录 B |
-| 3 | **retry 简化为只重跑当前节点；删 `target` 字段** | §5 |
-| 4 | 失败传播规则明文化 | 附录 D |
-| 5 | 本地 artifact 存储路径约定 | 附录 C |
-| 6 | 声明顺序作为 fan-out tiebreak（明文） | §10 |
-| 7 | `when: false` 节点写 skipped envelope | §6 / §10 |
-| 8 | attempt 计数 per-node、1-indexed | §5 / §9 |
-| 9 | `output_schema` 自动追加到 user prompt 末尾 | §11 |
-| 10 | state 启动后只读，废除 `set:` | §8 |
-| 11 | 移除 timeout / allowed_tools / model 节点字段 | §4 |
-| 12 | 默认 run 目录布局：`.camflow/runs/<run_id>/` | 附录 C |
-| 13 | **新增 envelope status `halted`** | §6 |
-| 14 | **新增 `node_halted` / `workflow_halted` trace 事件** | §9 |
-| 15 | **node 失败无 retry → workflow_halted（不是 workflow_failed）** | 附录 D |
-| 16 | **retry 耗尽 → workflow_halted；写 `halt.json` sidecar** | §5 / 附录 D |
-| 17 | **exit code: 0=success, 2=halted, 1=failed** | 附录 D |
-| 18 | **Auto-schema：runner 自动检查 output_schema，verify 里不再需要 `{type: schema}`** | §4 / §6 |
-| 19 | **Workspace dir：每个 attempt 一个 `workspace/` 子目录，prompt/input/raw 都进去；tools cwd 设到这里 + `CAMFLOW_WORKSPACE` env var** | 附录 C |
-| 20 | **`_build_agent_context()` 抽出成 dedicated context-builder**，skill / tool / (future) agent 共用 | §11 |
+## End of spec.

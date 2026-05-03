@@ -1,6 +1,6 @@
-"""camflow v1.0 runtime — single-file workflow engine.
+"""camflow runtime — single-file workflow engine.
 
-Implements docs/spec-v1.md:
+Implements docs/spec.md:
 - Workflow state machine: running / done / halted
 - Node state machine:     waiting / running / done (+ result success/fail)
 - Halt is workflow-level only; nodes have no halted state.
@@ -396,7 +396,7 @@ def empty_envelope(status: str = "fail",
                    error: dict | None = None,
                    feedback: str | None = None,
                    data: dict | None = None) -> dict:
-    """Build a v1.0 envelope. status is required; rest auto-fill."""
+    """Build an envelope. status is required; rest auto-fill."""
     return {
         "status": status,
         "data": data if data is not None else {},
@@ -407,7 +407,7 @@ def empty_envelope(status: str = "fail",
 
 
 def normalize_envelope(raw: dict) -> dict:
-    """Coerce arbitrary dict into a v1.0 envelope shape, validating
+    """Coerce arbitrary dict into an envelope shape, validating
     status. Returns either a clean envelope or a failure envelope with
     BAD_STATUS if status is invalid.
     """
@@ -451,7 +451,7 @@ def build_run_prompt(node: "Node", input_dict: dict,
                      workflow_context: str | None = None) -> str:
     """Compose the prompt for a run agent (skill mode).
 
-    Layout (v1.1):
+    Layout:
       [skill template]
       [Workflow Context]      ← shared across every node, optional
       [Goal]
@@ -896,7 +896,7 @@ class Node:
         att_dir.mkdir(parents=True, exist_ok=True)
 
         # Build input by auto-collecting upstream + previous-attempt feedback.
-        # No user-authored templates — `run.input` was removed in v1.1.
+        # No user-authored templates — `run.input` has been removed.
         upstream = {}
         for dep_id in self.needs:
             up = workflow.nodes_by_id.get(dep_id)
@@ -1077,7 +1077,7 @@ class Workflow:
     def expr_ctx(self, current_output: dict | None = None) -> dict:
         """Template namespace dict.
 
-        v1.1: only `nodes.<id>.output` namespace, plus `output.X` when
+        Only `nodes.<id>.output` namespace, plus `output.X` when
         verifying (current envelope under check). No `state` / `inputs`.
         """
         nodes_view = {nid: n.public_view() for nid, n in self.nodes_by_id.items()

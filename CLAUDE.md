@@ -47,11 +47,13 @@ User-facing CLI mirrors `camc run`: one mandatory prompt, two verbs
 
 ## Spec is source of truth
 
-[`docs/spec-v1.1.md`](docs/spec-v1.1.md) is the canonical spec.
-Doctrine rules at the bottom — any change that contradicts those
-needs an explicit RFC. Read it before changing runtime semantics.
+[`docs/spec.md`](docs/spec.md) is the canonical spec. **Current
+version: 1.1.** Patch / minor bumps go to 1.1.1, 1.1.2, ...; a major
+schema change bumps to 1.2 / 2.0. Doctrine rules at the bottom — any
+change that contradicts those needs an explicit RFC. Read it before
+changing runtime semantics.
 
-Highlights of the v1.1 spec to keep top-of-mind:
+Highlights to keep top-of-mind:
 
 - **Prompt is the only external input.** No `--state`, no `--inputs`,
   no `state:` / `inputs:` YAML, no `{{state.X}}` templates, no
@@ -116,27 +118,24 @@ Highlights of the v1.1 spec to keep top-of-mind:
 camflow/
 ├── README.md
 ├── LICENSE
-├── pyproject.toml                     # entry: camflow = "runner_v2.runtime:main"
+├── pyproject.toml                  # entry: camflow = "runner.runtime:main"
 ├── docs/
-│   ├── spec.md / spec-v1.0.md         # historical
-│   └── spec-v1.1.md                   # ← source of truth, read this first
-├── src/runner_v2/                     # the v1.1 runtime — only path
-│   ├── camc_lib.py                    # camc subprocess wrapper
-│   └── runtime.py                     # Workflow + Node + execute_dag + CLI
-├── builtin/planner/                   # the self-hosting Planner workflow
-│   ├── workflow.yaml                  # understand → design_dag → render_yaml
+│   └── spec.md                     # ← source of truth, read this first
+├── src/runner/                     # the runtime — only path
+│   ├── camc_lib.py                 # camc subprocess wrapper
+│   └── runtime.py                  # Workflow + Node + execute_dag + CLI
+├── builtin/planner/                # the self-hosting Planner workflow
+│   ├── workflow.yaml               # understand → design_dag → render_yaml
 │   └── skills/
 │       ├── prompt_analyzer/SKILL.md
 │       ├── workflow_designer/SKILL.md
 │       └── yaml_writer/SKILL.md
-├── skills/                            # global skill registry
-│   ├── analyzer/, evaluator/, reviewer/   # tracked
-│   └── code_writer/                   # untracked (v1.0 content; v1.1 update pending)
+├── skills/                         # global skill registry
+│   └── analyzer/, evaluator/, reviewer/, code_writer/
 ├── examples/
 │   ├── README.md
-│   └── bug-fix-compiled/              # reference workflow.yaml shape
-├── examples-v1.0-archive/             # the 6 old hand-authored examples
-└── tests/test_v2.py                   # full test suite, no LLM cost
+│   └── bug-fix-compiled/           # reference workflow.yaml shape
+└── tests/test_runtime.py           # full test suite, no LLM cost
 ```
 
 ## How to run
@@ -160,7 +159,7 @@ kill $(cat .camflow/run/runner.pid)
 
 # tests
 pip install -e '.[test]'
-pytest tests/test_v2.py -q
+pytest tests/test_runtime.py -q
 ```
 
 ## Run dir layout
@@ -194,9 +193,9 @@ is fully inspectable as just another camflow run.
 
 ## Conventions / decisions
 
-- **`runner_v2/` not `camflow/`** as the package dir — `camflow` is
-  the project name + CLI, `runner_v2` is the Python package.
-- **Single-file runtime** — `runner_v2/runtime.py` is intentionally
+- **`runner/` not `camflow/`** as the package dir — `camflow` is
+  the project name + CLI, `runner` is the Python package.
+- **Single-file runtime** — `runner/runtime.py` is intentionally
   one file (~1300 lines). Don't split preemptively. If it crosses
   ~1800 lines, candidates are `expr.py` + `template.py` + `verify.py`.
 - **Strict expressions**: `{{nodes.missing}}` raises `ExprError`. No
@@ -209,10 +208,10 @@ is fully inspectable as just another camflow run.
 ## DO / DON'T
 
 **DO**
-- Read [`docs/spec-v1.1.md`](docs/spec-v1.1.md) before changing
+- Read [`docs/spec.md`](docs/spec.md) before changing
   runtime semantics.
 - Read this file (CLAUDE.md) before adding new files or features.
-- Run `pytest tests/test_v2.py -q` after any runtime change. Fast,
+- Run `pytest tests/test_runtime.py -q` after any runtime change. Fast,
   no LLM cost.
 - A real `camflow run "<small task>"` smoke test is the right way to
   verify the Planner chain end-to-end — but it does spend LLM credits.
@@ -220,8 +219,8 @@ is fully inspectable as just another camflow run.
 
 **DON'T**
 - **Don't bring back `state:` / `inputs:` / `--state` / `{{state.X}}`
-  / `run.input:`.** All cut in v1.1 on purpose. Per-run input = the
-  user prompt; Planner compiles it; that's the only path.
+  / `run.input:`.** All cut on purpose. Per-run input = the user
+  prompt; Planner compiles it; that's the only path.
 - **Don't bypass the Planner for fresh prompts.** No
   `camflow exec workflow.yaml`, no `--validate`, no positional yaml
   argument. Every fresh-prompt `camflow run "<prompt>"` goes through
@@ -252,7 +251,7 @@ is fully inspectable as just another camflow run.
 
 ## Pointers
 
-- Workflow + runtime spec: [`docs/spec-v1.1.md`](docs/spec-v1.1.md)
+- Workflow + runtime spec: [`docs/spec.md`](docs/spec.md)
 - Memory (per-conversation notes):
   `~/.claude/projects/-home-hren--openclaw-workspace-camflow/memory/`
 - Old codebase (do not import from): `archive/phase-abc-2026-04` branch

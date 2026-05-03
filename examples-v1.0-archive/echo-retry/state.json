@@ -1,3 +1,0 @@
-{
-  "error": "Build failed with linker error: undefined reference to memcpy"
-}

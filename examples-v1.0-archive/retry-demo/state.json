@@ -1,4 +1,0 @@
-{
-  "bug_report": "App crashes on empty input: NullPointerException in Parser.tokenize",
-  "max_attempts": 3
-}

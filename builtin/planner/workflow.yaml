@@ -2,7 +2,7 @@ workflow: planner
 version: "1.1"
 
 goal: |
-  Compile a user prompt into a camflow v1.1 workflow.yaml.
+  Compile a user prompt into a camflow workflow.yaml.
   This builtin workflow is what `camflow run "<prompt>"` invokes.
   The Planner's output (a workflow.yaml string) is then executed by
   the runtime as a normal workflow.
@@ -17,7 +17,7 @@ context: |
   `# Workflow Context` block at the top of each node's prompt — the
   runtime concatenates it there before this `context`).
 
-  Output format MUST conform to camflow v1.1 spec:
+  Output format MUST conform to the camflow spec:
     - no `state:` / `inputs:` section, no `run.input:` field
     - cross-node data via `needs` (auto-injected)
     - `workflow.context` for shared facts
@@ -60,11 +60,11 @@ nodes:
     retry: 3
 
   - id: render_yaml
-    goal: "Emit a syntactically valid camflow v1.1 workflow.yaml"
+    goal: "Emit a syntactically valid camflow workflow.yaml"
     needs: [design_dag]
     steps:
       - "Read upstream design_dag (auto-injected as upstream.design_dag)"
-      - "Serialize the DAG and context to YAML following spec v1.1"
+      - "Serialize the DAG and context to YAML following the spec"
       - "Ensure yaml_text is a single string suitable for writing to workflow.yaml"
       - "If the user's prompt asked for in-flow review/approval on a specific step inside the user's workflow, attach verify={human: ...} to THAT user-workflow node. Do NOT attach human verify to this render_yaml node — plan-level approval is controlled by the runtime's -i / --interactive CLI flag, not by you."
       - "If the user rejected a previous attempt, follow previous.feedback"
@@ -73,5 +73,5 @@ nodes:
     output_schema:
       yaml_text: string
     verify:
-      criterion: "yaml_text parses as YAML and matches camflow v1.1 schema (no inputs:/state:/run.input; nodes have id+goal+steps+run)"
+      criterion: "yaml_text parses as YAML and matches the camflow schema (no inputs:/state:/run.input; nodes have id+goal+steps+run)"
     retry: 3

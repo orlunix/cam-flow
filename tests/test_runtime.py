@@ -1,4 +1,4 @@
-"""Test suite for camflow v1.0 (runner_v2).
+"""Test suite for camflow runtime.
 
 Layout:
 - TestExpressions   — eval_expr + render_str + render_deep, strict mode.
@@ -11,7 +11,7 @@ Layout:
                       run YAML → load → validate → execute → archive.
                       No LLM cost (uses tool nodes only).
 
-Run:    pytest tests/test_v2.py -q
+Run:    pytest tests/test_runtime.py -q
 """
 from __future__ import annotations
 
@@ -23,8 +23,8 @@ from pathlib import Path
 
 import pytest
 
-from runner_v2 import camc_lib  # noqa
-from runner_v2.runtime import (
+from runner import camc_lib  # noqa
+from runner.runtime import (
     ExprError,
     Node,
     Workflow,
@@ -59,7 +59,7 @@ def make_executable_tool(path: Path, body: str) -> None:
 
 
 def envelope_tool_body(data: dict, status: str = "success") -> str:
-    """Bash that prints a v1.0 envelope JSON to stdout."""
+    """Bash that prints an envelope JSON to stdout."""
     payload = {
         "status": status,
         "data": data,
@@ -77,7 +77,7 @@ def envelope_tool_body(data: dict, status: str = "success") -> str:
 class TestExpressions:
     """eval_expr / render_str / render_deep are namespace-agnostic.
     These tests use `nodes` since that's the only namespace the runtime
-    exposes in v1.1; expression engine itself doesn't care about names."""
+    exposes; expression engine itself doesn't care about names."""
 
     def test_simple_attr(self):
         assert eval_expr("nodes.a", {"nodes": {"a": 1}}) == 1
@@ -115,7 +115,7 @@ class TestExpressions:
                           {"nodes": {"name": "world"}}) == "hello world"
 
     def test_render_strict_missing(self):
-        """v1.1 has NO `?` optional marker; missing → ExprError."""
+        """this spec has NO `?` optional marker; missing → ExprError."""
         with pytest.raises(ExprError):
             render_str("{{nodes.missing}}", {"nodes": {}})
 
@@ -636,7 +636,7 @@ class TestE2E:
         )
 
         # Tool 2: read upstream diagnose's root_cause from input, return a patch.
-        # In v1.1, runtime auto-injects upstream envelopes under input.upstream.<id>.
+        # Runtime auto-injects upstream envelopes under input.upstream.<id>.
         make_executable_tool(
             scripts / "fix.sh",
             r"""
@@ -760,7 +760,7 @@ EOF
 
     # ── test 2: rerun auto-archives the prior run ──────────────────────
     def test_rerun_archives_prior(self, tmp_path):
-        from runner_v2.runtime import default_run_dir
+        from runner.runtime import default_run_dir
         proj = self._setup_project(tmp_path)
         wf = self._three_node_workflow()
 
@@ -944,7 +944,7 @@ class TestStepping:
         }
 
     def test_steps_halts_cleanly(self, tmp_path):
-        from runner_v2.runtime import run_workflow
+        from runner.runtime import run_workflow
         proj = self._setup_three_node_proj(tmp_path)
         wf = self._three_seq_workflow()
         rd = proj / ".camflow" / "run"
@@ -963,7 +963,7 @@ class TestStepping:
 
     def test_steps_propagate_fail_false(self, tmp_path):
         """Step halt must NOT mark downstream nodes as done+fail."""
-        from runner_v2.runtime import Workflow, run_workflow
+        from runner.runtime import Workflow, run_workflow
         proj = self._setup_three_node_proj(tmp_path)
         wf_dict = self._three_seq_workflow()
         rd = proj / ".camflow" / "run"
@@ -977,7 +977,7 @@ class TestStepping:
 
     def test_resume_after_step_halt_continues(self, tmp_path, monkeypatch):
         """After --steps halt, resume runs to completion."""
-        from runner_v2.runtime import run_workflow, _cmd_resume
+        from runner.runtime import run_workflow, _cmd_resume
         proj = self._setup_three_node_proj(tmp_path)
         wf = self._three_seq_workflow()
         rd = proj / ".camflow" / "run"
@@ -993,7 +993,7 @@ class TestStepping:
 
     def test_resume_with_more_steps(self, tmp_path):
         """Resume --steps 1 advances exactly 1 more node, then halts again."""
-        from runner_v2.runtime import run_workflow, _cmd_resume
+        from runner.runtime import run_workflow, _cmd_resume
         proj = self._setup_three_node_proj(tmp_path)
         wf = self._three_seq_workflow()
         rd = proj / ".camflow" / "run"
@@ -1013,7 +1013,7 @@ class TestStepping:
 
     def test_steps_count_includes_retries(self, tmp_path):
         """--steps counts attempts, not nodes — retries also tick the counter."""
-        from runner_v2.runtime import run_workflow
+        from runner.runtime import run_workflow
         proj = tmp_path / "proj"
         scripts = proj / "scripts"
         scripts.mkdir(parents=True)
@@ -1084,7 +1084,7 @@ class TestRerun:
         }
 
     def test_rerun_resets_target_and_downstream(self, tmp_path):
-        from runner_v2.runtime import run_workflow, _cmd_rerun
+        from runner.runtime import run_workflow, _cmd_rerun
         proj = self._setup_three_node_proj(tmp_path)
         wf = self._three_seq_workflow()
         rd = proj / ".camflow" / "run"
@@ -1103,7 +1103,7 @@ class TestRerun:
         assert (rd / "nodes" / "c" / "attempt-2" / "output.json").exists()
 
     def test_rerun_target_only_when_no_downstream(self, tmp_path):
-        from runner_v2.runtime import run_workflow, _cmd_rerun
+        from runner.runtime import run_workflow, _cmd_rerun
         proj = self._setup_three_node_proj(tmp_path)
         wf = self._three_seq_workflow()
         rd = proj / ".camflow" / "run"
@@ -1116,7 +1116,7 @@ class TestRerun:
         assert (rd / "nodes" / "c" / "attempt-2" / "output.json").exists()
 
     def test_rerun_unknown_node_errors(self, tmp_path, capsys):
-        from runner_v2.runtime import run_workflow, _cmd_rerun
+        from runner.runtime import run_workflow, _cmd_rerun
         proj = self._setup_three_node_proj(tmp_path)
         wf = self._three_seq_workflow()
         rd = proj / ".camflow" / "run"
@@ -1129,7 +1129,7 @@ class TestRerun:
 
     def test_rerun_with_steps(self, tmp_path):
         """rerun + --steps halts cleanly mid-rerun."""
-        from runner_v2.runtime import run_workflow, _cmd_rerun
+        from runner.runtime import run_workflow, _cmd_rerun
         proj = self._setup_three_node_proj(tmp_path)
         wf = self._three_seq_workflow()
         rd = proj / ".camflow" / "run"
@@ -1146,7 +1146,7 @@ class TestRerun:
 
     def test_rerun_clears_old_halt(self, tmp_path):
         """Rerunning after a halt clears halt.json before re-executing."""
-        from runner_v2.runtime import run_workflow, _cmd_rerun
+        from runner.runtime import run_workflow, _cmd_rerun
         proj = tmp_path / "proj"
         scripts = proj / "scripts"
         scripts.mkdir(parents=True)
@@ -1218,7 +1218,7 @@ class TestReviewerFixes:
     def test_run_from_default_path_does_not_archive(self, tmp_path,
                                                     monkeypatch):
         """Reviewer fix #1."""
-        from runner_v2.runtime import _cmd_run
+        from runner.runtime import _cmd_run
         proj = self._setup_seq_proj(tmp_path)
         monkeypatch.chdir(proj)
         wf = self._seq_workflow()
@@ -1243,7 +1243,7 @@ class TestReviewerFixes:
 
     def test_step_halt_during_retry_resume_continues(self, tmp_path):
         """Reviewer fix #2."""
-        from runner_v2.runtime import _cmd_resume
+        from runner.runtime import _cmd_resume
         proj = tmp_path / "proj"
         scripts = proj / "scripts"
         scripts.mkdir(parents=True)

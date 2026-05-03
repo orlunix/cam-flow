@@ -36,7 +36,7 @@ A JSON envelope written to `agent_output.json`. Required `data` fields:
    enough that the verify can meaningfully check it.
 2. **Dependency edges only via `needs`.** A node lists its upstream
    nodes by id; the runtime auto-injects upstream envelopes into its
-   prompt. No `run.input` field — that doesn't exist in v1.1.
+   prompt. No `run.input` field — that doesn't exist.
 3. **Pick existing skills.** If you don't know a skill exists, don't
    reference it. The runtime fails workflow load if a skill is missing.
 
@@ -90,7 +90,7 @@ A JSON envelope written to `agent_output.json`. Required `data` fields:
 6. **`workflow.context`** is for facts shared across all nodes — put
    the user's original task there, plus run-constants like tool paths,
    conventions, codebase layout, anything every node should know.
-7. **No `state:`, no `inputs:`, no `run.input`.** v1.1 doesn't have them.
+7. **No `state:`, no `inputs:`, no `run.input`.** they don't exist.
    Anything constant goes in `workflow.context`. Per-run inputs flow
    through the user's original prompt only (already in context).
 

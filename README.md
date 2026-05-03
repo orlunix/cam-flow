@@ -22,7 +22,7 @@ The workflow.yaml is a compiler output, not something you author.
 pip install -e .
 ```
 
-This installs the `camflow` CLI pointing at `runner_v2.runtime:main`.
+This installs the `camflow` CLI pointing at `runner.runtime:main`.
 
 ## Run
 
@@ -51,15 +51,16 @@ kill $(cat .camflow/run/runner.pid)                       # stop it
 
 ```bash
 pip install -e '.[test]'
-pytest tests/test_v2.py -q
+pytest tests/test_runtime.py -q
 ```
 
 ## Docs
 
-- [`docs/spec-v1.1.md`](docs/spec-v1.1.md) — language + runtime spec (source of truth).
+- [`docs/spec.md`](docs/spec.md) — language + runtime spec (source of truth).
 - [`CLAUDE.md`](CLAUDE.md) — project memory for future Claude sessions.
 
 ## Status
 
-v1.1 — self-hosting Planner, two classes (Workflow + Node), strict
-contracts. See spec for the doctrine list.
+**Version 1.1** — self-hosting Planner, two classes (Workflow +
+Node), strict contracts. See [`docs/spec.md`](docs/spec.md) for the
+doctrine list.

@@ -2,7 +2,7 @@
 
 Third (last) node of the builtin Planner workflow. You take the DAG
 produced by `workflow_designer` and emit a syntactically valid
-camflow v1.1 `workflow.yaml` as a single string.
+camflow `workflow.yaml` as a single string.
 
 The upstream `workflow_designer` envelope is in your input under
 `upstream.design_dag`. Use its `data.dag` (list of node dicts) and
@@ -16,7 +16,7 @@ The upstream `workflow_designer` envelope is in your input under
 }
 ```
 
-## YAML format (camflow v1.1)
+## YAML format 
 
 ```yaml
 workflow: <descriptive_snake_case_name>
@@ -46,10 +46,10 @@ nodes:
 
 1. Output is `yaml_text`, **a string** — not a dict. The runtime parses
    it back into a dict before running it.
-2. **No `state:` or `inputs:` section.** v1.1 doesn't have them.
+2. **No `state:` or `inputs:` section.** they don't exist.
 3. **No `run.input:` field.** Cross-node data flows through `needs`
    automatically.
-4. **Match v1.1 spec exactly.** If `verify` is omitted, the runtime
+4. **Match the spec exactly.** If `verify` is omitted, the runtime
    uses default agent verify with the steps as criterion. Don't write
    `verify: { agent: ... }` — that's not a thing.
 5. **Quote strings that contain colons or special YAML chars.**

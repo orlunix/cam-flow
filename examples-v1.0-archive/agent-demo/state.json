@@ -1,4 +1,0 @@
-{
-  "bug_report": "Our log parser crashes with TypeError: 'NoneType' object is not iterable when the input file is empty. Stack points at parser.py:48 inside Parser.tokenize, on the line `for token in tokens:`. The function returns None when given an empty string instead of an empty list.",
-  "language": "python"
-}
