@@ -67,15 +67,20 @@ Highlights of the v1.1 spec to keep top-of-mind:
 - **`verify.command`** — bash exit code as the deterministic gate.
   Verify-side commands are unconstrained — use them freely for
   pass/fail checks.
-- **`verify.human`** has **two contexts, two defaults** (don't
-  conflate):
-  1. **Planner's `render_yaml` node** — always carries it. Every
-     `camflow run` pauses after Planner finishes, shows the compiled
-     workflow.yaml, requires `approve` before runtime executes. This
-     is the interactive-mode contract; no bypass.
-  2. **User-workflow nodes** — opt-in. Planner inserts it on a user
-     node only when the user's prompt explicitly asked for in-flow
-     review on that step.
+- **`verify.human`** is opt-in via **two distinct mechanisms**, both
+  off by default:
+  1. **Plan-level approval** — opted into via the `-i` / `--interactive`
+     CLI flag. `camflow run -i "<prompt>"` patches Planner's
+     `render_yaml` at startup to require human approval of the
+     compiled workflow.yaml before runtime executes it. Without `-i`,
+     fire-and-forget — Planner finishes and runtime executes.
+  2. **In-flow node approval** — opted into via the user's prompt
+     language. Planner's `workflow_designer` detects requests like
+     "show me X before doing Y" and inserts `verify: human` on the
+     relevant user-workflow node.
+
+  `camflow run "<prompt>"` (no `-i`, prompt has no in-flow ask) =
+  zero human gates. That's the default.
 - **Retry is a counter, not an expression.** No `retry.until`. On
   retry, runtime auto-injects `previous` (last attempt's envelope)
   into the next attempt's input.
@@ -200,12 +205,10 @@ is fully inspectable as just another camflow run.
 - **Don't bypass the Planner.** No `camflow exec workflow.yaml`, no
   `--validate`, no positional yaml argument. Every CLI run goes
   through Planner.
-- **Don't insert `verify: human` on user-workflow nodes by default.**
-  In-flow human review on user nodes is opt-in — Planner adds it only
-  when the user's prompt explicitly asks for review on that step. (The
-  Planner's own `render_yaml` node DOES carry `verify: human` by
-  design — that's the interactive plan-approval gate; not the same
-  thing. Don't remove that one.)
+- **Don't insert `verify: human` anywhere by default.** Both flavors
+  are opt-in (CLI `-i` for plan-level; user-prompt language for
+  in-flow node-level). `camflow run "<prompt>"` should run end-to-end
+  with zero pauses unless the user asked for one.
 - **Don't model a role as a single SKILL.md OR as a sub-workflow.**
   Planner / Evaluator / Worker / Orchestrator are AGENTS — autonomous
   Claude Code sessions, one camc spawn per role, multi-step

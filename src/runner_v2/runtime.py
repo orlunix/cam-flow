@@ -1321,6 +1321,9 @@ def _cmd_run(argv: list[str]) -> int:
     )
     p.add_argument("prompt", nargs="?", default=None,
                    help="natural-language task prompt (required)")
+    p.add_argument("-i", "--interactive", action="store_true",
+                   help="pause after Planner compiles, let you approve "
+                        "(or revise) the workflow.yaml before execution")
     p.add_argument("--run-dir", default=None,
                    help="run directory (default: ./.camflow/run/)")
     args = p.parse_args(argv)
@@ -1356,6 +1359,25 @@ def _cmd_run(argv: list[str]) -> int:
         f"# Original user prompt\n{args.prompt.strip()}\n\n"
         f"---\n\n{base_ctx}"
     )
+
+    # Interactive mode: swap render_yaml's verify to require human approval
+    # of the compiled workflow.yaml before runtime executes it. Default
+    # (no -i): render_yaml uses its declared agent/criterion verify and
+    # the runtime just runs the result.
+    if args.interactive:
+        for n in planner_spec["nodes"]:
+            if n["id"] == "render_yaml":
+                n["verify"] = {
+                    "human": (
+                        "Review the proposed workflow.yaml below.\n"
+                        "Type 'approve' to accept and have the runtime "
+                        "execute it.\n"
+                        "Otherwise, describe what to change and the "
+                        "Planner will revise."
+                    )
+                }
+                break
+
     errors = validate_workflow(planner_spec, project_root=planner_dir)
     if errors:
         for e in errors:
@@ -1415,7 +1437,8 @@ def main(argv: list[str] | None = None) -> int:
             "camflow — prompt-driven, multi-agent workflow runner\n"
             "\n"
             "Usage:\n"
-            "  camflow run \"<prompt>\"          compile + run a workflow\n"
+            "  camflow run \"<prompt>\"          compile + run (fire-and-forget)\n"
+            "  camflow run -i \"<prompt>\"       compile + pause for plan approval, then run\n"
             "  camflow resume <run_dir>         resume a halted run\n"
             "\n"
             "Inspect a run:  cat .camflow/run/trace.jsonl\n"

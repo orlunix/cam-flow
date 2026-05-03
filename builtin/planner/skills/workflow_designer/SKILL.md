@@ -78,12 +78,13 @@ A JSON envelope written to `agent_output.json`. Required `data` fields:
    to the relevant node (the one whose output the user wants to gate
    on), not every node.
 
-   **Don't worry about plan-level approval.** The Planner's own
-   `render_yaml` node already has a `verify: human` gate by design —
-   the user always reviews + approves the compiled workflow.yaml
-   before it starts executing. That's the interactive contract; you
-   don't need to add anything for it. Your job is only the *in-flow*
-   case described above.
+   **Don't worry about plan-level approval.** Whether the user gets to
+   review the compiled workflow.yaml before execution is controlled by
+   the runtime's `-i` / `--interactive` CLI flag, NOT by you. If the
+   user wants plan approval, they invoked `camflow run -i "<prompt>"`
+   and the runtime patches Planner's `render_yaml` accordingly. You
+   should never put `verify: human` on the `render_yaml` node yourself,
+   and you should not assume plan approval will or won't happen.
 5. **Retry sparingly.** Default 1 (no retry). High-stakes generative
    work (code, plans) → 2-3. Deterministic tools rarely need retry.
 6. **`workflow.context`** is for facts shared across all nodes — put

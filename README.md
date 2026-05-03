@@ -27,9 +27,15 @@ This installs the `camflow` CLI pointing at `runner_v2.runtime:main`.
 ## Run
 
 ```bash
-camflow run "Fix the TypeError on line 87 of foo.py"     # compile + execute
+camflow run    "Fix the TypeError on line 87 of foo.py"   # fire-and-forget
+camflow run -i "Fix the TypeError on line 87 of foo.py"   # pause for plan approval
 camflow resume <run_dir>                                  # resume a halted run
 ```
+
+The `-i` / `--interactive` flag pauses after Planner finishes
+designing, so you can review (and revise) the compiled `workflow.yaml`
+before the runtime executes it. Without `-i`, Planner compiles and
+runtime runs without interaction.
 
 Inspect a run while it's going:
 

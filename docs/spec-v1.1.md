@@ -494,35 +494,35 @@ Run in the attempt directory. Exit 0 → approved. Non-zero → rejected; feedba
 
 ### `verify: { human: <prompt-text-shown-to-user> }`
 
-There are **two different contexts** for human approval, with
-different defaults — don't conflate them:
+Human approval has **two opt-in mechanisms**, both off by default:
 
-**1. Planner-level approval (the compiled `workflow.yaml` itself).**
-The Planner's `render_yaml` node carries `verify: human` **by design**.
-This is the interactive contract: every `camflow run` pauses after
-Planner finishes designing, presents the compiled workflow.yaml, and
-requires the user to type `approve` before the runtime executes it.
-There is no non-interactive mode that bypasses this gate. If the user
-rejects, their feedback feeds back into Planner via the standard
-retry+feedback channel.
+**1. Plan-level approval (review the compiled workflow.yaml).**
+Triggered by the `-i` / `--interactive` flag on `camflow run`. When set,
+the runtime patches Planner's `render_yaml` node at startup to use
+`verify: { human: ... }` — after Planner finishes designing, the user
+sees the compiled workflow.yaml and must type `approve` before the
+runtime executes it (or describe a change to drive a Planner revision).
+**Default (no `-i`)**: Planner's `render_yaml` uses its declared
+agent-criterion verify and the runtime executes whatever passes that —
+fire-and-forget.
 
-**2. User-workflow node approval (mid-execution review of a node's
-output).** Once the Planner's workflow.yaml is approved and starts
-executing, individual nodes default to **no human gating** —
-verifications use `agent` / `command`. A node carries
-`verify: human` only when the user's *original prompt* explicitly
+**2. In-flow approval (review a specific user-workflow node's
+output mid-execution).** Planner inserts `verify: { human: ... }` on a
+user-workflow node only when the user's *prompt itself* explicitly
 asked for in-flow review on that step ("show me the patch before
-applying it", "let me sanity-check the regex", etc.). Inserting
-`verify: human` on a node the user didn't ask for is a UX regression
-— it stalls the workflow waiting on input the user didn't request.
+applying", "let me sanity-check the regex"). Inserting it on nodes
+the user didn't ask about is a UX regression — it stalls the workflow.
 
-In both contexts, the runtime mechanic is the same. Only the question
-of *who decides whether to insert it* differs:
+In both cases, the runtime mechanic is identical. The question is
+*who decides to insert it*:
 
-| context | default | who decides |
+| context | default | how to opt-in |
 |---|---|---|
-| Planner's `render_yaml` | always present | spec (mandatory; interactive mode) |
-| User-workflow node | absent | Planner detects opt-in from user prompt |
+| Plan-level (`render_yaml`) | absent — fire-and-forget | `camflow run -i "<prompt>"` |
+| User-workflow node | absent | user mentions in-flow review in the prompt; Planner's `workflow_designer` skill detects it |
+
+Note: `-i` flag controls only the plan-level gate. It does NOT cause
+the Planner to sprinkle `verify: human` across user-workflow nodes.
 
 Runtime prints to stdout:
 
@@ -806,15 +806,21 @@ The Planner sub-directory makes Planner's own execution **fully inspectable as j
 ## 12. CLI
 
 ```
-camflow run "<prompt>"        # mandatory; spawns Planner workflow + executes its output
-camflow resume <run_dir>      # resume a halted run
+camflow run "<prompt>"           # fire-and-forget: Planner compiles, runtime executes
+camflow run -i "<prompt>"        # interactive: pause for plan approval before execution
+camflow resume <run_dir>         # resume a halted run
 ```
 
 | command | behavior | exit codes |
 |---|---|---|
 | `run "<prompt>"` | mandatory prompt; runs Planner → executes generated workflow.yaml | 0 done / 1 invocation error / 2 halted |
+| `run -i "<prompt>"` | same, plus a plan-approval gate after Planner finishes (see §9) | 0 / 1 / 2 |
 | `run` (no prompt) | print error and exit | 1 |
 | `resume <run_dir>` | resume from `<run_dir>/halt.json` state | 0 / 1 / 2 |
+
+`-i` / `--interactive` patches Planner's `render_yaml` node at startup
+to require human approval of the compiled `workflow.yaml`. Without
+`-i`, Planner finishes and runtime executes the result with no pause.
 
 Inspecting in-progress: `cat .camflow/run/trace.jsonl` (no `camflow status` subcommand).
 
@@ -956,7 +962,7 @@ Planner failure → camflow halts with the Planner's halt.json. User sees what P
 12. **Adding a verify type requires RFC.** Currently: agent (default), command, human.
 13. **Skill is the default run executor.** `run.tool:` is allowed only when ALL FIVE hard criteria in §10 hold (known command + fully-determined inputs + script-structured output + idempotent + cost matters). When in doubt, use skill. Adding a new run-phase executor type beyond skill / tool requires RFC.
 14. **Verify phase carries the deterministic gate.** `verify.command` (bash exit code) is the canonical place for "did the test pass / did the file parse / did the patch apply" checks. Verify-side commands are unconstrained — they're already deterministic by design. The hard rules in #13 are about RUN-phase tools, not verify.
-15. **`verify: human` has two contexts, two defaults.** Planner's `render_yaml` node always carries it (mandatory plan-approval gate; the interactive-mode contract). Inside the user's compiled workflow, `verify: human` is opt-in — Planner inserts it on a node only when the user's prompt asked for in-flow review on that step.
+15. **`verify: human` is opt-in via two distinct mechanisms.** Plan-level approval is opted into via the `-i` / `--interactive` CLI flag (runtime patches Planner's `render_yaml`); in-flow node approval is opted into via the user's prompt language (Planner's `workflow_designer` detects requests like "show me X before doing Y"). Both default to off — `camflow run "<prompt>"` is fire-and-forget. Adding human gates the user didn't request is a UX regression.
 
 Breaking any of these without explicit reason is a regression.
 
