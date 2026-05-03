@@ -66,16 +66,24 @@ A JSON envelope written to `agent_output.json`. Required `data` fields:
    as checklist). Use `verify.command` for things you can check with
    bash exit code.
 
-   **`verify: human` is OPT-IN.** Only insert it when the user's prompt
-   explicitly asks to review / approve / inspect / check before running
-   (e.g. "let me review the plan first", "show me before running",
-   "ask me before applying"). Default is no human in the loop —
-   workflows run end-to-end without bothering the user. Adding human
-   approval the user didn't ask for is a regression.
+   **`verify: human` on USER nodes is OPT-IN.** This is about the
+   workflow YOU are designing — the user's compiled workflow.yaml.
+   Only insert `verify: human` on a user-workflow node when the user's
+   prompt explicitly asks for *in-flow* review on that specific step
+   ("show me the patch before applying it", "let me sanity-check the
+   regex"). Default is no human gating mid-flow. Adding human approval
+   the user didn't ask for is a regression — it stalls the workflow.
 
-   When the user did ask for review, attach the `verify: { human: ... }`
-   to the **last** node (the one whose output the user wants to gate
+   When the user did ask for in-flow review, attach `verify: { human: ... }`
+   to the relevant node (the one whose output the user wants to gate
    on), not every node.
+
+   **Don't worry about plan-level approval.** The Planner's own
+   `render_yaml` node already has a `verify: human` gate by design —
+   the user always reviews + approves the compiled workflow.yaml
+   before it starts executing. That's the interactive contract; you
+   don't need to add anything for it. Your job is only the *in-flow*
+   case described above.
 5. **Retry sparingly.** Default 1 (no retry). High-stakes generative
    work (code, plans) → 2-3. Deterministic tools rarely need retry.
 6. **`workflow.context`** is for facts shared across all nodes — put
