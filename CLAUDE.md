@@ -89,6 +89,13 @@ Highlights of the v1.1 spec to keep top-of-mind:
   done+success or done+fail.
 - **Strict skill registry.** Workflow load fails if any referenced
   skill is missing. No dynamic creation.
+- **Resume = retry the halted node once.** `camflow resume <run_dir>`
+  restores Workflow + Node state from disk, resets the halted node to
+  `waiting`, bumps `retry_max += 1` (one more attempt), and re-enters
+  `execute_dag`. Optional `--feedback "<text>"` splices into the
+  halted node's last-envelope `feedback` field — surfaces as
+  `previous.feedback` on the next attempt, same channel as
+  agent-rejected retries. See spec §13 for full semantics.
 
 ## Project layout
 

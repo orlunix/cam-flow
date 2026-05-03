@@ -816,7 +816,7 @@ camflow resume <run_dir>         # resume a halted run
 | `run "<prompt>"` | mandatory prompt; runs Planner → executes generated workflow.yaml | 0 done / 1 invocation error / 2 halted |
 | `run -i "<prompt>"` | same, plus a plan-approval gate after Planner finishes (see §9) | 0 / 1 / 2 |
 | `run` (no prompt) | print error and exit | 1 |
-| `resume <run_dir>` | resume from `<run_dir>/halt.json` state | 0 / 1 / 2 |
+| `resume <run_dir> [--feedback "<text>"]` | resume a halted run; one more attempt for the halted node, optional human feedback. See §13 for full semantics. | 0 / 1 / 2 |
 
 `-i` / `--interactive` patches Planner's `render_yaml` node at startup
 to require human approval of the compiled `workflow.yaml`. Without
@@ -828,7 +828,145 @@ There is no `camflow exec workflow.yaml`, no `--validate`, no `--inputs`. The on
 
 ---
 
-## 13. The builtin Planner workflow
+## 13. Resume
+
+After a workflow halts, the user can fix what went wrong and continue
+where they left off via `camflow resume <run_dir>`. Resume is the
+manual recovery counterpart to retry — retry happens automatically
+within a node (bounded by `retry_max`); resume is the human-driven
+escape hatch at workflow level after retries are exhausted.
+
+### Pre-conditions
+
+```bash
+camflow resume <run_dir> [--feedback "<text>"]
+```
+
+* `<run_dir>/halt.json` MUST exist. If absent → CLI prints
+  `ERROR: not halted` and exits 1.
+* `<run_dir>/workflow.yaml` MUST exist (the compiled IR is intact).
+* `<run_dir>` may be the user's main run dir (`./.camflow/run/`) OR
+  a Planner sub-run dir (`./.camflow/run/planner/`) when it was
+  Planner that halted. The same code path handles both.
+
+### What gets restored from disk
+
+The runtime walks `<run_dir>/nodes/` and rebuilds per-node state by
+replaying attempt directories:
+
+| Node had on disk | Post-restore state |
+|---|---|
+| `attempt-N/output.json` files | `history` = list of envelopes, `output` = last envelope, `retry_count` = N − 1, `lifecycle = "done"`, `result` = `success`/`fail` per last envelope |
+| no attempt directory | default fresh state (`lifecycle = "waiting"`, `retry_count = 0`) — these are downstream nodes that were marked done+fail by halt propagation but never executed |
+
+This restoration is precise: a workflow that was halfway through a
+DAG has its successful upstream nodes preserved as `done+success`
+(they don't re-run), and its yet-to-run downstream nodes left as
+`waiting` (they'll execute as the DAG progresses).
+
+### Where execution restarts
+
+The single halted node — identified by `halt.json`'s `halted_node`
+field — is reset:
+
+```
+node.lifecycle = "waiting"
+node.result    = None
+node.retry_max = max(node.retry_max + 1, node.retry_count + 1)
+                       └────────┬────────┘
+                       grants exactly one more attempt
+```
+
+`retry_count` is **not** reset; it stays at the count from the
+original run. Combined with the bumped `retry_max`, this means resume
+gives **one fresh attempt**, not a full retry budget. If that
+attempt also fails (for the same or different reason), the workflow
+halts again — and the user can `resume` again, granting one more.
+
+The runtime then re-enters `Workflow.execute_dag()`. The DAG
+scheduler picks up the now-ready halted node, runs it, and proceeds
+forward — any downstream nodes become ready in turn if it succeeds.
+
+### Feedback channel (`--feedback "<text>"`)
+
+When the user wants to *steer* the next attempt (not just retry it
+identically), `--feedback` injects guidance:
+
+```bash
+camflow resume .camflow/run --feedback \
+  "the test was looking at the wrong file; check src/auth.py instead"
+```
+
+Mechanics — uses the same channel as agent-rejected retries:
+
+```
+1. Splice text into halted node's last envelope on disk:
+       node.history[-1].feedback = "<text>"
+
+2. On the next attempt, runtime auto-injects `previous` into the
+   input dict (per §6 retry feedback channel):
+       attempt-(N+1)/input.json
+         {
+           "upstream": {...},
+           "previous": {
+             "status": "fail",
+             "data":   {...},
+             "error":  {...},
+             "feedback": "the test was looking at the wrong file..."
+           }
+         }
+
+3. Skill agent reads input.previous.feedback as the actionable
+   directive; SKILL.md should already document the "On retry" path
+   that consults previous.feedback.
+```
+
+So `--feedback` is the user's hand-typed equivalent of the verify
+agent's reject reasoning. Same field, same plumbing.
+
+### Halt scenarios and what resume does to each
+
+| Halt cause | Resume behavior |
+|---|---|
+| Verify-agent rejected; retries exhausted | One more attempt; user can pass `--feedback` to redirect |
+| `verify.command` failed; retries exhausted | One more attempt; if the issue is transient, plain resume; if it's substantive, fix the cause + `--feedback` |
+| `verify.human` rejected and retry budget consumed | One more attempt; user can be more decisive on next try (or pass `--feedback` describing what to do differently) |
+| Node returned `request_human=true` | One more attempt; the human is expected to have resolved the underlying issue (e.g. unstuck a stale credential, fixed a file) before resuming |
+| Planner halted (couldn't compile valid yaml) | Resume `<run_dir>/planner/`; one more shot at the failing Planner node, optionally with `--feedback` steering the regeneration |
+
+### `-i` flag and resume
+
+`-i` / `--interactive` is a `run`-time flag only. Once a workflow.yaml
+has been compiled (and possibly approved via `-i` on the original
+`run`), the *same* compiled yaml is reused on every resume — plan
+approval does NOT re-trigger. The user already approved the plan; now
+they're just unsticking individual nodes.
+
+### What resume cannot do
+
+* Cannot resume a workflow that completed successfully (no halt.json).
+* Cannot un-run a node that already succeeded — `success` is permanent
+  within a run.
+* Cannot reorder, insert, or delete nodes — the DAG is fixed once
+  Planner has compiled. If the user wants a fundamentally different
+  plan, they should start a fresh `camflow run`.
+* Cannot re-prompt the Planner mid-run for a different design;
+  Planner is upstream of execution, not interactive with it.
+
+### Trace event on resume
+
+```jsonl
+{"step": N, "ts": "...", "event": "workflow_resumed",
+ "node": "<halted_id>", "retry_count": <count>, "feedback_len": <len>}
+```
+
+The trace's continuity (step counter monotonic across original-run +
+resume) makes resumed runs distinguishable from fresh ones in
+post-mortem analysis without extra tooling.
+
+---
+
+## 14. The builtin Planner workflow
 
 Lives at `camflow/builtin/planner/`:
 
@@ -919,7 +1057,7 @@ Planner failure → camflow halts with the Planner's halt.json. User sees what P
 
 ---
 
-## 14. Reserved / forbidden in v1.1
+## 15. Reserved / forbidden in v1.1
 
 | Cut | Why |
 |---|---|
@@ -946,7 +1084,7 @@ Planner failure → camflow halts with the Planner's halt.json. User sees what P
 
 ---
 
-## 15. Doctrine (rules for changing this spec)
+## 16. Doctrine (rules for changing this spec)
 
 1. **Two classes only: `Workflow` and `Node`.** No third runtime class.
 2. **Workflow doesn't run or verify.** It only schedules.
