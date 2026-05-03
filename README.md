@@ -29,13 +29,16 @@ This installs the `camflow` CLI pointing at `runner_v2.runtime:main`.
 ```bash
 camflow run    "Fix the TypeError on line 87 of foo.py"   # fire-and-forget
 camflow run -i "Fix the TypeError on line 87 of foo.py"   # pause for plan approval
+camflow run --from <node_id>                              # re-execute a node + downstream
+camflow run --steps 1 "<prompt>"                          # debug: halt after first attempt
 camflow resume <run_dir>                                  # resume a halted run
 ```
 
 The `-i` / `--interactive` flag pauses after Planner finishes
 designing, so you can review (and revise) the compiled `workflow.yaml`
-before the runtime executes it. Without `-i`, Planner compiles and
-runtime runs without interaction.
+before the runtime executes it. `--from <node_id>` re-runs a specific
+node (plus its downstream) on an existing `./.camflow/run/` —
+operate-on-existing path, mutex with a fresh-run prompt.
 
 Inspect a run while it's going:
 

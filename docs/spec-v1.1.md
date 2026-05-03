@@ -811,7 +811,7 @@ camflow run -i "<prompt>"               # interactive: pause for plan approval b
 camflow run --steps N "<prompt>"        # debug: halt after N node-attempts
 camflow resume <run_dir>                # resume a halted run
 camflow resume <run_dir> --steps N      # resume but advance only N more attempts
-camflow rerun <run_dir> <node_id>       # re-execute a node + downstream
+camflow run --from <node_id>            # re-execute a node + downstream
 ```
 
 | command | behavior | exit codes |
@@ -821,7 +821,7 @@ camflow rerun <run_dir> <node_id>       # re-execute a node + downstream
 | `run --steps N "<prompt>"` | runs but halts after N node-attempts (debug breakpoint, see §14) | 0 / 1 / 2 |
 | `run` (no prompt) | print error and exit | 1 |
 | `resume <run_dir> [--feedback "<text>"] [--steps N]` | resume a halted run. See §13. | 0 / 1 / 2 |
-| `rerun <run_dir> <node_id> [--feedback "<text>"] [--steps N]` | re-execute target + downstream. See §14. | 0 / 1 / 2 |
+| `run --from <node_id> [--run-dir <path>] [--feedback "<text>"] [--steps N]` | re-execute target + downstream on existing run dir. See §14. | 0 / 1 / 2 |
 
 `-i` / `--interactive` patches Planner's `render_yaml` node at startup
 to require human approval of the compiled `workflow.yaml`. Without
@@ -1078,14 +1078,18 @@ to be — these files are designed to be readable. If a future use case
 warrants pretty-formatting, that's a `camflow inspect` candidate;
 v1.1 doesn't ship it.
 
-### Re-executing a specific node — `camflow rerun`
+### Re-executing a specific node — `camflow run --from`
 
-`--steps` lets you pause; `rerun` lets you go back. Different intent,
-different command:
+`--steps` lets you pause; `--from` lets you go back. Same `run`
+subcommand, different mode (mutex with prompt):
 
 ```bash
-camflow rerun <run_dir> <node_id> [--feedback "<text>"] [--steps N]
+camflow run --from <node_id> [--run-dir <path>] [--feedback "<text>"] [--steps N]
 ```
+
+`--run-dir` defaults to `./.camflow/run/`. The presence of `--from`
+(without a prompt) tells `run` to operate on the existing run dir
+instead of compiling a fresh one.
 
 Use cases:
 
@@ -1093,14 +1097,14 @@ Use cases:
   just node `X` (and the downstream nodes that consume X's output).
 * The user-workflow halted at node `Y`, but on inspection you realize
   it's node `X` (upstream of `Y`) that produced the wrong thing.
-  `camflow rerun <run_dir> X` restarts from X.
+  `camflow run --from X` restarts from X.
 * You want to A/B compare an alternative skill output for a specific
   node, holding everything upstream constant.
 
 ### Semantics
 
 ```
-camflow rerun <run_dir> <node_id>:
+camflow run --from <node_id> [--run-dir <run_dir>]:
 
 1. Reload Workflow + every node's history from <run_dir>/nodes/
    (same restoration as `resume`).
@@ -1136,15 +1140,15 @@ camflow rerun <run_dir> <node_id>:
 
 ### vs. `resume`
 
-| | `resume` | `rerun` |
+| | `camflow resume` | `camflow run --from` |
 |---|---|---|
 | precondition | halt.json must exist | run_dir + workflow.yaml must exist (halt.json optional) |
 | node to restart | the halted one (per halt.json) | user-chosen |
 | downstream | untouched (will run after halted node clears) | **also reset** to re-run |
 | typical use | "fix the failing point and continue" | "I changed something upstream; redo from there" |
 
-`rerun` is fully reusable — you can call it on a successfully completed
-run as well as on a halted one, since it only depends on the
+`run --from` is fully reusable — you can call it on a successfully
+completed run as well as on a halted one, since it only depends on the
 on-disk state being intact.
 
 ### Implementation note

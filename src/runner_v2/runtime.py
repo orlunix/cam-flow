@@ -1392,28 +1392,15 @@ def _downstream_set(wf: "Workflow", root_id: str) -> set[str]:
     return result
 
 
-def _cmd_rerun(argv: list[str]) -> int:
-    """`camflow rerun <run_dir> <node_id>` — re-execute target + downstream."""
-    p = argparse.ArgumentParser(
-        prog="camflow rerun",
-        description=("Re-execute a specific node and all its downstream "
-                     "descendants. Upstream nodes stay as they are."),
-    )
-    p.add_argument("run_dir")
-    p.add_argument("node_id",
-                   help="id of the node to re-run; downstream nodes are "
-                        "automatically reset too (their inputs depend on it)")
-    p.add_argument("--feedback", default="",
-                   help="optional feedback spliced into the target node's "
-                        "last envelope; surfaces as input.previous.feedback")
-    p.add_argument("--steps", type=int, default=None,
-                   help="(debug) halt cleanly after N more node-attempts")
-    args = p.parse_args(argv)
-    if args.steps is not None and args.steps < 1:
-        print("ERROR: --steps must be >= 1", file=sys.stderr)
-        return 1
+def _do_rerun(rd: Path, node_id: str, feedback: str,
+              steps: Optional[int]) -> int:
+    """Body of rerun (factored from CLI parsing).
 
-    rd = Path(args.run_dir)
+    Re-execute `node_id` plus all its downstream descendants in the
+    workflow stored under `rd`. Upstream nodes keep their state.
+    Used by `camflow run --from <node>` and (for backcompat) the
+    legacy `_cmd_rerun` test entry point.
+    """
     wf_path = rd / "workflow.yaml"
     if not wf_path.exists():
         print(f"ERROR: no workflow.yaml at {wf_path}", file=sys.stderr)
@@ -1435,23 +1422,22 @@ def _cmd_rerun(argv: list[str]) -> int:
         node.lifecycle = "done"
         node.result = "success" if last.get("status") == "success" else "fail"
 
-    if args.node_id not in wf.nodes_by_id:
-        print(f"ERROR: node '{args.node_id}' not in workflow. "
+    if node_id not in wf.nodes_by_id:
+        print(f"ERROR: node '{node_id}' not in workflow. "
               f"Known: {sorted(wf.nodes_by_id)}", file=sys.stderr)
         return 1
 
     # Reset target + every descendant. They re-execute; their previous
     # attempts stay on disk under attempt-N/ (new ones append as N+1).
-    targets = _downstream_set(wf, args.node_id)
+    targets = _downstream_set(wf, node_id)
     for nid in sorted(targets):
         node = wf.nodes_by_id[nid]
         node.lifecycle = "waiting"
         node.result = None
         # Splice user feedback into ONLY the explicit target's last attempt
         # (downstream nodes get automatic upstream injection on next run).
-        if nid == args.node_id and args.feedback and node.history:
-            node.history[-1] = {**node.history[-1],
-                                "feedback": args.feedback}
+        if nid == node_id and feedback and node.history:
+            node.history[-1] = {**node.history[-1], "feedback": feedback}
             node.output = node.history[-1]
         # Bump retry_max so the scheduler will actually try again.
         node.retry_max = max(node.retry_max + 1, node.retry_count + 1)
@@ -1461,33 +1447,65 @@ def _cmd_rerun(argv: list[str]) -> int:
     if halt_path.exists():
         halt_path.unlink()
 
-    wf.trace("workflow_rerun", node=args.node_id,
-             downstream=sorted(targets - {args.node_id}),
-             feedback_len=len(args.feedback))
+    wf.trace("workflow_rerun", node=node_id,
+             downstream=sorted(targets - {node_id}),
+             feedback_len=len(feedback))
 
-    print(f"rerunning {args.node_id}"
+    print(f"rerunning {node_id}"
           + (f" (+ {len(targets)-1} downstream)" if len(targets) > 1 else ""),
           file=sys.stderr)
     result = run_workflow(workflow, rd, resume_with_run=wf,
-                          max_attempts=args.steps)
+                          max_attempts=steps)
     print(f"result: {result}", file=sys.stderr)
     return _result_to_exit(result)
 
 
+def _cmd_rerun(argv: list[str]) -> int:
+    """LEGACY thin wrapper around _do_rerun — preserved so existing
+    test fixtures (`_cmd_rerun([str(rd), "node_id"])`) keep working.
+    NOT routed from main(); production users invoke
+    `camflow run --from <node_id> [--run-dir <path>]`."""
+    p = argparse.ArgumentParser(prog="camflow rerun (legacy)")
+    p.add_argument("run_dir")
+    p.add_argument("node_id")
+    p.add_argument("--feedback", default="")
+    p.add_argument("--steps", type=int, default=None)
+    args = p.parse_args(argv)
+    if args.steps is not None and args.steps < 1:
+        print("ERROR: --steps must be >= 1", file=sys.stderr)
+        return 1
+    return _do_rerun(Path(args.run_dir), args.node_id,
+                     args.feedback, args.steps)
+
+
 def _cmd_run(argv: list[str]) -> int:
-    """`camflow run "<prompt>"` — spawn Planner, execute its output."""
+    """`camflow run` dispatcher.
+
+    Two modes:
+      - With prompt: fresh — compile via Planner, then execute.
+      - With --from <node_id> (no prompt): re-execute that node and
+        all its downstream descendants on an existing run dir.
+    """
     p = argparse.ArgumentParser(
         prog="camflow run",
-        description="Compile a prompt into a workflow via Planner, then run it.",
+        description="Compile a prompt into a workflow via Planner, "
+                    "then run it. Or re-execute from a specific node "
+                    "with --from.",
     )
     p.add_argument("prompt", nargs="?", default=None,
-                   help="natural-language task prompt (required)")
+                   help="natural-language task prompt (fresh-run mode)")
     p.add_argument("-i", "--interactive", action="store_true",
-                   help="pause after Planner compiles, let you approve "
-                        "(or revise) the workflow.yaml before execution")
+                   help="(fresh-run only) pause after Planner compiles, "
+                        "let you approve the workflow.yaml before execution")
+    p.add_argument("--from", dest="from_node", default=None,
+                   help="(rerun mode) id of a node in the existing run "
+                        "to re-execute, along with its downstream "
+                        "descendants. Cannot be combined with a prompt.")
+    p.add_argument("--feedback", default="",
+                   help="(rerun mode) optional human feedback spliced into "
+                        "the target node's last envelope")
     p.add_argument("--steps", type=int, default=None,
-                   help="(debug) halt cleanly after N node-attempts; "
-                        "use `camflow resume` to continue or step further")
+                   help="(debug) halt cleanly after N node-attempts")
     p.add_argument("--run-dir", default=None,
                    help="run directory (default: ./.camflow/run/)")
     args = p.parse_args(argv)
@@ -1495,10 +1513,26 @@ def _cmd_run(argv: list[str]) -> int:
         print("ERROR: --steps must be >= 1", file=sys.stderr)
         return 1
 
-    if not args.prompt or not args.prompt.strip():
-        print("ERROR: camflow run requires a prompt.\n"
-              "Usage: camflow run \"<your task description>\"",
+    has_prompt = bool(args.prompt and args.prompt.strip())
+    if has_prompt and args.from_node:
+        print("ERROR: cannot combine a prompt with --from. "
+              "Either provide a prompt (fresh run) OR --from <node> "
+              "(rerun on existing run dir).", file=sys.stderr)
+        return 1
+    if not has_prompt and not args.from_node:
+        print("ERROR: camflow run needs either a prompt OR --from <node>.\n"
+              "Examples:\n"
+              "  camflow run \"<your task description>\"\n"
+              "  camflow run --from <node_id>",
               file=sys.stderr)
+        return 1
+    if has_prompt and args.feedback:
+        print("ERROR: --feedback only valid with --from (rerun mode).",
+              file=sys.stderr)
+        return 1
+    if not has_prompt and args.interactive:
+        print("ERROR: -i / --interactive only valid with a prompt "
+              "(fresh-run mode).", file=sys.stderr)
         return 1
 
     project = Path.cwd().resolve()
@@ -1506,6 +1540,12 @@ def _cmd_run(argv: list[str]) -> int:
         run_dir = Path(args.run_dir).resolve()
     else:
         run_dir = default_run_dir(project)
+
+    # ── Rerun mode ─────────────────────────────────────────────────────
+    if args.from_node:
+        return _do_rerun(run_dir, args.from_node, args.feedback, args.steps)
+
+    # ── Fresh-run mode ─────────────────────────────────────────────────
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Persist the user's prompt at run-dir root for debug + resume.
@@ -1604,12 +1644,14 @@ def main(argv: list[str] | None = None) -> int:
             "camflow — prompt-driven, multi-agent workflow runner\n"
             "\n"
             "Usage:\n"
-            "  camflow run \"<prompt>\"           compile + run (fire-and-forget)\n"
-            "  camflow run -i \"<prompt>\"        compile + pause for plan approval, then run\n"
-            "  camflow run --steps N \"<...>\"    (debug) halt after N node-attempts\n"
-            "  camflow resume <run_dir>          resume a halted run\n"
-            "  camflow resume <run_dir> --steps N   resume but advance only N more attempts\n"
-            "  camflow rerun <run_dir> <node_id> re-execute a specific node + downstream\n"
+            "  camflow run \"<prompt>\"                compile + run (fire-and-forget)\n"
+            "  camflow run -i \"<prompt>\"             compile + plan-approval gate, then run\n"
+            "  camflow run --steps N \"<prompt>\"      (debug) halt after N node-attempts\n"
+            "  camflow run --from <node_id>          re-execute a node + downstream\n"
+            "                                          (operates on ./.camflow/run/ by default;\n"
+            "                                           use --run-dir to point elsewhere)\n"
+            "  camflow resume <run_dir>              resume a halted run\n"
+            "  camflow resume <run_dir> --steps N    resume but advance only N more attempts\n"
             "\n"
             "Inspect a run:  cat .camflow/run/trace.jsonl\n"
             "Stop a run:     kill $(cat .camflow/run/runner.pid)\n",
@@ -1621,8 +1663,6 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_run(argv[1:])
     if cmd == "resume":
         return _cmd_resume(argv[1:])
-    if cmd == "rerun":
-        return _cmd_rerun(argv[1:])
     print(f"ERROR: unknown subcommand '{cmd}'. "
           f"Try `camflow --help`.", file=sys.stderr)
     return 1
