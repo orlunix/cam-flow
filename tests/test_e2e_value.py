@@ -349,9 +349,140 @@ def test_score_py_on_pristine_fixture(tmp_path):
     # recovery null (manual).
     assert out["camflow"]["present"] is False
     assert rubric["process_auditability"]["auto_pts"] == 1
-    assert rubric["recovery"]["auto_pts"] is None
+    assert rubric["resilience"]["auto_pts"] is None
     # Manual rows must be left null for the human reviewer.
     assert rubric["evidence_quality"]["manual_pts"] is None
+
+
+def test_score_py_resilience_first_pass_done(tmp_path):
+    """First-pass success with bounded retry configured = full 5/5.
+    No retry needs to have fired — retry is a safety net, not a target
+    (codex-retry-semantics-correction)."""
+    import subprocess
+    proj = tmp_path / "leg"
+    shutil.copytree(FIXTURE, proj)
+
+    # Synthesize a minimal "done" camflow run: a workflow.yaml with one
+    # skill node configured with retry: 3, plus an empty trace and no
+    # halt.json. score.py reads workflow.yaml for retry config and
+    # halt.json absence to mean "lifecycle done".
+    run_dir = proj / ".camflow" / "run"
+    (run_dir / "nodes" / "implementer" / "attempt-1").mkdir(parents=True)
+    wf_yaml = (
+        "workflow: t\nversion: \"1.1\"\n"
+        "nodes:\n"
+        "  - id: implementer\n"
+        "    goal: g\n"
+        "    steps: [\"do it\"]\n"
+        "    run: {skill: code_writer}\n"
+        "    retry: 3\n"
+    )
+    (run_dir / "workflow.yaml").write_text(wf_yaml)
+    (run_dir / "trace.jsonl").write_text(
+        '{"event": "workflow_started"}\n'
+        '{"event": "node_completed", "node": "implementer"}\n'
+    )
+
+    score_py = REPO / "examples" / "value-demo" / "scripts" / "score.py"
+    p = subprocess.run(
+        ["python3", str(score_py), str(proj),
+         "--pristine", str(FIXTURE)],
+        capture_output=True, text=True,
+    )
+    assert p.returncode == 0
+    out = json.loads(p.stdout)
+    assert out["camflow"]["present"] is True
+    assert out["camflow"]["halted"] is False
+    assert out["camflow"]["nodes_with_bounded_retry"] == ["implementer"]
+    assert out["camflow"]["retry_triggered"] == 0
+    assert out["rubric"]["resilience"]["auto_pts"] == 5, (
+        "first-pass done + bounded retry configured = 5/5; got "
+        f"{out['rubric']['resilience']['auto_pts']}"
+    )
+
+
+def test_score_py_resilience_done_without_bounded_retry(tmp_path):
+    """Lifecycle done but no node has retry: ≥2 → 3/5 (recovery not
+    pre-wired; future failure would have nowhere to go)."""
+    import subprocess
+    proj = tmp_path / "leg"
+    shutil.copytree(FIXTURE, proj)
+
+    run_dir = proj / ".camflow" / "run"
+    (run_dir / "nodes" / "x" / "attempt-1").mkdir(parents=True)
+    wf_yaml = (
+        "workflow: t\nversion: \"1.1\"\n"
+        "nodes:\n"
+        "  - id: x\n"
+        "    goal: g\n"
+        "    steps: [\"s\"]\n"
+        "    run: {skill: analyzer}\n"
+        # retry omitted → defaults to 1 = no retries
+    )
+    (run_dir / "workflow.yaml").write_text(wf_yaml)
+    (run_dir / "trace.jsonl").write_text(
+        '{"event": "node_completed", "node": "x"}\n'
+    )
+
+    score_py = REPO / "examples" / "value-demo" / "scripts" / "score.py"
+    p = subprocess.run(
+        ["python3", str(score_py), str(proj),
+         "--pristine", str(FIXTURE)],
+        capture_output=True, text=True,
+    )
+    assert p.returncode == 0
+    out = json.loads(p.stdout)
+    assert out["camflow"]["nodes_with_bounded_retry"] == []
+    assert out["rubric"]["resilience"]["auto_pts"] == 3
+
+
+def test_score_py_resilience_clean_halt_with_feedback(tmp_path):
+    """Halt with halt.json carrying actionable feedback → 4/5
+    (recovery readiness paid off; operator can resume --feedback)."""
+    import subprocess
+    proj = tmp_path / "leg"
+    shutil.copytree(FIXTURE, proj)
+
+    run_dir = proj / ".camflow" / "run"
+    (run_dir / "nodes" / "implementer" / "attempt-1").mkdir(parents=True)
+    wf_yaml = (
+        "workflow: t\nversion: \"1.1\"\n"
+        "nodes:\n"
+        "  - id: implementer\n"
+        "    goal: g\n"
+        "    steps: [\"s\"]\n"
+        "    run: {skill: code_writer}\n"
+        "    retry: 2\n"
+    )
+    (run_dir / "workflow.yaml").write_text(wf_yaml)
+    halt_info = {
+        "halted_node": "implementer",
+        "kind": "halt",
+        "envelope": {
+            "status": "fail",
+            "error": {"code": "VERIFY_FAIL",
+                      "message": "tests/test_x.py::test_quote_handling failed"},
+            "feedback": "tests/test_x.py::test_quote_handling failed: "
+                        "doubled-quote case missed",
+        },
+    }
+    (run_dir / "halt.json").write_text(json.dumps(halt_info))
+    (run_dir / "trace.jsonl").write_text(
+        '{"event": "retry_triggered", "node": "implementer"}\n'
+        '{"event": "workflow_halted", "node": "implementer"}\n'
+    )
+
+    score_py = REPO / "examples" / "value-demo" / "scripts" / "score.py"
+    p = subprocess.run(
+        ["python3", str(score_py), str(proj),
+         "--pristine", str(FIXTURE)],
+        capture_output=True, text=True,
+    )
+    assert p.returncode == 0
+    out = json.loads(p.stdout)
+    assert out["camflow"]["halted"] is True
+    assert out["camflow"]["halt_has_actionable_feedback"] is True
+    assert out["rubric"]["resilience"]["auto_pts"] == 4
 
 
 def test_score_py_partial_invariant_credit(tmp_path):

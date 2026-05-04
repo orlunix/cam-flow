@@ -91,11 +91,12 @@ A JSON envelope written to `agent_output.json`. Required `data` fields:
    can evaluate (`pytest tests/`, `make test`, `cargo test`, `npm
    test`, a custom shell script that exits non-zero on failure), the
    generative node that produces the artifact under test should use
-   `verify.command` for that gate. This is what makes the runtime's
-   retry-with-feedback loop fire on missed requirements: a wrong
-   implementation gets an exit-code rejection, not a self-approving
-   agent verdict, and the next attempt sees the failure as
-   `previous.feedback`. Falling back to `verify: agent` when a
+   `verify.command` for that gate. The point is **deterministic
+   gating** — a wrong implementation gets an exit-code rejection, not
+   a self-approving agent verdict. If verification fails, the runtime
+   supports retry-with-feedback as a bounded recovery path, but the
+   goal is still first-pass correctness; retry is the safety net,
+   not the feature. Falling back to `verify: agent` when a
    deterministic gate is available is a regression — the agent can
    convince itself its own output is fine.
 
@@ -163,8 +164,14 @@ A JSON envelope written to `agent_output.json`. Required `data` fields:
    and the runtime patches Planner's `render_yaml` accordingly. You
    should never put `verify: human` on the `render_yaml` node yourself,
    and you should not assume plan approval will or won't happen.
-5. **Retry sparingly.** Default 1 (no retry). High-stakes generative
-   work (code, plans) → 2-3. Deterministic tools rarely need retry.
+5. **Retry sparingly — it's a safety net, not a feature.** Design
+   for first-pass correctness; retry is bounded recovery if
+   verification fails, not part of the expected path. Default 1
+   (no retry). High-stakes generative work (code, plans) → 2-3 as
+   recovery budget. Deterministic tools rarely need retry — if a tool
+   audit fails twice, that's evidence the implementation is wrong,
+   not something to loop on. Excessive retry churn (looping on the
+   same failure mode) is a Planner bug, not a feature.
 6. **`workflow.context`** is for facts shared across all nodes — put
    the user's original task there, plus run-constants like tool paths,
    conventions, codebase layout, anything every node should know.
@@ -238,8 +245,11 @@ Go, Rust, JS, or anything else), the standard DAG shape is:
    implement against `upstream.analyzer.data.requirements`. Crucially,
    `verify.command` runs the FULL deterministic test invocation
    (visible + invariant / hidden / property tests, whichever the
-   project has). On failure the runtime auto-retries with
-   `previous.feedback`. `retry: 2` or `3` is appropriate.
+   project has). The implementer should aim to satisfy every
+   requirement first try; configure `retry: 2` or `3` as a bounded
+   safety net so a verification failure can recover via
+   `previous.feedback`, but do not design steps assuming retry will
+   fire — retry is a recovery mechanism, not part of the happy path.
 
 3. **One audit tool node per test class.** When the project has
    distinct test groupings (visible vs. invariant, unit vs.
@@ -251,6 +261,9 @@ Go, Rust, JS, or anything else), the standard DAG shape is:
    and use `verify.command` to gate on the envelope's `data.passed`
    field. **Do not skip these nodes** when the project has separable
    test groups — they are the per-class evidence the reviewer cites.
+   `retry: 1` is correct here: if a deterministic audit fails
+   repeatedly, that's evidence the implementation is bad, not
+   something to loop on.
 
 4. **`reviewer`** (skill: `reviewer`, `needs: [analyzer, implementer,
    <each audit node>]`) — independently confirm every requirement from
@@ -358,8 +371,10 @@ markers and commands; the structure should stay the same.
 This shape is not the only valid one — adapt it to what the actual
 project has. But when these ingredients are present (a spec,
 multi-class test suite, a deterministic test command), this is the
-shape that produces inspectable per-attempt artifacts and surfaces
-retry-with-feedback when the implementer misses a hidden requirement.
+shape that produces inspectable per-attempt artifacts and supports
+retry-with-feedback as a recovery path if verification fails. The
+goal is first-pass success: bounded retry is configured as a safety
+net, not as a feature to be exercised.
 
 If the case has no test suite, drop the audit nodes and lean on
 `verify: agent` for the implementer (with the spec's requirements as

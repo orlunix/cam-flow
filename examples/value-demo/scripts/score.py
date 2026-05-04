@@ -88,6 +88,46 @@ def detect_camflow_artifacts(fixture: Path) -> dict:
                 node_ids.append(sub.name)
                 attempts += sum(1 for c in sub.iterdir()
                                 if c.name.startswith("attempt-"))
+
+    # Resilience signals (per the user-corrected semantics: retry is not
+    # a positive target; first-pass correctness is. We track WHETHER
+    # bounded retry was configured and HOW the workflow ended, not
+    # whether retry fired.)
+    workflow_yaml_path = run_dir / "workflow.yaml"
+    nodes_with_bounded_retry: list[str] = []
+    skill_nodes: list[str] = []
+    total_retry_budget = 0
+    if workflow_yaml_path.exists():
+        try:
+            import yaml as _yaml
+            wf = _yaml.safe_load(workflow_yaml_path.read_text())
+            for n in (wf.get("nodes") or []):
+                if not isinstance(n, dict):
+                    continue
+                run_cfg = n.get("run") or {}
+                if "skill" in run_cfg:
+                    skill_nodes.append(n.get("id", "?"))
+                rmax = int(n.get("retry", 1))
+                total_retry_budget += max(0, rmax - 1)  # retry:1 = no retries
+                if rmax >= 2:
+                    nodes_with_bounded_retry.append(n.get("id", "?"))
+        except (ImportError, Exception):
+            pass
+
+    halt_path = run_dir / "halt.json"
+    halt_info: dict = {}
+    if halt_path.exists():
+        try:
+            halt_info = json.loads(halt_path.read_text())
+        except json.JSONDecodeError:
+            pass
+    halt_has_feedback = False
+    if halt_info:
+        env = halt_info.get("envelope") or {}
+        fb = env.get("feedback") or ""
+        err_msg = (env.get("error") or {}).get("message") or ""
+        halt_has_feedback = bool(fb.strip() or err_msg.strip())
+
     return {
         "present": True,
         "trace_events": len(events),
@@ -95,6 +135,11 @@ def detect_camflow_artifacts(fixture: Path) -> dict:
         "workflow_halted": halts,
         "attempts_total": attempts,
         "node_ids": sorted(node_ids),
+        "skill_nodes": sorted(skill_nodes),
+        "nodes_with_bounded_retry": sorted(nodes_with_bounded_retry),
+        "total_retry_budget": total_retry_budget,
+        "halted": halt_path.exists(),
+        "halt_has_actionable_feedback": halt_has_feedback,
     }
 
 
@@ -149,11 +194,41 @@ def score_run(fixture: Path, pristine: Path) -> dict:
     else:
         robust_pts = 1
 
-    # Recovery (5): camflow auto from trace; baseline left manual.
+    # Resilience / recovery readiness (5).
+    #
+    # Per the user-corrected semantics (codex-retry-semantics-correction):
+    # retry is a bounded safety net, NOT a positive target. First-pass
+    # correctness with bounded retry CONFIGURED is the ideal — retry
+    # firing is a signal that something failed, not a feature.
+    #
+    # Auto-scoring rule (camflow side):
+    #   5 — lifecycle done + at least one skill node has retry: ≥2
+    #       (bounded recovery wired in case of failure; first-pass
+    #       success means it wasn't needed)
+    #   4 — lifecycle halted with halt.json carrying actionable feedback
+    #       (recovery readiness was useful: clean halt with retryable
+    #       diagnostic, operator can `camflow resume --feedback ...`)
+    #   3 — lifecycle done but no node has bounded retry (recovery not
+    #       pre-wired; future failure would have nowhere to go)
+    #   1 — lifecycle halted without actionable feedback
+    # Penalty: subtract 1 if retry_triggered count is excessive
+    # (> 2 × bounded-retry node count) — that's churn, not recovery.
+    # Baseline (no .camflow/run/) → manual (transcript inspection).
     if cf["present"]:
-        recovery_pts: int | None = 5 if cf["retry_triggered"] >= 1 else 0
+        has_bounded_retry = bool(cf.get("nodes_with_bounded_retry"))
+        if not cf.get("halted"):
+            resilience_pts: int | None = 5 if has_bounded_retry else 3
+        elif cf.get("halt_has_actionable_feedback"):
+            resilience_pts = 4
+        else:
+            resilience_pts = 1
+        # Churn penalty.
+        n_retry_nodes = len(cf.get("nodes_with_bounded_retry") or [])
+        if (resilience_pts is not None
+                and cf["retry_triggered"] > 2 * max(1, n_retry_nodes)):
+            resilience_pts = max(0, resilience_pts - 1)
     else:
-        recovery_pts = None  # human fills
+        resilience_pts = None  # baseline: human reads transcript
 
     return {
         "fixture_dir": str(fixture),
@@ -182,12 +257,17 @@ def score_run(fixture: Path, pristine: Path) -> dict:
             "robustness_minimality": {
                 "weight": 10, "auto_pts": robust_pts,
             },
-            "recovery": {
+            "resilience": {
                 "weight": 5,
-                "auto_pts": recovery_pts,  # null for baseline
-                "note": ("camflow: auto from retry_triggered count; "
-                         "baseline: human reads transcript for any "
-                         "self-correction."),
+                "auto_pts": resilience_pts,  # null for baseline
+                "note": ("camflow: 5 = first-pass done + bounded retry "
+                         "configured; 4 = clean halt w/ actionable "
+                         "feedback; 3 = done but no bounded retry; "
+                         "1 = halt without feedback. Churn penalty "
+                         "subtracts 1 if retry_triggered > 2 × "
+                         "bounded-retry-node count. Baseline: human "
+                         "reads transcript for self-correction or "
+                         "clean give-up."),
             },
         },
     }

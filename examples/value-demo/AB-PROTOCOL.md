@@ -143,7 +143,8 @@ Pristine:    examples/value-demo/fixture/
 | evidence quality       | 15     | <manual> | <manual>| transcript / trace.jsonl + verify envelopes        |
 | process auditability   | 15     | <auto>   | <auto>  | score.py: trace_events + attempts_total            |
 | robustness/minimality  | 10     | <auto>   | <auto>  | score.py: diff_lines                               |
-| recovery               |  5     | <manual> | <auto>  | trace retry_triggered (camflow) / transcript (b)   |
+| resilience             |  5     | <manual> | <auto>  | first-pass done + bounded retry configured = 5/5;  |
+|                        |        |          |         | clean halt + feedback = 4; done w/o retry = 3      |
 | TOTAL                  | 100    |          |         |                                                    |
 
 ## Delta and why
@@ -153,11 +154,21 @@ specific artifact paths.>
 
 The CamFlow advantage is **structural**: planning, durable
 intermediate artifacts, non-self verification with evidence, and
-retry-with-feedback are observable on disk. A given baseline run may
-score high on (test_correctness, robustness) by happening to do the
-right thing — that's fine, expected, and noted in the rubric. The
-auditability + evidence + recovery rows always favor the structural
-runner because the artifacts simply don't exist on the baseline side.
+bounded retry-with-feedback configured as a recovery safety net are
+observable on disk. A given baseline run may score high on
+(test_correctness, robustness) by happening to do the right thing —
+that's fine, expected, and noted in the rubric. The auditability +
+evidence + resilience rows always favor the structural runner because
+the artifacts simply don't exist on the baseline side.
+
+**Note on resilience scoring (per `codex-retry-semantics-correction`):**
+Retry is a bounded safety net, NOT a positive target. The ideal
+CamFlow run is first-pass correct with bounded retry *configured*
+where appropriate — it gets full 5/5 even if no retry ever fires. A
+clean halt with actionable feedback (operator can `camflow resume
+--feedback`) gets 4/5. A halt without feedback or excessive retry
+churn is penalized. We do NOT harden the fixture or design workflows
+to manufacture retry events.
 
 ---
 
