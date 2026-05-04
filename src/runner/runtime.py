@@ -537,6 +537,17 @@ def build_run_prompt(node: "Node", input_dict: dict,
                 + "\n```"
             )
         parts.append("# Upstream Outputs\n" + "\n\n".join(sections))
+    # Retry-note BEFORE Output (matches spec §8 ordering: Goal, Steps,
+    # Upstream Outputs, Note: previous attempt failed, Output).
+    if "previous" in input_dict:
+        parts.append(
+            "# Note: previous attempt failed\n"
+            "```json\n"
+            + json.dumps(input_dict["previous"], indent=2, ensure_ascii=False)
+            + "\n```\n"
+            "Read `feedback` (or `error.message`) to know what went wrong; "
+            "address it in this attempt."
+        )
     schema_section = _format_schema_for_prompt(node.output_schema)
     parts.append(
         f"# Output\n"
@@ -563,15 +574,6 @@ def build_run_prompt(node: "Node", input_dict: dict,
         f"- Don't print to stdout. Don't use markdown code fences in the file.\n"
         f"- Once written, do nothing else. The runner will close the session."
     )
-    if "previous" in input_dict:
-        parts.append(
-            "# Note: previous attempt failed\n"
-            "```json\n"
-            + json.dumps(input_dict["previous"], indent=2, ensure_ascii=False)
-            + "\n```\n"
-            "Read `feedback` (or `error.message`) to know what went wrong; "
-            "address it in this attempt."
-        )
     return "\n\n".join(parts)
 
 

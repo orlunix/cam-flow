@@ -1724,3 +1724,30 @@ def kw_path(monkeypatch):
     import tempfile
     d = Path(tempfile.mkdtemp(prefix="vshape-"))
     return d
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  TestPromptOrdering — finding 8 from code-review-codex-2026-05-04
+# ───────────────────────────────────────────────────────────────────────
+
+class TestPromptOrdering:
+    """Finding 8: when retry adds a `# Note: previous attempt failed`
+    section, it must appear BEFORE `# Output` per spec §8 ordering."""
+
+    def _node(self):
+        return Node.from_dict({
+            "id": "n", "goal": "g", "steps": ["s"],
+            "run": {"skill": "analyzer"},
+        })
+
+    def test_retry_note_precedes_output_section(self):
+        out = build_run_prompt(
+            self._node(),
+            {"previous": {"status": "fail", "feedback": "try again"}},
+        )
+        note_idx = out.index("# Note: previous attempt failed")
+        output_idx = out.index("# Output")
+        assert note_idx < output_idx, (
+            "spec §8 puts retry note before # Output; got note at "
+            f"{note_idx} and output at {output_idx}"
+        )

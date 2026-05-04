@@ -24,6 +24,14 @@ pip install -e .
 
 This installs the `camflow` CLI pointing at `runner.runtime:main`.
 
+> **Source-tree-only for v1.1.** The runtime resolves `builtin/` and
+> `skills/` as siblings of `src/`, so it expects the on-disk repo
+> layout. Run via `pip install -e .` from a clone (editable install).
+> Wheel/sdist packaging that ships `builtin/` and `skills/` as package
+> data is deferred (see
+> [`docs/camflow-asset-management-plan-001-2026-05-03.md`](docs/camflow-asset-management-plan-001-2026-05-03.md)
+> §5 P3).
+
 ## Run
 
 ```bash
