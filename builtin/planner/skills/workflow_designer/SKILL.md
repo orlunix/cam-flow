@@ -177,6 +177,53 @@ A JSON envelope written to `agent_output.json`. Required `data` fields:
 A list of node dicts. Each must have `id`, `goal`, `steps`, `run`. The
 other fields are optional but recommended where applicable.
 
+## `output_schema` field types — strict allow-list
+
+Every value in a node's `output_schema` map MUST be one of these five
+type names exactly:
+
+- **`string`** — text
+- **`integer`** — whole number (NOT `int`)
+- **`number`** — int or float
+- **`boolean`** — true/false (NOT `bool`)
+- **`array`** — list (NOT `array of <X>`, NOT `list`)
+
+Anything else is a workflow-load error. **Forbidden** patterns the
+runtime will reject (or silently ignore, which is worse — the field
+stops being type-checked):
+
+- `bool` — write `boolean`
+- `int` — write `integer`
+- `float` — write `number`
+- `list` — write `array`
+- `array of string`, `array of {...}`, `string[]` — just write `array`;
+  array element types are NOT part of v1.1 schema. Document the
+  element shape in the node's `goal` / `steps` instead.
+- Inline object schemas like `{id: string, count: integer}` — also not
+  v1.1. Promote to top-level fields if you need typed access, or use
+  `array` and document the per-element shape in the goal.
+- Schema as a string: `"object"`, `"any"`, `"json"` — not v1.1 types.
+
+Right vs wrong:
+
+```yaml
+# RIGHT
+output_schema:
+  passed: boolean
+  tests_run: integer
+  failed_tests: array
+
+# WRONG (Planner-load failure or silent skip)
+output_schema:
+  passed: bool                 # use boolean
+  tests_run: int               # use integer
+  failed_tests: array of string  # element type not allowed; use array
+  results: { id: string, n: int }  # nested schema not allowed
+```
+
+This applies to every node you produce, including audit tool nodes
+and reviewer nodes — same five type names everywhere.
+
 ## Common shape: implement code per spec
 
 When the task is "implement / modify code to satisfy a written spec
@@ -197,16 +244,116 @@ Go, Rust, JS, or anything else), the standard DAG shape is:
 3. **One audit tool node per test class.** When the project has
    distinct test groupings (visible vs. invariant, unit vs.
    integration), give each its own `run.tool` node that emits a
-   structured pass/fail envelope (`{passed: bool, tests_run: int,
-   failed_tests: array}`). These are pure audit — they make the
-   passing evidence concrete in the trace, separate from the
-   implementer's self-report. Each should `needs: [implementer]` and
-   use `verify.command` to gate on the envelope's `data.passed` field.
+   structured pass/fail envelope (`output_schema: passed: boolean,
+   tests_run: integer, failed_tests: array`). These are pure audit —
+   they make the passing evidence concrete in the trace, separate from
+   the implementer's self-report. Each should `needs: [implementer]`
+   and use `verify.command` to gate on the envelope's `data.passed`
+   field. **Do not skip these nodes** when the project has separable
+   test groups — they are the per-class evidence the reviewer cites.
 
 4. **`reviewer`** (skill: `reviewer`, `needs: [analyzer, implementer,
-   <each audit node>]`) — independently confirm every requirement is
-   satisfied, citing either a `file:line` range in the implementation
-   or a passing test name from the audit envelopes.
+   <each audit node>]`) — independently confirm every requirement from
+   `upstream.analyzer.data.requirements` is satisfied, with one
+   evidence citation per requirement: either a `file:line` range in
+   the implementation or a passing test name from an upstream audit
+   envelope. Approve only when every requirement has concrete
+   evidence; reject with specific issues that name the missing
+   requirement.
+
+### Verbatim template (generic — adapt names/paths to your project)
+
+Emit the `dag` along these lines for any "implement code per spec
+plus deterministic test groups" task. Replace `<spec-marker>`,
+`<test-cmd>`, `<visible-test-cmd>`, `<invariant-test-cmd>`,
+`<run_visible.sh>`, `<run_invariants.sh>` with the project's actual
+markers and commands; the structure should stay the same.
+
+```yaml
+- id: analyzer
+  goal: "Extract every requirement in the spec plus the test files it references, with verbatim evidence per requirement."
+  steps:
+    - "Read the spec verbatim."
+    - "Read each test file the spec references; verify which test covers which requirement."
+    - "Emit a structured requirement list with one entry per req."
+  run:
+    skill: analyzer
+  output_schema:
+    requirements: array
+    test_paths_referenced: array
+  retry: 2
+
+- id: implementer
+  goal: "Implement the artifact satisfying every requirement listed by analyzer."
+  needs: [analyzer]
+  steps:
+    - "Read upstream.analyzer.data.requirements as the ground-truth req list."
+    - "Implement the artifact covering ALL listed requirements."
+    - "Iterate until the deterministic test command exits 0."
+  run:
+    skill: code_writer
+  output_schema:
+    files_changed: array
+    summary: string
+  verify:
+    command: |
+      P=$(pwd)
+      while [ ! -f "$P/<spec-marker>" ] && [ "$P" != "/" ]; do P=$(dirname "$P"); done
+      [ "$P" = "/" ] && { echo "ERROR: no <spec-marker> ancestor"; exit 2; }
+      cd "$P" && <test-cmd>
+    timeout: 60
+  retry: 3
+
+- id: test_runner
+  goal: "Audit the visible test suite and emit a structured pass/fail envelope."
+  needs: [implementer]
+  steps:
+    - "Run the visible test command from the project root."
+    - "Capture pass/fail and a count of tests run."
+    - "Emit envelope with data.passed, data.tests_run."
+  run:
+    tool: scripts/<run_visible.sh>
+  output_schema:
+    passed: boolean
+    tests_run: integer
+    output: string
+  verify:
+    command: 'test "$(jq -r .data.passed agent_output.json)" = "true"'
+  retry: 1
+
+- id: invariant_checker
+  goal: "Audit the invariant/hidden tests and emit a structured pass/fail envelope listing any failing tests."
+  needs: [implementer]
+  steps:
+    - "Run the invariant/hidden test command from the project root."
+    - "Capture pass/fail and any failed test names."
+    - "Emit envelope with data.passed, data.tests_run, data.failed_tests."
+  run:
+    tool: scripts/<run_invariants.sh>
+  output_schema:
+    passed: boolean
+    tests_run: integer
+    failed_tests: array
+    output: string
+  verify:
+    command: 'test "$(jq -r .data.passed agent_output.json)" = "true"'
+  retry: 1
+
+- id: reviewer
+  goal: "Independently confirm the artifact satisfies every requirement; cite concrete evidence per req."
+  needs: [analyzer, implementer, test_runner, invariant_checker]
+  steps:
+    - "Read upstream.analyzer.data.requirements (ground-truth req list)."
+    - "Read the implementation."
+    - "For each requirement, cite a specific file:line range OR a passing test name from upstream.test_runner / upstream.invariant_checker."
+    - "Approve only if every requirement has concrete evidence; reject otherwise with specific issues that name the missing requirement."
+  run:
+    skill: reviewer
+  output_schema:
+    approved: boolean
+    issues: array
+  retry: 2
+```
 
 This shape is not the only valid one — adapt it to what the actual
 project has. But when these ingredients are present (a spec,

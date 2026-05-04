@@ -212,6 +212,95 @@ class TestBuiltinPlanner:
         # that's the part the live Planner skipped pre-fix.
         assert "audit" in text.lower()
 
+    def test_workflow_designer_output_schema_type_allowlist(self):
+        """P0 — Planner must enumerate the five legal output_schema type
+        names (string/integer/number/boolean/array) and forbid common
+        leaks (bool/int/array of <X>/nested object schemas)."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "workflow_designer" /
+                     "SKILL.md")
+        # The five legal types must each be present as a backtick-quoted
+        # type name (so they read as types, not just words).
+        for legal in ("`string`", "`integer`", "`number`", "`boolean`",
+                      "`array`"):
+            assert legal in text, (
+                f"workflow_designer SKILL.md must list {legal} as a "
+                f"legal output_schema type name."
+            )
+        # Forbidden leaks must be explicitly flagged.
+        for forbidden in ("`bool`", "`int`", "array of"):
+            assert forbidden in text, (
+                f"workflow_designer SKILL.md must explicitly forbid "
+                f"{forbidden!r} (Planner has been observed to leak it)."
+            )
+
+    def test_yaml_writer_output_schema_type_allowlist(self):
+        """P0 — yaml_writer must mirror the type allow-list so it
+        normalizes upstream slips before emitting the final YAML."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "yaml_writer" /
+                     "SKILL.md")
+        for legal in ("`string`", "`integer`", "`number`", "`boolean`",
+                      "`array`"):
+            assert legal in text
+        # yaml_writer's job is to *normalize*, so it must list the
+        # common rewrites.
+        for rewrite in ("bool` → `boolean`", "int` → `integer`",
+                        "list` → `array`"):
+            assert rewrite in text, (
+                f"yaml_writer SKILL.md must show the normalization "
+                f"rule {rewrite!r}."
+            )
+
+    def test_workflow_designer_has_verbatim_5node_template(self):
+        """P1 — workflow_designer must include the literal 5-node DAG
+        block so the LLM has a concrete template to copy. Anchor on
+        the five canonical node ids appearing in a single fenced block."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "workflow_designer" /
+                     "SKILL.md")
+        assert "Verbatim template" in text or "verbatim template" in text
+        # Each canonical id must appear as a YAML node id.
+        for node_id in ("id: analyzer", "id: implementer",
+                        "id: test_runner", "id: invariant_checker",
+                        "id: reviewer"):
+            assert node_id in text, (
+                f"5-node verbatim template must include `{node_id}`."
+            )
+        # The implementer's verify.command in the template must include
+        # the walk-up loop (anchors the cwd-safe pattern in the example,
+        # not just in prose).
+        assert "while [ ! -f " in text and "exit 2" in text
+
+
+class TestReviewerSkill:
+    """P2 — reviewer SKILL.md must require per-requirement evidence
+    (file:line range or passing test name from upstream audit
+    envelopes), not generic 'looks good' approves."""
+
+    REVIEWER_SKILL = SHIPPED_SKILLS_DIR / "reviewer" / "SKILL.md"
+
+    def test_skill_md_exists(self):
+        assert self.REVIEWER_SKILL.exists()
+
+    def test_requires_per_requirement_evidence(self):
+        text = _read(self.REVIEWER_SKILL)
+        assert "Per-requirement evidence" in text or \
+               "per-requirement evidence" in text.lower()
+
+    def test_lists_file_line_or_test_citation_alternatives(self):
+        text = _read(self.REVIEWER_SKILL)
+        # Both citation forms must be named so the agent knows which
+        # is acceptable.
+        assert "file:line" in text
+        assert "test name" in text.lower() or "test-name" in text.lower()
+
+    def test_flags_hollow_approves_explicitly(self):
+        """The SKILL.md must teach what does NOT count as evidence —
+        otherwise LLMs default to feel-good summaries."""
+        text = _read(self.REVIEWER_SKILL)
+        # The hollow-approve anti-pattern must be flagged.
+        assert "hollow approves" in text.lower() or \
+               "not evidence" in text.lower() or \
+               "Generic statements are NOT evidence" in text
+
 
 # ─── shipped skills/ ──────────────────────────────────────────────────
 

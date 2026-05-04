@@ -62,6 +62,32 @@ nodes:
    met). Don't change a `skill` to a `tool`. Don't change a `tool` to a
    `skill`. The decision belongs to design_dag, not yaml_writer.
 
+8. **`output_schema` types — strict allow-list of five names.** Every
+   value in any node's `output_schema` map MUST be exactly one of:
+   `string`, `integer`, `number`, `boolean`, `array`. If `design_dag`
+   handed you anything else (`bool`, `int`, `float`, `list`,
+   `array of <X>`, `string[]`, an inline object schema like
+   `{id: string, ...}`, or `"object"` / `"any"`), normalize it before
+   emitting:
+
+   - `bool` → `boolean`
+   - `int` → `integer`
+   - `float` → `number`
+   - `list` → `array`
+   - `array of string`, `array of {...}`, `string[]` → `array`
+     (element types are NOT part of v1.1 schema; document the shape
+     in the node's goal/steps if you need to)
+   - inline object schemas → either promote fields to top-level
+     `output_schema` keys, or replace with `array` and let the goal
+     describe per-element shape.
+   - `"object"` / `"any"` / `"json"` / `null` → these are not v1.1
+     types; pick the closest of the five (usually `string` for
+     opaque blobs, `array` for collections).
+
+   This is non-negotiable — workflow load fails on unknown type
+   names, or worse, silently skips the type check and leaves the
+   field unvalidated at runtime.
+
 ## On retry
 
 Read `previous.feedback`. Typical complaints:

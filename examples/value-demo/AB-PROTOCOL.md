@@ -41,6 +41,22 @@ one — that's how we accumulate auditable result history.
 
 ---
 
+## Canonical CamFlow invocation
+
+The CamFlow leg **MUST** be launched via the user-facing
+`camflow run` CLI, from inside the fixture-copy directory. Direct
+runtime invocations (`python -m runner.runtime`, importing
+`run_workflow` from a script, etc.) bypass the user-facing entry
+point and produce results that are NOT comparable to a real-user
+A/B. Such results should be marked **provisional** in the result
+doc and not used as canonical scores.
+
+The deterministic E2E in `tests/test_e2e_value.py` *does* drive the
+runtime directly — that's intentional, it's a CI smoke test, not an
+A/B leg.
+
+---
+
 ## Run
 
 ```bash
