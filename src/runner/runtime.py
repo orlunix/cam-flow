@@ -231,7 +231,18 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
     if "context" in wf and not isinstance(wf["context"], str):
         errors.append("workflow.context: must be a string")
 
-    ids = [n.get("id") for n in nodes]
+    # Guard: each nodes[] element must be a dict before we can call .get().
+    # Otherwise we'd raise AttributeError mid-pass and lose the rest of
+    # the errors. Record the bad indices and skip them per-node below.
+    non_dict_indices = {i for i, n in enumerate(nodes)
+                        if not isinstance(n, dict)}
+    for i in sorted(non_dict_indices):
+        errors.append(
+            f"nodes[{i}]: must be a dict (got "
+            f"{type(nodes[i]).__name__})"
+        )
+
+    ids = [n.get("id") if isinstance(n, dict) else None for n in nodes]
     for i in ids:
         if not isinstance(i, str) or not i:
             errors.append("a node is missing or has non-string 'id'")
@@ -240,7 +251,9 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
         errors.append(f"duplicate node ids: {ids}")
     id_set = {i for i in ids if isinstance(i, str) and i}
 
-    for n in nodes:
+    for idx, n in enumerate(nodes):
+        if idx in non_dict_indices:
+            continue  # already reported; can't introspect a non-dict
         nid = n.get("id", "<?>")
 
         # Required fields presence
@@ -303,6 +316,23 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
         has_tool = "tool" in run
         if not (has_skill ^ has_tool):
             errors.append(f"{nid}.run: must have exactly one of `skill` or `tool`")
+        # run.skill / run.tool values must be non-empty strings
+        # (otherwise _resolve_skill_path / _resolve_tool_path get
+        # garbage and TypeError later).
+        if has_skill:
+            sv = run["skill"]
+            if not isinstance(sv, str) or not sv.strip():
+                errors.append(
+                    f"{nid}.run.skill: must be a non-empty string "
+                    f"(got {type(sv).__name__})"
+                )
+        if has_tool:
+            tv = run["tool"]
+            if not isinstance(tv, str) or not tv.strip():
+                errors.append(
+                    f"{nid}.run.tool: must be a non-empty string "
+                    f"(got {type(tv).__name__})"
+                )
 
         # Verify mutex + unknown-keys check
         verify = n.get("verify")
@@ -323,10 +353,23 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
                         f"{nid}.verify: at most one of `criterion`, "
                         f"`command`, `human` (got {sorted(v_keys)})"
                     )
-                if "human" in verify and not isinstance(verify["human"], str):
-                    errors.append(
-                        f"{nid}.verify.human: must be a string (the prompt to show the user)"
-                    )
+                # Each verify-method key must carry a non-empty string.
+                for k in ("criterion", "command", "human"):
+                    if k in verify:
+                        v = verify[k]
+                        if not isinstance(v, str) or not v.strip():
+                            errors.append(
+                                f"{nid}.verify.{k}: must be a non-empty string"
+                            )
+                # verify.timeout (only meaningful for command); positive int.
+                if "timeout" in verify:
+                    tv = verify["timeout"]
+                    if (not isinstance(tv, int)
+                            or isinstance(tv, bool) or tv < 1):
+                        errors.append(
+                            f"{nid}.verify.timeout: must be a positive int "
+                            f"(got {tv!r})"
+                        )
         # needs references valid ids (only if needs is a well-formed list)
         n_needs = n.get("needs")
         if isinstance(n_needs, list):
@@ -339,6 +382,12 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
             errors.append(f"{nid}.output_schema: must be a dict")
         else:
             for fk, ft in schema.items():
+                if not isinstance(fk, str) or not fk:
+                    errors.append(
+                        f"{nid}.output_schema: field names must be "
+                        f"non-empty strings (got {fk!r})"
+                    )
+                    continue
                 if ft not in VALID_TYPES:
                     errors.append(
                         f"{nid}.output_schema.{fk}: unknown type {ft!r}; "
@@ -359,9 +408,15 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
                         f"executable (relative to {project_root})"
                     )
 
-    # cycle detection on `needs` graph
-    needs_map = {n["id"]: list(n.get("needs", []) or [])
-                 for n in nodes if "id" in n}
+    # cycle detection on `needs` graph (skip non-dict nodes — they
+    # were already flagged above; building needs_map for them would
+    # crash with the same AttributeError we're guarding against).
+    needs_map = {
+        n["id"]: list(n.get("needs", []) or [])
+        for n in nodes
+        if isinstance(n, dict) and isinstance(n.get("id"), str) and n["id"]
+        and isinstance(n.get("needs", []), list)
+    }
     visited, stack = set(), set()
 
     def dfs(u):

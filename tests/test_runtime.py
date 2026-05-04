@@ -1570,6 +1570,77 @@ class TestValidateTightenings:
         errs = validate_workflow(wf)
         assert errs == []
 
+    # ── codex post-fix follow-up: malformed YAML must NOT crash ─────
+
+    def test_non_dict_node_does_not_crash(self):
+        wf = {
+            "workflow": "v", "version": "1.0",
+            "nodes": [
+                "this should be a dict, not a string",
+                {"id": "ok", "goal": "g", "steps": ["s"],
+                 "run": {"tool": "x.sh"}},
+            ],
+        }
+        # Must return errors, not raise AttributeError.
+        errs = validate_workflow(wf)
+        assert any("nodes[0]: must be a dict" in e for e in errs)
+        # The legitimate second node still validates clean.
+        assert not any("ok." in e for e in errs)
+
+    def test_non_string_run_skill_rejected(self):
+        wf = {
+            "workflow": "v", "version": "1.0",
+            "nodes": [{
+                "id": "n", "goal": "g", "steps": ["s"],
+                "run": {"skill": 42},
+            }],
+        }
+        errs = validate_workflow(wf)
+        assert any("run.skill: must be a non-empty string" in e
+                   for e in errs)
+
+    def test_empty_run_tool_rejected(self):
+        wf = self._wf(**{"run": {"tool": ""}})
+        errs = validate_workflow(wf)
+        assert any("run.tool: must be a non-empty string" in e
+                   for e in errs)
+
+    def test_non_string_verify_command_rejected(self):
+        wf = self._wf(verify={"command": 42})
+        errs = validate_workflow(wf)
+        assert any("verify.command: must be a non-empty string" in e
+                   for e in errs)
+
+    def test_empty_verify_criterion_rejected(self):
+        wf = self._wf(verify={"criterion": "   "})
+        errs = validate_workflow(wf)
+        assert any("verify.criterion: must be a non-empty string" in e
+                   for e in errs)
+
+    def test_verify_timeout_zero_rejected(self):
+        wf = self._wf(verify={"command": "true", "timeout": 0})
+        errs = validate_workflow(wf)
+        assert any("verify.timeout: must be a positive int" in e
+                   for e in errs)
+
+    def test_verify_timeout_negative_rejected(self):
+        wf = self._wf(verify={"command": "true", "timeout": -3})
+        errs = validate_workflow(wf)
+        assert any("verify.timeout: must be a positive int" in e
+                   for e in errs)
+
+    def test_verify_timeout_non_int_rejected(self):
+        wf = self._wf(verify={"command": "true", "timeout": "30"})
+        errs = validate_workflow(wf)
+        assert any("verify.timeout: must be a positive int" in e
+                   for e in errs)
+
+    def test_output_schema_non_string_field_name_rejected(self):
+        wf = self._wf(output_schema={123: "string"})
+        errs = validate_workflow(wf)
+        assert any("output_schema: field names must be non-empty strings"
+                   in e for e in errs)
+
 
 class TestVerifyAgentShape:
     """Finding 7: verify_with_agent must structurally validate the
