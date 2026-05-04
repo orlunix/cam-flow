@@ -99,6 +99,51 @@ A JSON envelope written to `agent_output.json`. Required `data` fields:
    deterministic gate is available is a regression — the agent can
    convince itself its own output is fine.
 
+   **`verify.command` runs from the node's attempt directory, NOT the
+   project root.** Specifically the cwd is
+   `<run-dir>/nodes/<id>/attempt-N/`, several levels deep under
+   `<project>/.camflow/run/`. So a naive `bash scripts/run_all_tests.sh`
+   or `pytest tests/` fails with exit 127 / "no such file or
+   directory" — the test command never runs at all and the runtime
+   reports retry exhaustion that has nothing to do with code quality.
+
+   The reliable cross-project pattern is a walk-up to a project-root
+   marker, then run from there:
+
+   ```yaml
+   verify:
+     command: |
+       P=$(pwd)
+       while [ ! -f "$P/<marker>" ] && [ "$P" != "/" ]; do P=$(dirname "$P"); done
+       [ "$P" = "/" ] && { echo "ERROR: no <marker> ancestor"; exit 2; }
+       cd "$P" && <your test command>
+   ```
+
+   Pick `<marker>` as the most specific single file that uniquely
+   identifies the project root for this case. In rough priority:
+
+   1. A spec/readme file the user named in the prompt
+      (`SPEC.md`, `README.md`, `CONTRIBUTING.md`).
+   2. A language manifest (`pyproject.toml`, `setup.cfg`,
+      `package.json`, `Cargo.toml`, `go.mod`, `Gemfile`,
+      `pom.xml`, `build.gradle`).
+   3. `.git` as a last resort (loose — fails inside a submodule or
+      worktree).
+
+   Avoid markers that appear in multiple ancestors (e.g. plain
+   `__init__.py`, `index.js`, `main.go`). The `[ "$P" = "/" ] && exit 2`
+   guard is mandatory — without it a missing marker silently cds to
+   `/` and the test runs against your filesystem instead of the
+   project. Failing loudly is the right behavior; the runtime then
+   reports exit 2 in `previous.feedback` and the next attempt can
+   correct the marker.
+
+   If the deterministic test command is itself a path-bearing script
+   (e.g. `scripts/run_all_tests.sh`), using the script's *directory
+   anchor* as the marker is also fine — pick a parent file unique to
+   that project layout (the spec file, manifest, or the script's own
+   name if guaranteed unique).
+
    **`verify: human` on USER nodes is OPT-IN.** This is about the
    workflow YOU are designing — the user's compiled workflow.yaml.
    Only insert `verify: human` on a user-workflow node when the user's

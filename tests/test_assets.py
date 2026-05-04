@@ -174,6 +174,33 @@ class TestBuiltinPlanner:
         )
         assert "verify.command" in text
 
+    def test_workflow_designer_warns_about_verify_cwd(self):
+        """Lock the post-codex-review-planner-rerun-001 fix: Planner
+        must be told that verify.command runs from the node's attempt
+        directory (not project root), and shown the walk-up-to-marker
+        pattern so generated commands don't fail with exit 127."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "workflow_designer" /
+                     "SKILL.md")
+        # The cwd warning itself must be present.
+        assert "attempt directory" in text.lower()
+        # The walk-up pattern's defining loop must be shown verbatim,
+        # so the LLM has a concrete template to copy.
+        assert "while [ ! -f " in text
+        assert 'dirname "$P"' in text
+        # The "fail loudly if no marker" guard is mandatory — without it
+        # a missing marker silently cds to /. Tests must keep this
+        # guard documented.
+        assert "exit 2" in text
+        # Marker priority list must mention multiple project types so
+        # Planner doesn't overfit to one ecosystem.
+        for marker in ("pyproject.toml", "package.json", "Cargo.toml",
+                       "go.mod"):
+            assert marker in text, (
+                f"workflow_designer SKILL.md must list {marker!r} "
+                f"as one of the project-root markers (cross-language "
+                f"verify.command guidance)."
+            )
+
     def test_workflow_designer_has_implement_per_spec_recipe(self):
         """The 'implement code per spec' shape — analyzer / implementer /
         audit / reviewer — must be present as a named recipe so Planner
