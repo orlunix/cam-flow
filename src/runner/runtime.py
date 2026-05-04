@@ -96,7 +96,11 @@ def _expr_walk(node, ctx):
             except (IndexError, TypeError) as e:
                 raise ExprError(f"subscript: {e}")
         if isinstance(obj, dict):
-            return obj.get(idx)
+            # Strict mode: missing dict key is an ExprError (mirrors the
+            # attribute branch). No silent None / empty-string fallback.
+            if idx not in obj:
+                raise ExprError(f"missing key: [{idx!r}]")
+            return obj[idx]
         raise ExprError(f"can't subscript {type(obj).__name__}")
     if isinstance(node, ast.Compare):
         left = _expr_walk(node.left, ctx)
@@ -603,15 +607,33 @@ def build_verify_prompt(node: "Node", run_envelope: dict,
 # ═══════════════════════════════════════════════════════════════════════
 
 def exec_tool(tool_path: Path, input_dict: dict, workspace: Path) -> dict:
-    """Run a shell tool. stdin = input.json, stdout = envelope JSON."""
-    proc = subprocess.run(
-        [str(tool_path)],
-        input=json.dumps(input_dict),
-        capture_output=True, text=True,
-        cwd=str(workspace),
-        env={**os.environ, "CAMFLOW_WORKSPACE": str(workspace)},
-        timeout=600,
-    )
+    """Run a shell tool. stdin = input.json, stdout = envelope JSON.
+
+    On timeout, return a TOOL_TIMEOUT fail envelope rather than letting
+    subprocess.TimeoutExpired propagate (which would crash the runner).
+    The scheduler then handles retry/halt normally. Whatever the tool
+    managed to write before being killed is still persisted in
+    raw_stdout.txt for debugging.
+    """
+    try:
+        proc = subprocess.run(
+            [str(tool_path)],
+            input=json.dumps(input_dict),
+            capture_output=True, text=True,
+            cwd=str(workspace),
+            env={**os.environ, "CAMFLOW_WORKSPACE": str(workspace)},
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired as e:
+        partial = e.stdout
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", errors="replace")
+        (workspace / "raw_stdout.txt").write_text(partial or "")
+        return empty_envelope(
+            "fail",
+            error={"code": "TOOL_TIMEOUT",
+                   "message": f"tool exceeded {e.timeout}s timeout"},
+        )
     (workspace / "raw_stdout.txt").write_text(proc.stdout or "")
     if proc.returncode != 0:
         return empty_envelope(

@@ -1301,3 +1301,120 @@ class TestReviewerFixes:
             (rd / "nodes" / "x" / "attempt-2" / "output.json").read_text()
         )
         assert att2["status"] == "success"
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  TestCodexPhase1Fixes — findings 1, 2, 3 from code-review-codex-2026-05-04
+# ───────────────────────────────────────────────────────────────────────
+
+class TestToolTimeout:
+    """Finding 1 (BLOCKER): subprocess.TimeoutExpired in exec_tool must
+    NOT propagate; it must produce a TOOL_TIMEOUT fail envelope so the
+    scheduler runs the normal retry/halt flow."""
+
+    def test_timeout_returns_fail_envelope(self, tmp_path, monkeypatch):
+        import subprocess as _sp
+        from runner import runtime as rt
+
+        proj = tmp_path / "proj"
+        scripts = proj / "scripts"
+        scripts.mkdir(parents=True)
+        # Put any executable on disk (we monkeypatch the actual run).
+        make_executable_tool(scripts / "slow.sh", "exit 0\n")
+
+        # Patch subprocess.run inside runtime to raise TimeoutExpired
+        # only for our tool — verify.command bash invocations pass through.
+        original_run = rt.subprocess.run
+
+        def fake_run(cmd, *args, **kw):
+            if isinstance(cmd, list) and cmd and "slow.sh" in cmd[0]:
+                raise _sp.TimeoutExpired(cmd=cmd,
+                                         timeout=kw.get("timeout", 1),
+                                         output="partial output\n")
+            return original_run(cmd, *args, **kw)
+
+        monkeypatch.setattr(rt.subprocess, "run", fake_run)
+
+        wf = {
+            "workflow": "to", "version": "1.0",
+            "nodes": [{
+                "id": "x", "goal": "g", "steps": ["s"],
+                "run": {"tool": "scripts/slow.sh"},
+            }],
+        }
+        rd = proj / ".camflow" / "run"
+        result = run_workflow(wf, rd)
+        assert result == "halted"  # retry: 1 default; halts after retry exhaust
+        out = json.loads(
+            (rd / "nodes" / "x" / "attempt-1" / "output.json").read_text()
+        )
+        assert out["status"] == "fail"
+        assert out["error"]["code"] == "TOOL_TIMEOUT"
+        # Whatever partial stdout existed should have been preserved.
+        partial_text = (rd / "nodes" / "x" / "attempt-1"
+                        / "raw_stdout.txt").read_text()
+        assert "partial" in partial_text
+
+
+class TestToolPathContainment:
+    """Finding 2: tool resolution must enforce <project>/<rel>; reject
+    absolute paths, .. traversal, and symlink escapes."""
+
+    def test_absolute_path_rejected(self, tmp_path):
+        from runner.assets import _resolve_tool_path
+        outside = tmp_path / "outside.sh"
+        outside.write_text("#!/bin/sh\necho hi\n")
+        outside.chmod(0o755)
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        # Absolute path → rejected, even though the file exists + is -x.
+        assert _resolve_tool_path(str(outside.resolve()), proj) is None
+
+    def test_dotdot_escape_rejected(self, tmp_path):
+        from runner.assets import _resolve_tool_path
+        outside = tmp_path / "outside.sh"
+        outside.write_text("#!/bin/sh\necho hi\n")
+        outside.chmod(0o755)
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        assert _resolve_tool_path("../outside.sh", proj) is None
+
+    def test_symlink_escape_rejected(self, tmp_path):
+        from runner.assets import _resolve_tool_path
+        outside = tmp_path / "outside.sh"
+        outside.write_text("#!/bin/sh\necho hi\n")
+        outside.chmod(0o755)
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        link = proj / "link.sh"
+        link.symlink_to(outside)
+        # Symlink resolves outside project_root → rejected.
+        assert _resolve_tool_path("link.sh", proj) is None
+
+    def test_legitimate_path_accepted(self, tmp_path):
+        from runner.assets import _resolve_tool_path
+        proj = tmp_path / "proj"
+        scripts = proj / "scripts"
+        scripts.mkdir(parents=True)
+        ok = scripts / "ok.sh"
+        ok.write_text("#!/bin/sh\necho hi\n")
+        ok.chmod(0o755)
+        resolved = _resolve_tool_path("scripts/ok.sh", proj)
+        assert resolved is not None
+        assert resolved.name == "ok.sh"
+
+
+class TestExprStrictSubscript:
+    """Finding 3: dict subscript with a missing key must raise ExprError,
+    matching the strict semantics of the attribute branch."""
+
+    def test_dict_missing_key_raises(self):
+        with pytest.raises(ExprError):
+            eval_expr('nodes["missing"]', {"nodes": {}})
+
+    def test_dict_present_key_ok(self):
+        assert eval_expr('nodes["x"]', {"nodes": {"x": 7}}) == 7
+
+    def test_render_dict_missing_key_raises(self):
+        with pytest.raises(ExprError):
+            render_str('val={{nodes["missing"]}}', {"nodes": {}})

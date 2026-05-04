@@ -55,6 +55,22 @@ def _resolve_skill_path(name: str, project_root: Path) -> Optional[Path]:
 
 def _resolve_tool_path(rel: str, project_root: Path) -> Optional[Path]:
     """`run.tool: <path>` resolves to <project_root>/<rel> if it's an
-    executable regular file."""
-    p = (project_root / rel).resolve()
+    executable regular file CONTAINED within project_root.
+
+    Spec §10 says tools resolve as <project>/<path>. Reject:
+      * absolute paths (`/etc/...`)
+      * `..`-traversal that escapes project_root
+      * symlink targets outside project_root
+    All three are caught by checking that the resolved final path is a
+    descendant of `project_root.resolve()`.
+    """
+    if Path(rel).is_absolute():
+        return None
+    project_root_resolved = project_root.resolve()
+    p = (project_root_resolved / rel).resolve()
+    try:
+        p.relative_to(project_root_resolved)
+    except ValueError:
+        # Final resolved path escaped project_root (via .. or symlink).
+        return None
     return p if p.is_file() and os.access(p, os.X_OK) else None

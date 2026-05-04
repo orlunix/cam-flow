@@ -74,6 +74,8 @@ DEPRECATED_PATTERNS = [
     r'status:\s*"?halted"?',  # status enum value that doesn't exist
     r"\bverify-N\b",          # run-dir doc residue: it's `verify/`, not `verify-N/`
     r"verify-<n>",            # ditto, parameterized form
+    r"^\s*verify:\s*\[",      # v0.x list-form verify (now dict-only)
+    r"^\s*type:\s*agent",     # v0.x `verify: [{type: agent}]` element
 ]
 
 
