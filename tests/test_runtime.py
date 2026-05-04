@@ -1418,3 +1418,309 @@ class TestExprStrictSubscript:
     def test_render_dict_missing_key_raises(self):
         with pytest.raises(ExprError):
             render_str('val={{nodes["missing"]}}', {"nodes": {}})
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  TestCodexPhase2Fixes — findings 4, 6, 7 from code-review-codex-2026-05-04
+# ───────────────────────────────────────────────────────────────────────
+
+class TestToolAgentOutputPersist:
+    """Finding 4: every tool attempt writes attempt-N/agent_output.json
+    (the producer's literal stdout) alongside raw_stdout.txt and the
+    runtime-validated output.json."""
+
+    def test_tool_success_writes_agent_output_json(self, tmp_path):
+        proj = tmp_path / "proj"
+        scripts = proj / "scripts"
+        scripts.mkdir(parents=True)
+        make_executable_tool(
+            scripts / "ok.sh",
+            envelope_tool_body({"x": 1}),
+        )
+        wf = {
+            "workflow": "p", "version": "1.0",
+            "nodes": [{
+                "id": "x", "goal": "g", "steps": ["s"],
+                "run": {"tool": "scripts/ok.sh"},
+                "output_schema": {"x": "integer"},
+                "verify": {"command": "true"},
+            }],
+        }
+        rd = proj / ".camflow" / "run"
+        result = run_workflow(wf, rd)
+        assert result == "done"
+        att = rd / "nodes" / "x" / "attempt-1"
+        assert (att / "agent_output.json").exists()
+        # Content should be parseable JSON matching what the tool emitted.
+        producer = json.loads((att / "agent_output.json").read_text())
+        assert producer["data"]["x"] == 1
+        # raw_stdout.txt also kept.
+        assert (att / "raw_stdout.txt").exists()
+        # output.json is the runtime-validated envelope.
+        assert (att / "output.json").exists()
+
+    def test_tool_bad_output_still_persists_agent_output(self, tmp_path):
+        """Even when the tool emits non-JSON, agent_output.json holds
+        the raw bytes — useful for debugging."""
+        proj = tmp_path / "proj"
+        scripts = proj / "scripts"
+        scripts.mkdir(parents=True)
+        make_executable_tool(
+            scripts / "garbage.sh",
+            "echo not-json-at-all\n",
+        )
+        wf = {
+            "workflow": "p", "version": "1.0",
+            "nodes": [{
+                "id": "x", "goal": "g", "steps": ["s"],
+                "run": {"tool": "scripts/garbage.sh"},
+            }],
+        }
+        rd = proj / ".camflow" / "run"
+        result = run_workflow(wf, rd)
+        assert result == "halted"
+        att = rd / "nodes" / "x" / "attempt-1"
+        # agent_output.json holds the raw stdout (non-JSON).
+        agent_text = (att / "agent_output.json").read_text()
+        assert "not-json-at-all" in agent_text
+        # output.json is the BAD_TOOL_OUTPUT fail envelope.
+        out = json.loads((att / "output.json").read_text())
+        assert out["status"] == "fail"
+        assert out["error"]["code"] == "TOOL_BAD_OUTPUT"
+
+
+class TestValidateTightenings:
+    """Finding 6: validate_workflow rejects malformed schemas."""
+
+    def _wf(self, **node_overrides):
+        return {
+            "workflow": "v", "version": "1.0",
+            "nodes": [{
+                "id": "n", "goal": "g", "steps": ["s"],
+                "run": {"tool": "x.sh"},
+                **node_overrides,
+            }],
+        }
+
+    def test_unsafe_node_id_rejected(self):
+        wf = {
+            "workflow": "v", "version": "1.0",
+            "nodes": [{
+                "id": "../escape", "goal": "g", "steps": ["s"],
+                "run": {"tool": "x.sh"},
+            }],
+        }
+        errs = validate_workflow(wf)
+        assert any("filesystem-safe" in e for e in errs)
+
+    def test_non_string_node_id_rejected(self):
+        wf = {
+            "workflow": "v", "version": "1.0",
+            "nodes": [{
+                "id": 42, "goal": "g", "steps": ["s"],
+                "run": {"tool": "x.sh"},
+            }],
+        }
+        errs = validate_workflow(wf)
+        assert any("non-string 'id'" in e for e in errs)
+
+    def test_non_string_goal_rejected(self):
+        wf = self._wf(goal=42)
+        errs = validate_workflow(wf)
+        assert any("goal: must be a non-empty string" in e for e in errs)
+
+    def test_steps_with_non_string_element_rejected(self):
+        wf = self._wf(steps=["ok", 7, "ok"])
+        errs = validate_workflow(wf)
+        assert any("steps[1]: must be a non-empty string" in e for e in errs)
+
+    def test_needs_with_non_string_rejected(self):
+        wf = self._wf(needs=[42])
+        errs = validate_workflow(wf)
+        assert any("needs[0]: must be a string" in e for e in errs)
+
+    def test_retry_negative_rejected(self):
+        wf = self._wf(retry=-1)
+        errs = validate_workflow(wf)
+        assert any("retry: must be a non-negative int" in e for e in errs)
+
+    def test_retry_non_int_rejected(self):
+        wf = self._wf(retry="two")
+        errs = validate_workflow(wf)
+        assert any("retry: must be a non-negative int" in e for e in errs)
+
+    def test_retry_float_rejected(self):
+        wf = self._wf(retry=1.5)
+        errs = validate_workflow(wf)
+        assert any("retry: must be a non-negative int" in e for e in errs)
+
+    def test_retry_bool_rejected(self):
+        # bool is a subclass of int in Python; tighten checks for that.
+        wf = self._wf(retry=True)
+        errs = validate_workflow(wf)
+        assert any("retry: must be a non-negative int" in e for e in errs)
+
+    def test_unknown_verify_key_rejected(self):
+        wf = self._wf(verify={"foo": 1})
+        errs = validate_workflow(wf)
+        assert any("verify: unknown keys" in e for e in errs)
+
+    def test_legitimate_baseline_still_valid(self):
+        wf = self._wf(retry=2, needs=[], verify={"command": "true"})
+        errs = validate_workflow(wf)
+        assert errs == []
+
+
+class TestVerifyAgentShape:
+    """Finding 7: verify_with_agent must structurally validate the
+    evaluator's `data` shape. Missing/wrong-typed fields → reject (and
+    consume retry budget like any verify failure)."""
+
+    def _verify_envelope(self, data):
+        """Build the envelope a verify-agent would write."""
+        return {
+            "status": "success",
+            "data": data,
+            "error": None,
+            "feedback": None,
+            "request_human": False,
+        }
+
+    def _node(self, n_steps=2):
+        return Node.from_dict({
+            "id": "n", "goal": "g",
+            "steps": [f"step{i}" for i in range(1, n_steps + 1)],
+            "run": {"tool": "x.sh"},
+        })
+
+    def _approved_data(self, n=2):
+        return {
+            "approved": True,
+            "reasoning": "looks ok",
+            "step_results": [
+                {"step": i + 1, "passed": True,
+                 "evidence": "quote",
+                 "reasoning": "ok"}
+                for i in range(n)
+            ],
+        }
+
+    def test_well_formed_passes(self, monkeypatch):
+        from runner import runtime as rt
+        from runner.runtime import verify_with_agent
+
+        def fake_run_and_collect(**kw):
+            return ("aid", self._verify_envelope(self._approved_data(2)))
+
+        monkeypatch.setattr(rt.camc, "run_and_collect", fake_run_and_collect)
+        wf_dummy = type("W", (), {"run_dir": kw_path(monkeypatch),
+                                  "tag": "t",
+                                  "spec": {}})()
+        ok, _ = verify_with_agent(self._node(2), wf_dummy,
+                                  {"status": "success"}, 1)
+        assert ok is True
+
+    def test_missing_step_results_rejects(self, monkeypatch):
+        from runner import runtime as rt
+        from runner.runtime import verify_with_agent
+
+        bad = {"approved": True, "reasoning": "fine"}
+        # NO step_results
+
+        def fake_run_and_collect(**kw):
+            return ("aid", self._verify_envelope(bad))
+
+        monkeypatch.setattr(rt.camc, "run_and_collect", fake_run_and_collect)
+        wf_dummy = type("W", (), {"run_dir": kw_path(monkeypatch),
+                                  "tag": "t",
+                                  "spec": {}})()
+        ok, fb = verify_with_agent(self._node(2), wf_dummy,
+                                   {"status": "success"}, 1)
+        assert ok is False
+        assert "malformed data" in fb
+        assert "step_results" in fb
+
+    def test_wrong_step_results_length_rejects(self, monkeypatch):
+        from runner import runtime as rt
+        from runner.runtime import verify_with_agent
+
+        bad = {
+            "approved": True,
+            "reasoning": "fine",
+            "step_results": [
+                {"step": 1, "passed": True, "evidence": "e", "reasoning": "r"},
+            ],  # only 1 entry, but node has 2 steps
+        }
+
+        def fake_run_and_collect(**kw):
+            return ("aid", self._verify_envelope(bad))
+
+        monkeypatch.setattr(rt.camc, "run_and_collect", fake_run_and_collect)
+        wf_dummy = type("W", (), {"run_dir": kw_path(monkeypatch),
+                                  "tag": "t",
+                                  "spec": {}})()
+        ok, fb = verify_with_agent(self._node(2), wf_dummy,
+                                   {"status": "success"}, 1)
+        assert ok is False
+        assert "1 entries, expected 2" in fb
+
+    def test_wrong_typed_step_field_rejects(self, monkeypatch):
+        from runner import runtime as rt
+        from runner.runtime import verify_with_agent
+
+        bad = {
+            "approved": True,
+            "reasoning": "fine",
+            "step_results": [
+                {"step": "1", "passed": True,
+                 "evidence": "e", "reasoning": "r"},
+                {"step": 2, "passed": True,
+                 "evidence": "e", "reasoning": "r"},
+            ],
+        }
+
+        def fake_run_and_collect(**kw):
+            return ("aid", self._verify_envelope(bad))
+
+        monkeypatch.setattr(rt.camc, "run_and_collect", fake_run_and_collect)
+        wf_dummy = type("W", (), {"run_dir": kw_path(monkeypatch),
+                                  "tag": "t",
+                                  "spec": {}})()
+        ok, fb = verify_with_agent(self._node(2), wf_dummy,
+                                   {"status": "success"}, 1)
+        assert ok is False
+        assert "step must be an int" in fb
+
+    def test_empty_evidence_for_approved_step_NOT_enforced(self, monkeypatch):
+        """Reviewer note: evidence-non-empty is prompt-protocol-only.
+        Runtime accepts empty evidence on an approved step."""
+        from runner import runtime as rt
+        from runner.runtime import verify_with_agent
+
+        data = {
+            "approved": True,
+            "reasoning": "fine",
+            "step_results": [
+                {"step": 1, "passed": True, "evidence": "", "reasoning": ""},
+                {"step": 2, "passed": True, "evidence": "", "reasoning": ""},
+            ],
+        }
+
+        def fake_run_and_collect(**kw):
+            return ("aid", self._verify_envelope(data))
+
+        monkeypatch.setattr(rt.camc, "run_and_collect", fake_run_and_collect)
+        wf_dummy = type("W", (), {"run_dir": kw_path(monkeypatch),
+                                  "tag": "t",
+                                  "spec": {}})()
+        ok, _ = verify_with_agent(self._node(2), wf_dummy,
+                                  {"status": "success"}, 1)
+        assert ok is True
+
+
+def kw_path(monkeypatch):
+    """Helper: a Path to a fresh temp dir for verify_with_agent's
+    sub_dir.mkdir() calls in the shape tests above."""
+    import tempfile
+    d = Path(tempfile.mkdtemp(prefix="vshape-"))
+    return d

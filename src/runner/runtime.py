@@ -207,11 +207,20 @@ def parse_workflow_yaml(text: str, project_root: Path | None = None) -> dict:
     return wf
 
 
+_NODE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_KNOWN_VERIFY_KEYS = {"criterion", "command", "human", "timeout"}
+
+
 def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
     """Return list of validation error strings. Empty list = OK.
 
     With project_root, also resolves skill/tool references to disk —
     workflow load FAILS if any referenced skill or tool is missing.
+
+    Codex review finding 6: tightened — checks id/goal types, steps
+    element types, needs element types, retry int range, unknown verify
+    keys, and filesystem-safe node IDs (so attempt-N/ paths can't be
+    coerced into directory traversal).
     """
     errors = []
     if not isinstance(wf, dict):
@@ -223,20 +232,68 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
         errors.append("workflow.context: must be a string")
 
     ids = [n.get("id") for n in nodes]
-    if any(not i for i in ids):
-        errors.append("a node is missing 'id'")
+    for i in ids:
+        if not isinstance(i, str) or not i:
+            errors.append("a node is missing or has non-string 'id'")
+            break
     if len(ids) != len(set(ids)):
         errors.append(f"duplicate node ids: {ids}")
-    id_set = set(filter(None, ids))
+    id_set = {i for i in ids if isinstance(i, str) and i}
 
     for n in nodes:
         nid = n.get("id", "<?>")
-        # Required fields
+
+        # Required fields presence
         for k in ("goal", "steps", "run"):
             if k not in n:
                 errors.append(f"{nid}: missing required field '{k}'")
-        if not isinstance(n.get("steps"), list) or not n.get("steps"):
-            errors.append(f"{nid}.steps: must be a non-empty list of strings")
+
+        # id: filesystem-safe (used as attempt dir name)
+        if isinstance(nid, str) and nid != "<?>" and not _NODE_ID_RE.match(nid):
+            errors.append(
+                f"{nid}.id: must be filesystem-safe "
+                f"(match {_NODE_ID_RE.pattern})"
+            )
+
+        # goal: non-empty string
+        goal = n.get("goal")
+        if goal is not None and (not isinstance(goal, str) or not goal.strip()):
+            errors.append(f"{nid}.goal: must be a non-empty string")
+
+        # steps: non-empty list of non-empty strings
+        steps = n.get("steps")
+        if steps is not None:
+            if not isinstance(steps, list) or not steps:
+                errors.append(
+                    f"{nid}.steps: must be a non-empty list of strings"
+                )
+            else:
+                for i, s in enumerate(steps):
+                    if not isinstance(s, str) or not s.strip():
+                        errors.append(
+                            f"{nid}.steps[{i}]: must be a non-empty string"
+                        )
+
+        # needs: list of strings
+        needs = n.get("needs")
+        if needs is not None:
+            if not isinstance(needs, list):
+                errors.append(f"{nid}.needs: must be a list of node ids")
+            else:
+                for i, dep in enumerate(needs):
+                    if not isinstance(dep, str):
+                        errors.append(
+                            f"{nid}.needs[{i}]: must be a string node id"
+                        )
+
+        # retry: int >= 0 (reject negative, non-int, float)
+        if "retry" in n:
+            rv = n["retry"]
+            if not isinstance(rv, int) or isinstance(rv, bool) or rv < 0:
+                errors.append(
+                    f"{nid}.retry: must be a non-negative int (got {rv!r})"
+                )
+
         # Run mutex
         run = n.get("run") or {}
         if not isinstance(run, dict):
@@ -246,12 +303,19 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
         has_tool = "tool" in run
         if not (has_skill ^ has_tool):
             errors.append(f"{nid}.run: must have exactly one of `skill` or `tool`")
-        # Verify mutex
+
+        # Verify mutex + unknown-keys check
         verify = n.get("verify")
         if verify is not None:
             if not isinstance(verify, dict):
                 errors.append(f"{nid}.verify: must be a dict")
             else:
+                unknown = set(verify.keys()) - _KNOWN_VERIFY_KEYS
+                if unknown:
+                    errors.append(
+                        f"{nid}.verify: unknown keys {sorted(unknown)}; "
+                        f"allowed: {sorted(_KNOWN_VERIFY_KEYS)}"
+                    )
                 v_keys = {k for k in ("criterion", "command", "human")
                           if k in verify}
                 if len(v_keys) > 1:
@@ -263,10 +327,12 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
                     errors.append(
                         f"{nid}.verify.human: must be a string (the prompt to show the user)"
                     )
-        # needs references valid ids
-        for dep in n.get("needs", []) or []:
-            if dep not in id_set:
-                errors.append(f"{nid}.needs: unknown node '{dep}'")
+        # needs references valid ids (only if needs is a well-formed list)
+        n_needs = n.get("needs")
+        if isinstance(n_needs, list):
+            for dep in n_needs:
+                if isinstance(dep, str) and dep not in id_set:
+                    errors.append(f"{nid}.needs: unknown node '{dep}'")
         # output_schema types
         schema = n.get("output_schema") or {}
         if not isinstance(schema, dict):
@@ -609,12 +675,21 @@ def build_verify_prompt(node: "Node", run_envelope: dict,
 def exec_tool(tool_path: Path, input_dict: dict, workspace: Path) -> dict:
     """Run a shell tool. stdin = input.json, stdout = envelope JSON.
 
+    Persistence rule (codex review finding 4): every tool attempt writes
+    its raw stdout to BOTH `agent_output.json` (the producer's literal
+    output, mirroring spec §11 layout where every attempt has
+    agent_output.json) and `raw_stdout.txt` (kept as an extra debug
+    artifact). `output.json` is written separately by execute_attempt
+    and holds the runtime-validated envelope.
+
     On timeout, return a TOOL_TIMEOUT fail envelope rather than letting
     subprocess.TimeoutExpired propagate (which would crash the runner).
-    The scheduler then handles retry/halt normally. Whatever the tool
-    managed to write before being killed is still persisted in
-    raw_stdout.txt for debugging.
+    The scheduler then handles retry/halt normally.
     """
+    def _persist_stdout(text: str) -> None:
+        (workspace / "agent_output.json").write_text(text or "")
+        (workspace / "raw_stdout.txt").write_text(text or "")
+
     try:
         proc = subprocess.run(
             [str(tool_path)],
@@ -628,13 +703,13 @@ def exec_tool(tool_path: Path, input_dict: dict, workspace: Path) -> dict:
         partial = e.stdout
         if isinstance(partial, bytes):
             partial = partial.decode("utf-8", errors="replace")
-        (workspace / "raw_stdout.txt").write_text(partial or "")
+        _persist_stdout(partial or "")
         return empty_envelope(
             "fail",
             error={"code": "TOOL_TIMEOUT",
                    "message": f"tool exceeded {e.timeout}s timeout"},
         )
-    (workspace / "raw_stdout.txt").write_text(proc.stdout or "")
+    _persist_stdout(proc.stdout or "")
     if proc.returncode != 0:
         return empty_envelope(
             "fail",
@@ -804,18 +879,65 @@ def verify_with_agent(node: "Node", workflow: "Workflow", envelope: dict,
             f"{(raw.get('error') or {}).get('message', '?')}"
         )
     data = raw.get("data") or {}
-    approved = bool(data.get("approved"))
-    reasoning = data.get("reasoning") or "(no reasoning provided)"
+
+    # Structural shape check (codex review finding 7). The fixed
+    # evaluator data shape per spec §9: approved bool, reasoning str,
+    # step_results list of length len(node.steps); each item has
+    # int step / bool passed / str evidence / str reasoning. Empty-
+    # evidence-on-approve is intentionally NOT enforced — that's a
+    # prompt-protocol concern (spec §9), not a runtime gate.
+    shape_problems = _verify_agent_shape_errors(data, len(node.steps))
+    if shape_problems:
+        return False, (
+            "verify-agent returned malformed data: " + "; ".join(shape_problems)
+        )
+
+    approved = bool(data["approved"])
+    reasoning = data["reasoning"]
     if not approved:
         # Append step-level details so feedback is actionable.
-        bad_steps = [
-            sr for sr in (data.get("step_results") or [])
-            if not sr.get("passed")
-        ]
+        bad_steps = [sr for sr in data["step_results"] if not sr["passed"]]
         if bad_steps:
             reasoning += "\nFailed steps: " + json.dumps(bad_steps,
                                                          ensure_ascii=False)
     return approved, reasoning
+
+
+def _verify_agent_shape_errors(data: dict, expected_len: int) -> list[str]:
+    """Return a list of structural-shape error strings for a verify
+    agent's `data` dict. Empty list = OK.
+
+    Structural only — types and lengths. Non-empty evidence is NOT
+    enforced (prompt-side concern; see Evidence Protocol in spec §9).
+    """
+    problems: list[str] = []
+    if not isinstance(data, dict):
+        return ["data is not a dict"]
+    if not isinstance(data.get("approved"), bool):
+        problems.append("`approved` must be a bool")
+    if not isinstance(data.get("reasoning"), str):
+        problems.append("`reasoning` must be a string")
+    sr = data.get("step_results")
+    if not isinstance(sr, list):
+        problems.append("`step_results` must be a list")
+        return problems
+    if len(sr) != expected_len:
+        problems.append(
+            f"`step_results` has {len(sr)} entries, expected {expected_len}"
+        )
+    for i, item in enumerate(sr):
+        if not isinstance(item, dict):
+            problems.append(f"step_results[{i}] is not a dict")
+            continue
+        if not isinstance(item.get("step"), int) or isinstance(item.get("step"), bool):
+            problems.append(f"step_results[{i}].step must be an int")
+        if not isinstance(item.get("passed"), bool):
+            problems.append(f"step_results[{i}].passed must be a bool")
+        if not isinstance(item.get("evidence"), str):
+            problems.append(f"step_results[{i}].evidence must be a string")
+        if not isinstance(item.get("reasoning"), str):
+            problems.append(f"step_results[{i}].reasoning must be a string")
+    return problems
 
 
 # ═══════════════════════════════════════════════════════════════════════
