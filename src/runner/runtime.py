@@ -393,18 +393,23 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
                         f"{nid}.output_schema.{fk}: unknown type {ft!r}; "
                         f"allowed: {sorted(VALID_TYPES)}"
                     )
-        # skill / tool existence (only with project_root)
+        # skill / tool existence (only with project_root, and only when
+        # the value is a non-empty string — otherwise the type-error
+        # we already recorded above is the right outcome, and we'd
+        # raise TypeError inside _resolve_*_path on garbage input).
         if project_root is not None:
-            if has_skill:
-                if not _resolve_skill_path(run["skill"], project_root):
+            sv = run.get("skill")
+            tv = run.get("tool")
+            if has_skill and isinstance(sv, str) and sv.strip():
+                if not _resolve_skill_path(sv, project_root):
                     errors.append(
-                        f"{nid}.run.skill: '{run['skill']}' not found "
-                        f"(no skills/{run['skill']}/SKILL.md in project or repo)"
+                        f"{nid}.run.skill: '{sv}' not found "
+                        f"(no skills/{sv}/SKILL.md in project or repo)"
                     )
-            if has_tool:
-                if not _resolve_tool_path(run["tool"], project_root):
+            if has_tool and isinstance(tv, str) and tv.strip():
+                if not _resolve_tool_path(tv, project_root):
                     errors.append(
-                        f"{nid}.run.tool: '{run['tool']}' not found or not "
+                        f"{nid}.run.tool: '{tv}' not found or not "
                         f"executable (relative to {project_root})"
                     )
 

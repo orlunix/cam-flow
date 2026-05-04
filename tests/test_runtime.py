@@ -1641,6 +1641,56 @@ class TestValidateTightenings:
         assert any("output_schema: field names must be non-empty strings"
                    in e for e in errs)
 
+    # ── codex final-validation-gap follow-up:
+    # ── existence check must not crash on garbage value types.
+
+    def test_non_string_run_skill_with_project_root_no_typeerror(
+            self, tmp_path):
+        """validate_workflow(project_root=...) must NOT raise TypeError
+        when run.skill is a non-string. The earlier 'must be a non-empty
+        string' error is the only outcome."""
+        wf = {
+            "workflow": "v", "version": "1.0",
+            "nodes": [{
+                "id": "n", "goal": "g", "steps": ["s"],
+                "run": {"skill": 42},
+            }],
+        }
+        # If the existence-check forwarded the int into
+        # _resolve_skill_path, this would raise TypeError below.
+        errs = validate_workflow(wf, project_root=tmp_path)
+        assert any("run.skill: must be a non-empty string" in e
+                   for e in errs)
+        # And NOT a "skill 'X' not found" message keyed on the int.
+        assert not any("not found" in e and "42" in e for e in errs)
+
+    def test_non_string_run_tool_with_project_root_no_typeerror(
+            self, tmp_path):
+        wf = {
+            "workflow": "v", "version": "1.0",
+            "nodes": [{
+                "id": "n", "goal": "g", "steps": ["s"],
+                "run": {"tool": 7},
+            }],
+        }
+        errs = validate_workflow(wf, project_root=tmp_path)
+        assert any("run.tool: must be a non-empty string" in e
+                   for e in errs)
+        assert not any("not found or not" in e and "7" in e for e in errs)
+
+    def test_empty_run_skill_with_project_root_no_typeerror(
+            self, tmp_path):
+        wf = {
+            "workflow": "v", "version": "1.0",
+            "nodes": [{
+                "id": "n", "goal": "g", "steps": ["s"],
+                "run": {"skill": "   "},
+            }],
+        }
+        errs = validate_workflow(wf, project_root=tmp_path)
+        assert any("run.skill: must be a non-empty string" in e
+                   for e in errs)
+
 
 class TestVerifyAgentShape:
     """Finding 7: verify_with_agent must structurally validate the
