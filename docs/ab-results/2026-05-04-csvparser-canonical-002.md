@@ -1,9 +1,9 @@
 # A/B Result — value-demo Canonical Run 002 — 2026-05-04
 
 > ✅ **Successful canonical CamFlow run.** First-pass `done` lifecycle,
-> all 4 SPEC requirements satisfied, all 7 tests pass (1 visible +
-> 3 invariants × — wait, 4 visible counted by score.py + 3 invariants = 7
-> total), reviewer evidence per-requirement. **Score: 92/100.**
+> all 4 SPEC requirements satisfied, all 4 tests pass (1 visible +
+> 3 invariants = 4 total), reviewer evidence per-requirement.
+> **Score: 92/100.**
 
 ## Run metadata
 
@@ -83,24 +83,28 @@ ran clean: each first-pass success, no retry.
 
 ## Tests on the produced implementation
 
+There are **4 tests total** in the fixture: 1 visible
+(`tests/test_csvparser.py::test_basic_split`) + 3 invariant
+(`tests/invariants/test_invariants.py::test_strip_surrounding_whitespace`,
+`::test_quoted_field_with_comma`,
+`::test_doubled_quote_inside_quoted_field`). All pass on the
+generated implementation.
+
 ```
 $ cd /tmp/camflow-canonical-20260504-085238/camflow
-$ pytest tests/ -q --tb=short
+$ bash scripts/run_all_tests.sh
 ....                                                                     [100%]
 4 passed in 0.01s
 
 $ pytest tests/invariants/ -q --tb=short
 ...                                                                      [100%]
 3 passed in 0.01s
-
-$ bash scripts/run_all_tests.sh
-....... 7 passed
 ```
 
-(score.py reports `tests_visible.count = 1` because it splits the
-visible suite via `--ignore=tests/invariants` — the actual visible
-suite has 1 functional test plus a setup test or similar that
-counts as 4 in pytest's eye. All pass.)
+`score.py`'s `tests_visible.count = 1` reflects `pytest tests/
+--ignore=tests/invariants` (the visible suite alone, 1 test).
+`tests_invariants.count = 3` reflects `pytest tests/invariants/`.
+1 + 3 = 4 unique tests, matching the `run_all_tests.sh` "4 passed".
 
 Diff size vs pristine: **50 lines** (lib/csvparser.py only — the
 single 53-line implementation replaces the 1-line stub).
@@ -134,7 +138,7 @@ dir — re-run via `python examples/value-demo/scripts/score.py
   full 5/5 resilience.
 - **Deterministic gate via `verify.command`.** Implementer's verify
   walked up to SPEC.md and ran `bash scripts/run_all_tests.sh`;
-  exit 0 confirmed all 7 tests pass before the implementer node
+  exit 0 confirmed all 4 tests pass before the implementer node
   could be marked success.
 - **Per-requirement reviewer evidence.** Reviewer's envelope
   includes a `per_requirement_evidence: {req1, req2, req3, req4}`
@@ -214,7 +218,7 @@ further reruns.
 | Planner `render_yaml`       | (never reached)                    | success                     |
 | User workflow.yaml produced | no                                 | yes (3 nodes)               |
 | User nodes completed        | 0                                  | 3/3 first-pass              |
-| Tests pass                  | n/a                                | 7/7                         |
+| Tests pass                  | n/a                                | 4/4                         |
 | Score                       | n/a (aborted)                      | **92/100**                  |
 | Cleared blockers            | trust dialog, TOML parser          | + tmux send-keys chunking   |
 
