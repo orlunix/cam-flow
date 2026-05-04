@@ -37,8 +37,9 @@ nodes:
       task_statement: string
       constraints: array
       ambiguities: array
+      test_files: array
     verify:
-      criterion: "task_statement faithfully covers what the user asked; constraints + ambiguities are accurate"
+      criterion: "task_statement faithfully covers what the user asked; constraints + ambiguities are accurate; test_files lists any test/spec artifacts the downstream designer should plan around (empty list if none)"
     retry: 2
 
   - id: design_dag

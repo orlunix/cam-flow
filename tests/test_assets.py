@@ -124,6 +124,67 @@ class TestBuiltinPlanner:
             p = BUILTIN_PLANNER_SKILLS_DIR / sub / "SKILL.md"
             assert p.exists(), f"missing builtin Planner skill: {p}"
 
+    def test_prompt_analyzer_surfaces_test_files(self):
+        """Lock the post-codex-review-planner-gap-greenlight nudge:
+        prompt_analyzer must emit a test_files field and must allow
+        reading explicitly-named artifacts (so downstream design can
+        plan around tests it didn't have to invent)."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "prompt_analyzer" /
+                     "SKILL.md")
+        assert "test_files" in text, (
+            "prompt_analyzer must declare a test_files output field — "
+            "the designer relies on it to plan audit nodes."
+        )
+        # Section heading proving the read-named-artifacts permission
+        # is the new official policy, not a stray hint.
+        assert "## On reading files" in text
+
+    def test_planner_workflow_yaml_includes_test_files_schema(self):
+        """understand node's output_schema must include test_files
+        (else the designer's downstream auto-injection won't know to
+        carry the field, and the verify criterion can't reference it)."""
+        spec = yaml.safe_load(_read(BUILTIN_PLANNER_YAML))
+        understand = next(n for n in spec["nodes"] if n["id"] == "understand")
+        assert "test_files" in (understand.get("output_schema") or {}), (
+            "understand.output_schema must include test_files: array"
+        )
+
+    def test_workflow_designer_lists_repo_skills(self):
+        """Designer must point at concrete repo skills it can reach for
+        — without this, LLMs invent names like gather_context /
+        regression_review (live A/B finding, codex-review-live-ab-result-001)."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "workflow_designer" /
+                     "SKILL.md")
+        assert "Available repo skills" in text
+        for skill_name in ("analyzer", "code_writer", "reviewer"):
+            assert f"`{skill_name}`" in text, (
+                f"workflow_designer SKILL.md must mention the {skill_name!r} "
+                f"skill so Planner reaches for it instead of inventing names."
+            )
+
+    def test_workflow_designer_prefers_verify_command_for_deterministic_tests(self):
+        """The retry-with-feedback gate only fires if generative nodes
+        use verify.command for deterministic gates. The SKILL.md must
+        say so explicitly."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "workflow_designer" /
+                     "SKILL.md")
+        assert "deterministic test command" in text.lower(), (
+            "workflow_designer must teach: prefer verify.command when a "
+            "deterministic test command is available."
+        )
+        assert "verify.command" in text
+
+    def test_workflow_designer_has_implement_per_spec_recipe(self):
+        """The 'implement code per spec' shape — analyzer / implementer /
+        audit / reviewer — must be present as a named recipe so Planner
+        produces inspectable multi-step DAGs on this class of task."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "workflow_designer" /
+                     "SKILL.md")
+        assert "Common shape: implement code per spec" in text
+        # Must call out the audit-tool-node component specifically —
+        # that's the part the live Planner skipped pre-fix.
+        assert "audit" in text.lower()
+
 
 # ─── shipped skills/ ──────────────────────────────────────────────────
 

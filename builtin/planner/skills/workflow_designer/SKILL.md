@@ -40,6 +40,26 @@ A JSON envelope written to `agent_output.json`. Required `data` fields:
 3. **Pick existing skills.** If you don't know a skill exists, don't
    reference it. The runtime fails workflow load if a skill is missing.
 
+   **Available repo skills** — the camflow shipped `skills/` directory
+   commonly carries these (resolved automatically; treat the list as
+   indicative, not exhaustive — projects can add their own under
+   `<project>/skills/<name>/SKILL.md`):
+
+   - `analyzer` — read source/spec/test artifacts and emit a
+     structured requirements list with verbatim evidence.
+   - `code_writer` — implement or modify code to satisfy a stated
+     requirement set; iterate until a deterministic test command
+     passes.
+   - `reviewer` — independently confirm a diff covers a requirement
+     list, citing concrete file:line evidence per requirement.
+   - `evaluator` — the default agent-verify role (you don't reference
+     this directly; the runtime invokes it when a node has no explicit
+     `verify` block).
+
+   Prefer these over inventing new skill names. If none of them fit a
+   step, that's a sign the step is itself a custom skill — but don't
+   reference custom names unless you know they exist on disk.
+
    **`run.tool:` is an escape hatch with hard criteria.** Default every
    node to `run: { skill: <name> }`. Use `run: { tool: <path> }` only
    when ALL FIVE of these hold for the node:
@@ -65,6 +85,19 @@ A JSON envelope written to `agent_output.json`. Required `data` fields:
 4. **Verify everything non-trivial.** Default is `verify: agent` (steps
    as checklist). Use `verify.command` for things you can check with
    bash exit code.
+
+   **Prefer `verify.command` whenever a deterministic test command
+   exists.** If the task has any pass/fail gate that a shell command
+   can evaluate (`pytest tests/`, `make test`, `cargo test`, `npm
+   test`, a custom shell script that exits non-zero on failure), the
+   generative node that produces the artifact under test should use
+   `verify.command` for that gate. This is what makes the runtime's
+   retry-with-feedback loop fire on missed requirements: a wrong
+   implementation gets an exit-code rejection, not a self-approving
+   agent verdict, and the next attempt sees the failure as
+   `previous.feedback`. Falling back to `verify: agent` when a
+   deterministic gate is available is a regression — the agent can
+   convince itself its own output is fine.
 
    **`verify: human` on USER nodes is OPT-IN.** This is about the
    workflow YOU are designing — the user's compiled workflow.yaml.
@@ -99,8 +132,51 @@ A JSON envelope written to `agent_output.json`. Required `data` fields:
 A list of node dicts. Each must have `id`, `goal`, `steps`, `run`. The
 other fields are optional but recommended where applicable.
 
+## Common shape: implement code per spec
+
+When the task is "implement / modify code to satisfy a written spec
+plus a deterministic test command" (whether the language is Python,
+Go, Rust, JS, or anything else), the standard DAG shape is:
+
+1. **`analyzer`** — read the spec/source/test artifacts named in
+   `upstream.understand` (especially `test_files`); emit a structured
+   requirement list with verbatim evidence per requirement.
+
+2. **`implementer`** (skill: `code_writer`, `needs: [analyzer]`) —
+   implement against `upstream.analyzer.data.requirements`. Crucially,
+   `verify.command` runs the FULL deterministic test invocation
+   (visible + invariant / hidden / property tests, whichever the
+   project has). On failure the runtime auto-retries with
+   `previous.feedback`. `retry: 2` or `3` is appropriate.
+
+3. **One audit tool node per test class.** When the project has
+   distinct test groupings (visible vs. invariant, unit vs.
+   integration), give each its own `run.tool` node that emits a
+   structured pass/fail envelope (`{passed: bool, tests_run: int,
+   failed_tests: array}`). These are pure audit — they make the
+   passing evidence concrete in the trace, separate from the
+   implementer's self-report. Each should `needs: [implementer]` and
+   use `verify.command` to gate on the envelope's `data.passed` field.
+
+4. **`reviewer`** (skill: `reviewer`, `needs: [analyzer, implementer,
+   <each audit node>]`) — independently confirm every requirement is
+   satisfied, citing either a `file:line` range in the implementation
+   or a passing test name from the audit envelopes.
+
+This shape is not the only valid one — adapt it to what the actual
+project has. But when these ingredients are present (a spec,
+multi-class test suite, a deterministic test command), this is the
+shape that produces inspectable per-attempt artifacts and surfaces
+retry-with-feedback when the implementer misses a hidden requirement.
+
+If the case has no test suite, drop the audit nodes and lean on
+`verify: agent` for the implementer (with the spec's requirements as
+explicit verify criteria). If the case is single-step (config tweak,
+trivial rename), a 2-node analyzer+implementer DAG is fine.
+
 ## On retry
 
 `previous.feedback` tells you what the verify agent rejected. Most
 common: missing dependencies, orphan nodes, infeasible decomposition,
-referenced a skill that doesn't exist.
+referenced a skill that doesn't exist, fell back to `verify: agent`
+on a node where a deterministic test command was available.

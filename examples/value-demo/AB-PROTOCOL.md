@@ -158,6 +158,45 @@ runner because the artifacts simply don't exist on the baseline side.
 
 ---
 
+## Planner expectations for this fixture
+
+When `camflow run` compiles `PROMPT.txt` against this fixture, the
+Planner should produce a workflow whose **shape** is close to
+`workflow-reference.yaml`. Specifically, on the camflow leg's
+`<dest>/.camflow/run/workflow.yaml` we expect to see:
+
+* **An analyzer-style first node** that reads `SPEC.md` + the test
+  files and emits a structured requirement list. `prompt_analyzer`
+  should have surfaced the test paths in `task_statement` /
+  `test_files`, so the designer should not skip this.
+* **An implementer node** with `verify.command` running the full
+  deterministic test invocation (visible + invariants together —
+  e.g. `pytest tests/ tests/invariants/` or `bash scripts/run_all_tests.sh`).
+  This is what makes a missed Req 2/3/4 trigger retry-with-feedback
+  rather than a hollow self-approval.
+* **At least one audit tool node** that runs pytest and emits a
+  structured envelope (`data.passed`, `data.tests_run`,
+  `data.failed_tests`). The reference DAG splits this into two —
+  `test_runner` for `tests/` and `invariant_checker` for
+  `tests/invariants/` — but a single combined audit node is also
+  acceptable.
+* **A reviewer node** that depends on the analyzer + implementer + the
+  audit node(s), and is told to cite per-requirement evidence.
+
+The Planner is an LLM, not a deterministic compiler — exact node
+names, counts, and `retry:` values will vary run-to-run. What we're
+checking is whether the structural shape lines up. If the produced
+workflow skipped the audit tool node, used `verify: agent` on the
+implementer despite the deterministic test command being available,
+or collapsed everything into 2-3 generic nodes — flag it as Planner
+drift and re-run; if it persists, treat it as a Planner-prompt
+regression.
+
+The diagnostic mapping below covers what to do when the runtime
+itself surprises you on a given run.
+
+---
+
 ## Diagnostic mapping (when the result is surprising)
 
 If CAMFLOW halts at Planner → planner DAG bad / planner skill weak
