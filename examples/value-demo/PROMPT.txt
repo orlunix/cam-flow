@@ -1,0 +1,1 @@
+Implement parse_record in lib/csvparser.py per SPEC.md. Make all tests pass. Don't break anything else.

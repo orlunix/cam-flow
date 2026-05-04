@@ -1,0 +1,112 @@
+workflow: csvparser_implementation
+version: "1.1"
+
+# Reference DAG: this is what the builtin Planner is *expected* to
+# produce for PROMPT.txt against this fixture. Use it as a target shape
+# when reviewing Planner output with `camflow run -i`, or as an input
+# to a deterministic CI test that drives the runtime directly.
+#
+# Recovery model is hybrid (see codex-review-case-retry-semantics):
+#   * implementer.verify runs the FULL pytest invocation (visible +
+#     invariants), so any missed requirement triggers automatic retry
+#     with previous.feedback — this is the recovery loop.
+#   * test_runner / invariant_checker are downstream AUDIT tool nodes
+#     that emit structured pass/fail envelopes for the reviewer to
+#     cite as evidence.
+
+context: |
+  Task: implement lib/csvparser.parse_record per SPEC.md.
+
+  See SPEC.md for the full requirements. The visible failing test
+  in tests/test_csvparser.py exercises only Req 1, but SPEC.md
+  references additional invariant tests under tests/invariants/.
+  The full pytest invocation (default + invariants) is the
+  deterministic gate.
+
+nodes:
+  - id: analyzer
+    goal: "Extract every requirement in SPEC.md plus the test files SPEC references, with verbatim evidence per requirement."
+    steps:
+      - "Read SPEC.md and quote every Req section verbatim."
+      - "Read tests/test_csvparser.py and tests/invariants/test_invariants.py to verify which tests cover which requirement."
+      - "Emit a structured requirement list with one entry per req."
+    run:
+      skill: analyzer
+    output_schema:
+      requirements: array
+      test_paths_referenced: array
+    retry: 2
+
+  - id: implementer
+    goal: "Implement parse_record in lib/csvparser.py satisfying every requirement listed by analyzer."
+    needs: [analyzer]
+    steps:
+      - "Read upstream.analyzer.data.requirements as the ground-truth req list."
+      - "Read the existing stub in lib/csvparser.py."
+      - "Implement parse_record covering ALL listed requirements (not just the visible test)."
+      - "Iterate until pytest tests/ tests/invariants/ -q exits 0."
+    run:
+      skill: code_writer
+    output_schema:
+      files_changed: array
+      summary: string
+    verify:
+      # Run from attempt-dir cwd: walk up to project root (the dir
+      # holding SPEC.md), then invoke run_all_tests.sh from there.
+      command: |
+        P=$(pwd)
+        while [ ! -f "$P/SPEC.md" ] && [ "$P" != "/" ]; do P=$(dirname "$P"); done
+        [ "$P" = "/" ] && { echo "ERROR: no SPEC.md ancestor"; exit 2; }
+        bash "$P/scripts/run_all_tests.sh"
+      timeout: 60
+    retry: 3
+
+  - id: test_runner
+    goal: "Audit the visible test suite and emit a structured pass/fail envelope."
+    needs: [implementer]
+    steps:
+      - "Run pytest tests/ -q at the project root."
+      - "Capture pass/fail and recent output."
+      - "Emit envelope with data.passed and data.tests_run."
+    run:
+      tool: scripts/run_default_tests.sh
+    output_schema:
+      passed: boolean
+      tests_run: integer
+      output: string
+    verify:
+      command: 'test "$(jq -r .data.passed agent_output.json)" = "true"'
+    retry: 1
+
+  - id: invariant_checker
+    goal: "Audit the invariant tests and emit a structured pass/fail envelope listing any failing tests."
+    needs: [implementer]
+    steps:
+      - "Run pytest tests/invariants/ -q at the project root."
+      - "Capture pass/fail and any failed test names."
+      - "Emit envelope with data.passed, data.tests_run, data.failed_tests."
+    run:
+      tool: scripts/run_invariants.sh
+    output_schema:
+      passed: boolean
+      tests_run: integer
+      failed_tests: array
+      output: string
+    verify:
+      command: 'test "$(jq -r .data.passed agent_output.json)" = "true"'
+    retry: 1
+
+  - id: reviewer
+    goal: "Independently confirm the diff satisfies every requirement from upstream.analyzer.data.requirements; cite concrete evidence per req."
+    needs: [analyzer, implementer, test_runner, invariant_checker]
+    steps:
+      - "Read upstream.analyzer.data.requirements (ground-truth req list)."
+      - "Read lib/csvparser.py current content via Read tool."
+      - "For each requirement, cite a specific file:line range in lib/csvparser.py OR a passing test name from upstream.test_runner / upstream.invariant_checker."
+      - "Approve only if every requirement has concrete evidence; reject otherwise with specific issues that name the missing requirement."
+    run:
+      skill: reviewer
+    output_schema:
+      approved: boolean
+      issues: array
+    retry: 2
