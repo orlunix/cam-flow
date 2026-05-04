@@ -354,6 +354,52 @@ def test_score_py_on_pristine_fixture(tmp_path):
     assert rubric["evidence_quality"]["manual_pts"] is None
 
 
+def test_score_py_partial_invariant_credit(tmp_path):
+    """Partial-coverage scoring: if some invariants pass and some fail,
+    the requirement_coverage row must reflect the per-test count, NOT
+    fall back to 0 because the invariant suite's exit code was nonzero.
+    Reviewer finding codex-review-value-demo-score-finding."""
+    import subprocess
+    proj = tmp_path / "leg"
+    shutil.copytree(FIXTURE, proj)
+
+    # Partial impl: covers Req 1 (split on ',') and Req 2 (whitespace
+    # strip). Does NOT handle quotes (Req 3, Req 4 fail).
+    (proj / "lib" / "csvparser.py").write_text(
+        '"""Partial impl: Req 1 + Req 2 only."""\n'
+        'def parse_record(line: str) -> list[str]:\n'
+        '    return [f.strip() for f in line.split(",")]\n'
+    )
+    score_py = REPO / "examples" / "value-demo" / "scripts" / "score.py"
+    p = subprocess.run(
+        ["python3", str(score_py), str(proj),
+         "--pristine", str(FIXTURE)],
+        capture_output=True, text=True,
+    )
+    assert p.returncode == 0, f"stderr={p.stderr}\nstdout={p.stdout}"
+    out = json.loads(p.stdout)
+
+    # Visible (Req 1) passes; 1 of 3 invariants (Req 2) passes; Req 3
+    # and Req 4 fail. So 2 of 4 requirements satisfied → round(35 * 2/4)
+    # = 18.
+    assert out["tests_visible"]["pass"] is True
+    assert out["tests_visible"]["count"] == 1
+    assert out["tests_invariants"]["pass"] is False, \
+        "invariant suite must report failure (Req 3 + Req 4 fail)"
+    assert out["tests_invariants"]["count"] == 1, (
+        f"expected 1 of 3 invariants to pass (Req 2 only); got "
+        f"{out['tests_invariants']['count']}"
+    )
+    rubric = out["rubric"]
+    assert rubric["requirement_coverage"]["auto_pts"] == 18, (
+        f"partial coverage must score per-test, not all-or-none; got "
+        f"{rubric['requirement_coverage']['auto_pts']}"
+    )
+    # test_correctness still all-or-none (visible pass + invariant fail
+    # → partial credit 14, the existing rule).
+    assert rubric["test_correctness"]["auto_pts"] == 14
+
+
 def test_workflow_reference_validates_under_repo_skills():
     """workflow-reference.yaml must validate against project_root=fixture
     using the camflow-repo's skills/ dir as fallback (analyzer,

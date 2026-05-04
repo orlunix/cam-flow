@@ -109,10 +109,12 @@ def score_run(fixture: Path, pristine: Path) -> dict:
     cf = detect_camflow_artifacts(fixture)
 
     # Requirement coverage (35): 1 visible req + 3 invariant reqs.
-    visible_passed = min(1, visible_count) if visible_pass else 0
-    invariant_passed = (invariant_count if invariant_pass
-                        else 0)
-    invariant_passed = min(invariant_passed, 3)
+    # Per-test, NOT all-or-none: if 2 of 3 invariants pass, those 2
+    # requirements are satisfied. Pytest exits non-zero whenever any
+    # test in the run failed, so we must NOT gate on the suite's
+    # exit status here — only on the parsed "N passed" count.
+    visible_passed = min(visible_count, 1)
+    invariant_passed = min(invariant_count, 3)
     req_pts = round(35 * (visible_passed + invariant_passed) / 4)
 
     # Test correctness (20).
