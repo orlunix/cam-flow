@@ -321,6 +321,22 @@ class TestBuiltinPlanner:
                 f"verify.command guidance)."
             )
 
+    def test_workflow_designer_has_replan_context_section(self):
+        """Per codex-blind-maze-oracle Phase A: when the user prompt
+        carries a `# Replan Context` block (operator ran
+        `camflow replan` after a halt), the designer must know to
+        treat it as re-design context, not noise."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "workflow_designer" /
+                     "SKILL.md")
+        assert "# Replan Context" in text
+        # Must distinguish local vs. structural fixes so the replan
+        # doesn't gratuitously redesign on every halt.
+        normalized = " ".join(text.split()).lower()
+        assert "local" in normalized and "structural" in normalized
+        # Must reference dag_revisions/ replay so the LLM understands
+        # why minimal-diff replans are preferred.
+        assert "dag_revisions" in text
+
     def test_workflow_designer_has_implement_per_spec_recipe(self):
         """The 'implement code per spec' shape — analyzer / implementer /
         audit / reviewer — must be present as a named recipe so Planner

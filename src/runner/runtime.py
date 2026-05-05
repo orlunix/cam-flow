@@ -790,13 +790,21 @@ def exec_tool(tool_path: Path, input_dict: dict, workspace: Path) -> dict:
         (workspace / "agent_output.json").write_text(text or "")
         (workspace / "raw_stdout.txt").write_text(text or "")
 
+    # Surface dag_revision in env too — convenient for tool wrappers
+    # that prefer env vars (curl bodies, simple shells) over JSON
+    # parsing. The same value is also in the JSON stdin under
+    # "dag_revision" for tools that already parse the input dict.
+    rev = input_dict.get("dag_revision")
+    env = {**os.environ, "CAMFLOW_WORKSPACE": str(workspace)}
+    if rev is not None:
+        env["CAMFLOW_DAG_REVISION"] = str(rev)
     try:
         proc = subprocess.run(
             [str(tool_path)],
             input=json.dumps(input_dict),
             capture_output=True, text=True,
             cwd=str(workspace),
-            env={**os.environ, "CAMFLOW_WORKSPACE": str(workspace)},
+            env=env,
             timeout=600,
         )
     except subprocess.TimeoutExpired as e:
@@ -1141,6 +1149,10 @@ class Node:
             rendered["upstream"] = upstream
         if attempt_n > 1 and self.history:
             rendered["previous"] = self.history[-1]
+        # Tools that talk to external systems (e.g. an oracle that
+        # tracks dag_revisions) need to know which DAG revision is
+        # active. Skill agents reading input.json get the same signal.
+        rendered["dag_revision"] = workflow.dag_revision
         (att_dir / "input.json").write_text(
             json.dumps(rendered, indent=2, ensure_ascii=False)
         )
@@ -1251,6 +1263,7 @@ class Workflow:
 
     def __init__(self, spec: dict, run_dir: Path,
                  *, resume: bool = False,
+                 replan: bool = False,
                  project_root: Optional[Path] = None):
         self.spec = spec
         self.run_dir = run_dir
@@ -1291,7 +1304,16 @@ class Workflow:
         self._is_user_workflow = self._detect_user_workflow_role()
         self.dag_revision: int = 1
 
-        if not resume:
+        if replan:
+            # Replan: caller (camflow replan) has already written the new
+            # active workflow.yaml AND recorded dag_revisions/<N>/. Pick
+            # up that revision; preserve the existing trace.jsonl so the
+            # halt-then-replan story stays continuous on disk.
+            if self.trace_path.exists():
+                self.step_n = sum(1 for _ in self.trace_path.open())
+            if self._is_user_workflow:
+                self.dag_revision = self._latest_recorded_revision() or 1
+        elif not resume:
             (run_dir / "workflow.yaml").write_text(
                 yaml.safe_dump(spec, sort_keys=False)
             )
@@ -1591,7 +1613,8 @@ class Workflow:
 
 def run_workflow(workflow: dict, run_dir: Path,
                  *, resume_with_run: Optional["Workflow"] = None,
-                 max_attempts: Optional[int] = None) -> str:
+                 max_attempts: Optional[int] = None,
+                 replan: bool = False) -> str:
     """Execute a workflow → return final lifecycle state ('done' or 'halted').
 
     `resume_with_run` is for the resume command — caller pre-builds a
@@ -1599,9 +1622,13 @@ def run_workflow(workflow: dict, run_dir: Path,
 
     `max_attempts` (debug): halt cleanly after that many node-attempts
     via a breakpoint-kind halt. Resume continues from there.
+
+    `replan` is for the replan command — caller has already written
+    the new active workflow.yaml + recorded dag_revisions/<N>/, so
+    Workflow skips those side effects and reuses the existing run_dir.
     """
     wf = resume_with_run if resume_with_run is not None else \
-        Workflow(workflow, run_dir)
+        Workflow(workflow, run_dir, replan=replan)
     if resume_with_run is None:
         wf.trace("workflow_started", run_id=wf.run_id)
     try:
@@ -2028,6 +2055,290 @@ def _cmd_run(argv: list[str]) -> int:
 
     print(f"executing compiled workflow → {run_dir}", file=sys.stderr)
     result = run_workflow(user_spec, run_dir, max_attempts=args.steps)
+    print(f"result: {result}", file=sys.stderr)
+    return _result_to_exit(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  REPLAN — manual halt-time Planner re-entry (Phase A)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Phase A: prompt-based Planner re-entry on a halted run dir. The
+# operator types `camflow replan <run_dir>`; this function:
+#   1. Reads the halt artifacts + prior compiled workflow.yaml + the
+#      original user prompt.
+#   2. Builds a "Replan Context" block summarising what halted and why.
+#   3. Re-invokes the existing builtin Planner workflow with the
+#      original prompt + that context.
+#   4. Records the new compiled workflow.yaml as
+#      dag_revisions/<N+1>/ with parent_revision=N and
+#      reason="manual_replan_after_halt".
+#   5. Archives the prior nodes/ + halt.json into
+#      dag_revisions/<N>/ for replay.
+#   6. Re-executes the new DAG (conservative: re-run all nodes; per
+#      supplement §4.4, until invalidation rules exist).
+#
+# This is **logical Planner re-entry**, NOT full Planner residency:
+# the Planner workflow is invoked again (a second time, with extended
+# context) — there's no resident Planner process. Auto-replan triggered
+# from runtime on halt is deferred to Phase B.
+
+_REPLAN_CONTEXT_HEADER = "# Replan Context"
+_REPLAN_RECENT_TRACE_LIMIT = 30
+
+
+def _build_replan_context(prior_workflow_yaml: str,
+                          halt_info: dict,
+                          recent_events: list[dict],
+                          prior_revision: int) -> str:
+    """Build the replan-context prompt block appended to the user's
+    original prompt before re-invoking the Planner workflow."""
+    halted_node = halt_info.get("halted_node", "?")
+    kind = halt_info.get("kind", "halt")
+    reason = halt_info.get("reason", "")
+    env = halt_info.get("envelope") or {}
+    feedback = env.get("feedback") or (env.get("error") or {}).get("message") or ""
+    err_code = (env.get("error") or {}).get("code") or ""
+
+    lines = [_REPLAN_CONTEXT_HEADER]
+    lines.append(
+        f"The prior CamFlow run halted at dag_revision {prior_revision}. "
+        f"This is a replan request: re-design the workflow to address "
+        f"the halt and complete the original objective. Same overall "
+        f"goal as the user's original prompt above; do NOT silently "
+        f"drop requirements."
+    )
+    lines.append("")
+    lines.append("## What halted")
+    lines.append(f"- node: `{halted_node}`")
+    lines.append(f"- kind: `{kind}`")
+    if reason:
+        lines.append(f"- reason: {reason}")
+    if err_code:
+        lines.append(f"- error code: {err_code}")
+    if feedback:
+        # Truncate long feedback to keep the planner prompt bounded.
+        snippet = feedback if len(feedback) <= 800 else feedback[:797] + "..."
+        lines.append("- feedback / error message:")
+        lines.append("  ```")
+        for ln in snippet.splitlines():
+            lines.append(f"  {ln}")
+        lines.append("  ```")
+    lines.append("")
+    lines.append(f"## Prior compiled workflow.yaml (revision {prior_revision})")
+    lines.append("```yaml")
+    # Keep prior YAML bounded too — it can be large for big DAGs.
+    yaml_snippet = (prior_workflow_yaml if len(prior_workflow_yaml) <= 4000
+                    else prior_workflow_yaml[:3997] + "...")
+    lines.append(yaml_snippet)
+    lines.append("```")
+    if recent_events:
+        lines.append("")
+        lines.append(
+            f"## Recent trace events (last {len(recent_events)})")
+        lines.append("```")
+        for e in recent_events:
+            lines.append(json.dumps(e, ensure_ascii=False))
+        lines.append("```")
+    lines.append("")
+    lines.append(
+        "Decide whether the halt was a local issue (fix the failing "
+        "node's plan) or a structural one (the DAG itself was wrong — "
+        "different decomposition / different verify gates / different "
+        "skills needed). Emit a new compiled workflow.yaml accordingly. "
+        "If the prior plan was nearly right, copy as much of it as "
+        "remains valid; don't redesign for the sake of it."
+    )
+    return "\n".join(lines)
+
+
+def _archive_prior_revision_artifacts(run_dir: Path,
+                                      prior_revision: int) -> None:
+    """Move the about-to-be-stale artifacts (nodes/, halt.json) into
+    the prior revision's dag_revisions slot so replay tools can
+    reconstruct what each revision actually executed."""
+    rev_dir = (run_dir / "dag_revisions"
+               / f"{prior_revision:04d}")
+    rev_dir.mkdir(parents=True, exist_ok=True)
+    nodes_src = run_dir / "nodes"
+    if nodes_src.is_dir():
+        nodes_dest = rev_dir / "nodes"
+        if nodes_dest.exists():
+            # Already archived once — leave the previous archive intact;
+            # rename with a numeric suffix so we don't clobber.
+            n = 2
+            while (rev_dir / f"nodes-{n}").exists():
+                n += 1
+            nodes_dest = rev_dir / f"nodes-{n}"
+        nodes_src.rename(nodes_dest)
+    halt_src = run_dir / "halt.json"
+    if halt_src.exists():
+        (rev_dir / "halt.json").write_text(halt_src.read_text())
+        halt_src.unlink()
+
+
+def _cmd_replan(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(
+        prog="camflow replan",
+        description=(
+            "Re-invoke the Planner on a halted run with halt context, "
+            "record a new DAG revision, and execute it. Manual only — "
+            "automatic halt-time replan is Phase B (not implemented)."))
+    p.add_argument("run_dir",
+                   help="path to the halted run dir (.camflow/run/)")
+    p.add_argument("--steps", type=int, default=None,
+                   help="(debug) halt cleanly after N node-attempts")
+    args = p.parse_args(argv)
+
+    run_dir = Path(args.run_dir).resolve()
+    if not run_dir.is_dir():
+        print(f"ERROR: run dir not found: {run_dir}", file=sys.stderr)
+        return 1
+    halt_path = run_dir / "halt.json"
+    if not halt_path.exists():
+        print(
+            f"ERROR: replan needs a halted run (no halt.json at "
+            f"{halt_path}). For a clean run, use `camflow run`. For a "
+            f"single-node retry, use `camflow resume`.",
+            file=sys.stderr)
+        return 1
+    prompt_path = run_dir / "prompt.txt"
+    if not prompt_path.exists():
+        print(
+            f"ERROR: original user prompt not found at {prompt_path}; "
+            f"replan needs the original prompt to preserve the goal.",
+            file=sys.stderr)
+        return 1
+    workflow_path = run_dir / "workflow.yaml"
+    if not workflow_path.exists():
+        print(
+            f"ERROR: prior workflow.yaml missing at {workflow_path}; "
+            f"replan operates on an existing compiled workflow.",
+            file=sys.stderr)
+        return 1
+
+    try:
+        halt_info = json.loads(halt_path.read_text())
+    except json.JSONDecodeError as e:
+        print(f"ERROR: halt.json is not valid JSON: {e}", file=sys.stderr)
+        return 1
+    original_prompt = prompt_path.read_text()
+    prior_yaml_text = workflow_path.read_text()
+
+    # Determine prior revision number from disk.
+    rev_dir = run_dir / "dag_revisions"
+    prior_revision = 1
+    if rev_dir.is_dir():
+        nums = []
+        for sub in rev_dir.iterdir():
+            if sub.is_dir() and sub.name.isdigit():
+                nums.append(int(sub.name))
+        if nums:
+            prior_revision = max(nums)
+    new_revision = prior_revision + 1
+
+    # Pull recent trace events for the replan context.
+    events = _read_trace_events(run_dir / "trace.jsonl")
+    recent = events[-_REPLAN_RECENT_TRACE_LIMIT:]
+
+    # Build the extended prompt the Planner sees.
+    replan_block = _build_replan_context(
+        prior_yaml_text, halt_info, recent, prior_revision)
+    extended_prompt = f"{original_prompt.strip()}\n\n{replan_block}\n"
+
+    # ── Phase 1: re-invoke the Planner workflow ─────────────────────
+    planner_dir = _builtin_planner_dir()
+    planner_yaml = planner_dir / "workflow.yaml"
+    if not planner_yaml.exists():
+        print(f"ERROR: builtin Planner missing at {planner_yaml}",
+              file=sys.stderr)
+        return 1
+    planner_spec = yaml.safe_load(planner_yaml.read_text())
+    base_ctx = planner_spec.get("context") or ""
+    planner_spec["context"] = (
+        f"# Original user prompt + replan context\n"
+        f"{extended_prompt.strip()}\n\n---\n\n{base_ctx}"
+    )
+
+    errors = validate_workflow(planner_spec, project_root=planner_dir)
+    if errors:
+        for e in errors:
+            print(f"ERROR (Planner): {e}", file=sys.stderr)
+        return 1
+
+    # Each replan gets its own planner sub-dir to keep the prior
+    # Planner artifacts intact for replay/debug.
+    planner_run_dir = run_dir / f"planner-rev{new_revision}"
+    print(f"replanning via Planner → {planner_run_dir}", file=sys.stderr)
+    planner_wf = Workflow(planner_spec, planner_run_dir,
+                          project_root=planner_dir)
+    planner_wf.trace("workflow_started", run_id=planner_wf.run_id,
+                     role="planner-replan",
+                     parent_revision=prior_revision,
+                     new_revision=new_revision)
+    try:
+        planner_result = planner_wf.execute_dag()
+    finally:
+        planner_wf.cleanup()
+
+    if planner_result != "done":
+        print(f"Planner halted during replan ({planner_result}). See "
+              f"{planner_run_dir}/halt.json for details. Original "
+              f"halted run dir is unchanged.", file=sys.stderr)
+        return _result_to_exit(planner_result)
+
+    render_node = planner_wf.nodes_by_id.get("render_yaml")
+    if render_node is None or not render_node.output:
+        print("ERROR: Planner finished but produced no render_yaml output",
+              file=sys.stderr)
+        return 1
+    yaml_text = (render_node.output.get("data") or {}).get("yaml_text")
+    if not yaml_text:
+        print("ERROR: Planner's render_yaml output is missing yaml_text",
+              file=sys.stderr)
+        return 1
+
+    # Resolve project root (the .camflow ancestor of the user run dir)
+    # so user-skill / user-tool resolution lines up with `camflow run`.
+    parts = run_dir.resolve().parts
+    if ".camflow" in parts:
+        idx = parts.index(".camflow")
+        project_root = Path(*parts[:idx]) if idx > 0 else Path("/")
+    else:
+        project_root = Path.cwd().resolve()
+
+    try:
+        user_spec = parse_workflow_yaml(yaml_text, project_root=project_root)
+    except WorkflowParseError as e:
+        print(f"ERROR: Planner produced invalid YAML on replan: {e}",
+              file=sys.stderr)
+        return 1
+
+    # ── Phase 2: archive prior revision's runtime artifacts ─────────
+    _archive_prior_revision_artifacts(run_dir, prior_revision)
+
+    # ── Phase 3: write the new active workflow.yaml + record rev ────
+    workflow_path.write_text(yaml.safe_dump(user_spec, sort_keys=False))
+    new_rev_dir = run_dir / "dag_revisions" / f"{new_revision:04d}"
+    new_rev_dir.mkdir(parents=True, exist_ok=True)
+    (new_rev_dir / "workflow.yaml").write_text(workflow_path.read_text())
+    manifest = {
+        "revision": new_revision,
+        "parent_revision": prior_revision,
+        "reason": "manual_replan_after_halt",
+        "workflow_goal": user_spec.get("goal"),
+        "halted_node": halt_info.get("halted_node"),
+        "halt_kind": halt_info.get("kind"),
+    }
+    (new_rev_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False)
+    )
+
+    # ── Phase 4: execute the new DAG ─────────────────────────────────
+    print(f"executing replanned workflow (revision {new_revision}) → "
+          f"{run_dir}", file=sys.stderr)
+    result = run_workflow(user_spec, run_dir,
+                          max_attempts=args.steps, replan=True)
     print(f"result: {result}", file=sys.stderr)
     return _result_to_exit(result)
 
@@ -2482,6 +2793,9 @@ def main(argv: list[str] | None = None) -> int:
             "                                           use --run-dir to point elsewhere)\n"
             "  camflow resume <run_dir>              resume a halted run\n"
             "  camflow resume <run_dir> --steps N    resume but advance only N more attempts\n"
+            "  camflow replan <run_dir>              re-invoke Planner on a halted run, record a new\n"
+            "                                          DAG revision, and execute it (manual halt-time\n"
+            "                                          replan; auto-replan is Phase B)\n"
             "  camflow status                        read-only summary of ./.camflow/run/\n"
             "  camflow status --json                 machine-readable summary\n"
             "  camflow status --events N             include last N trace events\n"
@@ -2498,6 +2812,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_run(argv[1:])
     if cmd == "resume":
         return _cmd_resume(argv[1:])
+    if cmd == "replan":
+        return _cmd_replan(argv[1:])
     if cmd == "status":
         return _cmd_status(argv[1:])
     print(f"ERROR: unknown subcommand '{cmd}'. "

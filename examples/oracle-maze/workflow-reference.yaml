@@ -1,0 +1,61 @@
+workflow: oracle_maze_solve
+version: "1.1"
+
+# Reference DAG: a plausible shape Planner might produce for this
+# fixture's PROMPT.txt. The solver node is a skill so the agent can
+# scan, probe iteratively, and decide a path. It then calls
+# maze_submit (via the wrapper or curl directly). On rev 1 the
+# oracle halts; rev 2 (after `camflow replan`) submits again and
+# succeeds.
+
+goal: "Reach maze_status.solved=true on dag_revision >= 2 by inferring the hidden 5-step path through probes and submitting it."
+
+context: |
+  Original task: solve the camflow-blind-maze-oracle.
+  Oracle base URL: $CAMFLOW_ORACLE_BASE_URL
+  Session id:     $CAMFLOW_ORACLE_SESSION_ID
+  Path length:    5 (verify via maze_scan)
+  Action set:     N, E, S, W
+  Tool wrappers:  scripts/maze_{scan,probe,submit,status}.sh
+  Each wrapper reads CAMFLOW_DAG_REVISION from env and emits a
+  CamFlow envelope with data=<oracle response>.
+
+  Important: the oracle deliberately halts the FIRST submit on
+  dag_revision=1 even when the path is correct. The solve must
+  come from dag_revision>=2 — the operator runs `camflow replan`
+  between the halt and the second attempt.
+
+nodes:
+  - id: solver
+    goal: "Scan the maze, probe to infer the 5-step path, and submit it. Report the inferred path so a replan can re-use it."
+    steps:
+      - "Run scripts/maze_scan.sh to confirm path_length=5 and exits."
+      - "Use scripts/maze_probe.sh iteratively (depth-first style) to narrow down each step of the path."
+      - "Once a full 5-step path is justified by the probes, call scripts/maze_submit.sh with that path."
+      - "If the oracle responds with halt=true (expected on dag_revision=1), report status=fail with the inferred path in data so the replan can re-use it."
+    run:
+      skill: code_writer
+    output_schema:
+      path: array
+      submit_response: string
+    verify:
+      command: |
+        # Verify only succeeds when the oracle reports solved=true.
+        bash scripts/maze_status.sh \
+          | jq -e '.data.solved == true' >/dev/null
+    retry: 1
+
+  - id: confirm
+    goal: "Confirm the maze is solved by reading maze_status (audit envelope)."
+    needs: [solver]
+    steps:
+      - "Run scripts/maze_status.sh from the project root."
+      - "Emit envelope with data.solved, data.event_counts."
+    run:
+      tool: scripts/maze_status.sh
+    output_schema:
+      ok: boolean
+      solved: boolean
+    verify:
+      command: 'test "$(jq -r .data.solved agent_output.json)" = "true"'
+    retry: 1

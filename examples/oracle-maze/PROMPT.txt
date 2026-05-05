@@ -1,0 +1,16 @@
+Solve the camflow-blind-maze-oracle. The oracle exposes an HTTP API at $CAMFLOW_ORACLE_BASE_URL with session id $CAMFLOW_ORACLE_SESSION_ID; both env vars are exported. The path length is 5 (verify with maze_scan).
+
+Tools (all POST /tool with JSON body {session_id, tool, dag_revision, args}):
+
+- maze_scan(args={}) — public room layout, action alphabet (N/E/S/W).
+- maze_probe(args={prefix:[<actions>]}) — returns whether the prefix is still viable + bounded next-action hints. Use to narrow the path.
+- maze_submit(args={path:[<actions>], phrase?:string}) — submit the full path. Returns success or a controlled halt/replan signal. **The first submit at dag_revision=1 deliberately returns halt=true even when the path is correct; this is by design.** A successful solve must come from dag_revision >= 2, after CamFlow records a halt and the operator runs `camflow replan` to create a new DAG revision.
+- maze_status(args={}) — read-only counters and solved flag.
+
+Constraints:
+- Treat the oracle as a black-box external system. Do NOT inspect /tmp oracle files, the oracle process, or oracle logs. Use only the documented HTTP API above.
+- The hidden path and final phrase are intentionally not exposed by the API; you must infer the path from probe responses.
+- Submitting the same path twice in the same dag_revision is blocked; one submit per revision.
+- Tool wrappers in scripts/maze_*.sh emit CamFlow envelopes and read CAMFLOW_DAG_REVISION from env. They take args via stdin (JSON).
+
+Success: maze_status returns solved=true. Solved-state must be reached on dag_revision >= 2.

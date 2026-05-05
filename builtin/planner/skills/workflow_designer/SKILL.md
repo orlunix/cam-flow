@@ -488,3 +488,33 @@ trivial rename), a 2-node analyzer+implementer DAG is fine.
 common: missing dependencies, orphan nodes, infeasible decomposition,
 referenced a skill that doesn't exist, fell back to `verify: agent`
 on a node where a deterministic test command was available.
+
+## On replan (`# Replan Context` block in the prompt)
+
+If your prompt includes a `# Replan Context` section, you are being
+re-invoked because a prior compiled workflow halted. The same
+Workflow.goal still applies — do NOT silently drop requirements.
+Read the context to understand:
+
+- which node halted, and the halt kind (`halt` = retry exhausted /
+  request_human; `breakpoint` = `--steps` debug stop);
+- the prior DAG (it's quoted under `## Prior compiled workflow.yaml`);
+- the recent trace events around the halt.
+
+Decide whether the halt was:
+
+- **local**: the failing node's plan was wrong (bad verify command,
+  missing upstream data, wrong skill, wrong retry budget). Most of
+  the prior DAG should remain — change just the failing node's
+  plan, copy the rest. This is by far the common case.
+- **structural**: the DAG itself was wrong (missing decomposition
+  step, wrong audit shape, deterministic gate skipped, evidence trail
+  too thin for the reviewer to confirm Workflow.goal). Re-design the
+  affected slice; preserve nodes upstream of the halt that were
+  already producing valid envelopes.
+
+Don't re-design for the sake of it — if the prior plan was nearly
+right, the new revision should look mostly like the prior one with
+the targeted fix. The runtime records every revision under
+`dag_revisions/<NNNN>/` so a downstream replay tool can compare
+revisions; gratuitous rewrites make replay harder.

@@ -2418,3 +2418,352 @@ class TestStatus:
             f"  added/removed: {set(before) ^ set(after)}\n"
             f"  changed: { {k for k in before & after.keys() if before[k] != after[k]} }"
         )
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  TestToolDagRevisionInjection — Phase A oracle-maze plumbing
+# ───────────────────────────────────────────────────────────────────────
+
+class TestToolDagRevisionInjection:
+    """Tools that talk to external systems need to know which DAG
+    revision is active. Per codex-blind-maze-oracle Phase A, runtime
+    must surface dag_revision both as an env var (CAMFLOW_DAG_REVISION)
+    and as a JSON field in the tool's stdin (dag_revision)."""
+
+    def _make_proj_with_echo_tool(self, tmp_path: Path) -> Path:
+        proj = tmp_path / "proj"
+        scripts = proj / "scripts"
+        scripts.mkdir(parents=True)
+        # Tool that echoes back what it sees. We capture the env var
+        # and the input dict's dag_revision into the data envelope.
+        body = (
+            r'''
+input_json=$(cat)
+ev="${CAMFLOW_DAG_REVISION:-MISSING}"
+rev=$(echo "$input_json" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('dag_revision','MISSING'))")
+cat <<EOF
+{"status":"success","data":{"env_rev":"$ev","input_rev":"$rev"},"error":null,"feedback":null,"request_human":false}
+EOF
+'''
+        )
+        make_executable_tool(scripts / "echo.sh", body)
+        return proj
+
+    def test_env_and_input_carry_dag_revision_on_fresh_run(self, tmp_path):
+        proj = self._make_proj_with_echo_tool(tmp_path)
+        wf = {
+            "workflow": "wf", "version": "1.1",
+            "goal": "Capture dag_revision in tool input.",
+            "nodes": [{
+                "id": "x", "goal": "g", "steps": ["echo"],
+                "run": {"tool": "scripts/echo.sh"},
+                "output_schema": {"env_rev": "string",
+                                  "input_rev": "string"},
+                "verify": {"command": "true"},
+            }],
+        }
+        rd = proj / ".camflow" / "run"
+        result = run_workflow(wf, rd)
+        assert result == "done"
+        out = json.loads(
+            (rd / "nodes" / "x" / "attempt-1" / "output.json").read_text()
+        )
+        # Both channels deliver the same revision number.
+        assert out["data"]["env_rev"] == "1", out
+        assert out["data"]["input_rev"] == "1", out
+
+    def test_input_json_includes_dag_revision_field(self, tmp_path):
+        """Skill nodes don't get the env var (camc agents read input.json
+        from disk inside their tmux session) — but they DO see the
+        dag_revision field in input.json. Verify the field is written."""
+        proj = self._make_proj_with_echo_tool(tmp_path)
+        wf = {
+            "workflow": "wf", "version": "1.1",
+            "nodes": [{
+                "id": "x", "goal": "g", "steps": ["echo"],
+                "run": {"tool": "scripts/echo.sh"},
+                "verify": {"command": "true"},
+                "output_schema": {"env_rev": "string", "input_rev": "string"},
+            }],
+        }
+        rd = proj / ".camflow" / "run"
+        run_workflow(wf, rd)
+        inp = json.loads(
+            (rd / "nodes" / "x" / "attempt-1" / "input.json").read_text())
+        assert inp["dag_revision"] == 1
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  TestReplan — manual halt-time Planner re-entry (Phase A)
+# ───────────────────────────────────────────────────────────────────────
+
+class TestReplan:
+    """`camflow replan <run_dir>` — manual halt-time Planner re-entry.
+    Per codex-blind-maze-oracle Phase A. Auto-replan is Phase B and
+    NOT covered here. These tests stub the Planner workflow with a
+    canned new spec so they're deterministic + LLM-free."""
+
+    def _stage_halted_run(self, tmp_path: Path,
+                          *, halt_kind: str = "halt") -> Path:
+        """Synthesize a halted user run dir without touching Workflow."""
+        proj = tmp_path / "proj"
+        scripts = proj / "scripts"
+        scripts.mkdir(parents=True)
+        # A simple tool node that always succeeds — used by the
+        # replanned (rev 2) workflow.
+        make_executable_tool(
+            scripts / "ok.sh",
+            envelope_tool_body({"value": 42}),
+        )
+
+        rd = proj / ".camflow" / "run"
+        rd.mkdir(parents=True)
+        # Original prompt persisted by camflow run.
+        (rd / "prompt.txt").write_text("solve the maze")
+        # Prior compiled workflow.yaml (rev 1).
+        prior_spec = {
+            "workflow": "rev1", "version": "1.1",
+            "goal": "Solve the maze.",
+            "nodes": [{
+                "id": "submit", "goal": "submit path",
+                "steps": ["s"],
+                "run": {"tool": "scripts/ok.sh"},
+                "output_schema": {"value": "integer"},
+                "verify": {"command": "true"},
+            }],
+        }
+        (rd / "workflow.yaml").write_text(
+            yaml.safe_dump(prior_spec, sort_keys=False))
+        # Initial revision recording (matches Workflow.__init__ behavior).
+        (rd / "dag_revisions" / "0001").mkdir(parents=True)
+        (rd / "dag_revisions" / "0001" / "workflow.yaml").write_text(
+            yaml.safe_dump(prior_spec, sort_keys=False))
+        (rd / "dag_revisions" / "0001" / "manifest.json").write_text(
+            json.dumps({
+                "revision": 1, "parent_revision": None,
+                "reason": "initial_plan",
+                "workflow_goal": "Solve the maze.",
+            }))
+        # Some prior nodes/ artifacts (rev 1 attempt that "failed").
+        att = rd / "nodes" / "submit" / "attempt-1"
+        att.mkdir(parents=True)
+        (att / "output.json").write_text(json.dumps({
+            "status": "fail",
+            "error": {"code": "ORACLE_HALT",
+                      "message": "first submit halts even when correct"},
+            "feedback": "rev=1 halt by design",
+        }))
+        # Trace + halt.json.
+        events = [
+            {"step": 1, "ts": "t", "event": "workflow_started",
+             "dag_revision": 1},
+            {"step": 2, "ts": "t", "event": "node_started",
+             "node": "submit", "attempt": 1, "dag_revision": 1},
+            {"step": 3, "ts": "t", "event": "node_failed",
+             "node": "submit", "attempt": 1, "reason": "oracle halt",
+             "dag_revision": 1},
+            {"step": 4, "ts": "t", "event": "workflow_halted",
+             "node": "submit", "reason": "request_human or halt",
+             "dag_revision": 1},
+        ]
+        (rd / "trace.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in events) + "\n")
+        halt_info = {
+            "halted_node": "submit",
+            "kind": halt_kind,
+            "reason": "oracle returned halt=true at rev 1",
+            "envelope": {
+                "status": "fail",
+                "error": {"code": "ORACLE_HALT",
+                          "message": "first submit halts at rev 1"},
+                "feedback": "submit again on a fresh dag_revision",
+            },
+        }
+        (rd / "halt.json").write_text(json.dumps(halt_info))
+        return rd
+
+    def _stub_planner(self, monkeypatch, new_yaml: str,
+                      *, capture: dict | None = None) -> None:
+        """Patch _cmd_replan's Planner re-entry path so it returns
+        new_yaml without spawning real camc agents."""
+        from runner import runtime as rt
+
+        orig_workflow_cls = rt.Workflow
+
+        class _StubWorkflow:
+            def __init__(self, spec, run_dir, *, project_root=None,
+                         resume=False, replan=False):
+                self.spec = spec
+                self.run_dir = Path(run_dir)
+                self.run_dir.mkdir(parents=True, exist_ok=True)
+                self.run_id = "stub-planner"
+                self.dag_revision = 1
+                self._is_user_workflow = False
+                self.nodes_by_id = {
+                    "render_yaml": type("N", (), {
+                        "id": "render_yaml",
+                        "output": {
+                            "status": "success",
+                            "data": {"yaml_text": new_yaml},
+                        },
+                    })()
+                }
+                if capture is not None:
+                    capture["spec"] = spec
+                    capture["context"] = spec.get("context", "")
+
+            def trace(self, *args, **kwargs):  # noqa: ARG002
+                pass
+
+            def execute_dag(self, *, max_attempts=None):  # noqa: ARG002
+                # Pretend the planner sub-workflow ran cleanly.
+                return "done"
+
+            def cleanup(self):
+                pass
+
+        # Only stub when invoked under planner-rev<N> sub-dir; the user
+        # workflow.yaml execution must use the real Workflow class so we
+        # can verify replan semantics on disk.
+        original_init = orig_workflow_cls.__init__
+
+        def patched_init(self, spec, run_dir, *, resume=False,
+                         replan=False, project_root=None):
+            rd = Path(run_dir).resolve()
+            if "planner-rev" in rd.name:
+                # Hand off to the stub by mutating self into a stub clone.
+                stub = _StubWorkflow(spec, rd, project_root=project_root,
+                                     resume=resume, replan=replan)
+                self.__class__ = _StubWorkflow
+                self.__dict__.update(stub.__dict__)
+                return
+            original_init(self, spec, rd, resume=resume, replan=replan,
+                          project_root=project_root)
+
+        monkeypatch.setattr(rt.Workflow, "__init__", patched_init)
+
+    def test_replan_creates_revision_2_and_executes(self, tmp_path,
+                                                     monkeypatch):
+        from runner.runtime import _cmd_replan
+        rd = self._stage_halted_run(tmp_path)
+        # New rev2 spec — same single node, succeeds at rev 2.
+        new_yaml = (
+            "workflow: rev2\n"
+            "version: \"1.1\"\n"
+            "goal: \"Solve the maze (revision 2 after halt).\"\n"
+            "nodes:\n"
+            "  - id: submit\n"
+            "    goal: \"submit at rev 2\"\n"
+            "    steps: [\"s\"]\n"
+            "    run: {tool: scripts/ok.sh}\n"
+            "    output_schema: {value: integer}\n"
+            "    verify: {command: \"true\"}\n"
+        )
+        self._stub_planner(monkeypatch, new_yaml)
+        rc = _cmd_replan([str(rd)])
+        assert rc == 0
+
+        # dag_revisions/0002/ created.
+        rev2 = rd / "dag_revisions" / "0002"
+        assert rev2.is_dir()
+        manifest = json.loads((rev2 / "manifest.json").read_text())
+        assert manifest["revision"] == 2
+        assert manifest["parent_revision"] == 1
+        assert manifest["reason"] == "manual_replan_after_halt"
+        assert manifest["halted_node"] == "submit"
+        # Active workflow.yaml replaced.
+        active = yaml.safe_load((rd / "workflow.yaml").read_text())
+        assert active["workflow"] == "rev2"
+        assert active["goal"].startswith("Solve the maze")
+
+        # Prior nodes/ archived under dag_revisions/0001/.
+        archived_nodes = rd / "dag_revisions" / "0001" / "nodes"
+        assert archived_nodes.is_dir()
+        assert (archived_nodes / "submit" / "attempt-1" /
+                "output.json").exists()
+        # Prior halt.json archived too.
+        assert (rd / "dag_revisions" / "0001" / "halt.json").is_file()
+        # Active halt.json gone.
+        assert not (rd / "halt.json").exists()
+
+        # Rev 2 actually executed: a fresh nodes/submit/attempt-1
+        # directory exists with success output.
+        out = json.loads(
+            (rd / "nodes" / "submit" / "attempt-1" / "output.json").read_text()
+        )
+        assert out["status"] == "success"
+        assert out["data"]["value"] == 42
+
+        # Rev 2 trace events tagged dag_revision=2.
+        events = [
+            json.loads(line) for line in
+            (rd / "trace.jsonl").read_text().splitlines() if line
+        ]
+        rev2_events = [e for e in events if e.get("dag_revision") == 2]
+        assert rev2_events, "rev 2 user-workflow events must carry dag_revision=2"
+        # And rev 1 events are still in the trace (continuous history).
+        assert any(e.get("dag_revision") == 1 for e in events)
+
+    def test_replan_rejects_when_not_halted(self, tmp_path, capsys):
+        from runner.runtime import _cmd_replan
+        rd = tmp_path / "rd"
+        rd.mkdir()
+        (rd / "prompt.txt").write_text("p")
+        (rd / "workflow.yaml").write_text("workflow: w\nversion: '1.1'\nnodes: []\n")
+        # No halt.json → replan refuses.
+        rc = _cmd_replan([str(rd)])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "halt.json" in err or "halted run" in err
+
+    def test_replan_rejects_missing_run_dir(self, tmp_path, capsys):
+        from runner.runtime import _cmd_replan
+        rc = _cmd_replan([str(tmp_path / "nope")])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "not found" in err
+
+    def test_replan_rejects_when_prompt_missing(self, tmp_path, capsys):
+        from runner.runtime import _cmd_replan
+        rd = tmp_path / "rd"
+        rd.mkdir()
+        (rd / "halt.json").write_text(json.dumps({"halted_node": "x",
+                                                   "kind": "halt"}))
+        (rd / "workflow.yaml").write_text("workflow: w\n")
+        # No prompt.txt → replan needs it to preserve the goal.
+        rc = _cmd_replan([str(rd)])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "prompt" in err
+
+    def test_replan_extends_planner_prompt_with_halt_context(self,
+                                                              tmp_path,
+                                                              monkeypatch):
+        """The planner re-entry prompt must include the # Replan
+        Context block carrying halt info + prior YAML."""
+        from runner.runtime import _cmd_replan
+        rd = self._stage_halted_run(tmp_path)
+        new_yaml = (
+            "workflow: rev2\nversion: \"1.1\"\n"
+            "goal: \"g\"\n"
+            "nodes:\n"
+            "  - id: submit\n"
+            "    goal: g\n"
+            "    steps: [s]\n"
+            "    run: {tool: scripts/ok.sh}\n"
+            "    output_schema: {value: integer}\n"
+            "    verify: {command: \"true\"}\n"
+        )
+        captured: dict = {}
+        self._stub_planner(monkeypatch, new_yaml, capture=captured)
+        rc = _cmd_replan([str(rd)])
+        assert rc == 0
+        ctx = captured.get("context", "")
+        # The planner must have seen the original prompt.
+        assert "solve the maze" in ctx
+        # And the replan-context header.
+        assert "# Replan Context" in ctx
+        # And the halted-node identity.
+        assert "submit" in ctx
+        # And a snippet of the prior YAML.
+        assert "workflow: rev1" in ctx
