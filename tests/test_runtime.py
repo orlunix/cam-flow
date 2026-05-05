@@ -2808,3 +2808,347 @@ class TestReplan:
         assert "submit" in ctx
         # And a snippet of the prior YAML.
         assert "workflow: rev1" in ctx
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  TestPhaseBAutoReplan — opt-in halt-time auto-replan
+# ───────────────────────────────────────────────────────────────────────
+
+class TestPhaseBAutoReplan:
+    """Phase B: workflows can declare `on_halt: replan` + `max_replans: N`
+    to have runtime auto-invoke `_perform_replan` on halt up to N times,
+    without operator intervention. Default behavior (no `on_halt` field
+    or explicit `manual`) is unchanged from Phase A."""
+
+    # ── validation ────────────────────────────────────────────────────
+
+    def test_validate_accepts_on_halt_replan(self):
+        from runner.runtime import validate_workflow
+        spec = {
+            "workflow": "w", "version": "1.1",
+            "on_halt": "replan", "max_replans": 2,
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"skill": "analyzer"}}],
+        }
+        assert validate_workflow(spec) == []
+
+    def test_validate_rejects_unknown_on_halt(self):
+        from runner.runtime import validate_workflow
+        spec = {
+            "workflow": "w", "version": "1.1",
+            "on_halt": "loop_forever",
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"skill": "analyzer"}}],
+        }
+        errs = validate_workflow(spec)
+        assert any("on_halt" in e for e in errs)
+
+    def test_validate_rejects_non_int_max_replans(self):
+        from runner.runtime import validate_workflow
+        spec = {
+            "workflow": "w", "version": "1.1",
+            "on_halt": "replan", "max_replans": "two",
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"skill": "analyzer"}}],
+        }
+        errs = validate_workflow(spec)
+        assert any("max_replans" in e for e in errs)
+
+    def test_validate_rejects_max_replans_above_hard_ceiling(self):
+        from runner.runtime import validate_workflow, _MAX_REPLANS_HARD_CEILING
+        spec = {
+            "workflow": "w", "version": "1.1",
+            "on_halt": "replan",
+            "max_replans": _MAX_REPLANS_HARD_CEILING + 1,
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"skill": "analyzer"}}],
+        }
+        errs = validate_workflow(spec)
+        assert any("max_replans" in e for e in errs)
+
+    # ── Workflow attribute storage ────────────────────────────────────
+
+    def test_workflow_default_on_halt_is_manual(self, tmp_path):
+        from runner.runtime import Workflow
+        spec = {
+            "workflow": "w", "version": "1.1",
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"tool": "scripts/x.sh"}}],
+        }
+        wf = Workflow(spec, tmp_path / "rd")
+        assert wf.on_halt == "manual"
+        assert wf.max_replans == 0
+
+    def test_workflow_on_halt_replan_default_max_is_1(self, tmp_path):
+        from runner.runtime import Workflow
+        spec = {
+            "workflow": "w", "version": "1.1",
+            "on_halt": "replan",
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"tool": "scripts/x.sh"}}],
+        }
+        wf = Workflow(spec, tmp_path / "rd")
+        assert wf.on_halt == "replan"
+        assert wf.max_replans == 1
+
+    def test_workflow_max_replans_clamped_to_hard_ceiling(self, tmp_path):
+        from runner.runtime import Workflow, _MAX_REPLANS_HARD_CEILING
+        spec = {
+            "workflow": "w", "version": "1.1",
+            "on_halt": "replan",
+            "max_replans": _MAX_REPLANS_HARD_CEILING + 5,
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"tool": "scripts/x.sh"}}],
+        }
+        wf = Workflow(spec, tmp_path / "rd")
+        assert wf.max_replans == _MAX_REPLANS_HARD_CEILING
+
+    # ── auto-replan execution (stubbed Planner) ───────────────────────
+
+    def _stage_halting_project(self, tmp_path: Path) -> Path:
+        """Project with a tool node that always halts (verify always
+        fails). After auto-replan installs a different node, the new
+        node succeeds. The 'replan' is implemented by the stub
+        Planner returning a different YAML."""
+        proj = tmp_path / "proj"
+        scripts = proj / "scripts"
+        scripts.mkdir(parents=True)
+        # ok.sh always succeeds.
+        make_executable_tool(
+            scripts / "ok.sh",
+            envelope_tool_body({"value": 1}),
+        )
+        # bad.sh emits a successful envelope but verify=false (gate fails).
+        make_executable_tool(
+            scripts / "bad.sh",
+            envelope_tool_body({"value": 0}),
+        )
+        return proj
+
+    def _initial_spec(self) -> dict:
+        # bad.sh + verify "false" → schema check passes, command verify fails.
+        return {
+            "workflow": "rev1", "version": "1.1",
+            "goal": "Make the run succeed even after halt.",
+            "on_halt": "replan", "max_replans": 1,
+            "nodes": [{
+                "id": "x", "goal": "g", "steps": ["s"],
+                "run": {"tool": "scripts/bad.sh"},
+                "output_schema": {"value": "integer"},
+                "verify": {"command": "false"},
+                "retry": 1,
+            }],
+        }
+
+    def _replan_spec(self) -> dict:
+        # ok.sh + verify "true" — replanned shape that succeeds.
+        return {
+            "workflow": "rev2", "version": "1.1",
+            "goal": "Make the run succeed even after halt.",
+            "on_halt": "replan", "max_replans": 1,
+            "nodes": [{
+                "id": "x", "goal": "g", "steps": ["s"],
+                "run": {"tool": "scripts/ok.sh"},
+                "output_schema": {"value": "integer"},
+                "verify": {"command": "true"},
+                "retry": 1,
+            }],
+        }
+
+    def _stub_planner(self, monkeypatch, replan_yaml: str) -> None:
+        """Patch Workflow under planner-rev<N>/ with a stub returning
+        the canned replan_yaml — same pattern as TestReplan."""
+        from runner import runtime as rt
+        orig_init = rt.Workflow.__init__
+
+        class _StubWorkflow:
+            def __init__(self, spec, run_dir, *, project_root=None,
+                         resume=False, replan=False):
+                self.spec = spec
+                self.run_dir = Path(run_dir)
+                self.run_dir.mkdir(parents=True, exist_ok=True)
+                self.run_id = "stub-planner"
+                self.dag_revision = 1
+                self._is_user_workflow = False
+                self.nodes_by_id = {
+                    "render_yaml": type("N", (), {
+                        "id": "render_yaml",
+                        "output": {
+                            "status": "success",
+                            "data": {"yaml_text": replan_yaml},
+                        },
+                    })()
+                }
+
+            def trace(self, *args, **kwargs):  # noqa: ARG002
+                pass
+
+            def execute_dag(self, *, max_attempts=None):  # noqa: ARG002
+                return "done"
+
+            def cleanup(self):
+                pass
+
+        def patched_init(self, spec, run_dir, *, resume=False,
+                         replan=False, project_root=None):
+            rd = Path(run_dir).resolve()
+            if "planner-rev" in rd.name:
+                stub = _StubWorkflow(spec, rd, project_root=project_root,
+                                     resume=resume, replan=replan)
+                self.__class__ = _StubWorkflow
+                self.__dict__.update(stub.__dict__)
+                return
+            orig_init(self, spec, rd, resume=resume, replan=replan,
+                      project_root=project_root)
+
+        monkeypatch.setattr(rt.Workflow, "__init__", patched_init)
+
+    def test_default_no_on_halt_field_no_auto_replan(self, tmp_path,
+                                                      monkeypatch):
+        """Phase B preserves Phase A: workflows without on_halt halt
+        as before; the auto-replan loop never fires."""
+        from runner.runtime import _execute_with_optional_auto_replan
+        proj = self._stage_halting_project(tmp_path)
+        rd = proj / ".camflow" / "run"
+        (rd.parent).mkdir(parents=True, exist_ok=True)
+        rd.mkdir(parents=True, exist_ok=True)
+        (rd / "prompt.txt").write_text("p")
+        spec = self._initial_spec()
+        del spec["on_halt"]
+        del spec["max_replans"]
+        # Stub the Planner so any inadvertent re-entry would be
+        # observable (it shouldn't fire).
+        self._stub_planner(monkeypatch, "should not be used")
+        result = _execute_with_optional_auto_replan(spec, rd)
+        assert result == "halted"
+        # No dag_revisions/0002 was created — Phase A behavior preserved.
+        assert not (rd / "dag_revisions" / "0002").exists()
+
+    def test_on_halt_replan_creates_revision_2_and_succeeds(
+            self, tmp_path, monkeypatch):
+        from runner.runtime import _execute_with_optional_auto_replan
+        proj = self._stage_halting_project(tmp_path)
+        rd = proj / ".camflow" / "run"
+        rd.mkdir(parents=True)
+        (rd / "prompt.txt").write_text("solve x")
+        replan_yaml_text = yaml.safe_dump(self._replan_spec(),
+                                          sort_keys=False)
+        self._stub_planner(monkeypatch, replan_yaml_text)
+
+        result = _execute_with_optional_auto_replan(
+            self._initial_spec(), rd)
+        assert result == "done", (
+            f"auto-replan should have recovered to done; got {result}"
+        )
+        rev2 = rd / "dag_revisions" / "0002"
+        assert rev2.is_dir()
+        manifest = json.loads((rev2 / "manifest.json").read_text())
+        assert manifest["reason"] == "auto_replan_after_halt"
+        assert manifest["replan_count"] == 1
+        assert manifest["parent_revision"] == 1
+
+    def test_max_replans_caps_loop(self, tmp_path, monkeypatch):
+        """If the replanned spec ALSO fails, runtime stops after
+        max_replans; it does NOT loop forever."""
+        from runner.runtime import _execute_with_optional_auto_replan
+        proj = self._stage_halting_project(tmp_path)
+        rd = proj / ".camflow" / "run"
+        rd.mkdir(parents=True)
+        (rd / "prompt.txt").write_text("solve x")
+        # Replan returns ANOTHER halting spec — same bad.sh + verify false.
+        replan_yaml_text = yaml.safe_dump(self._initial_spec(),
+                                          sort_keys=False)
+        self._stub_planner(monkeypatch, replan_yaml_text)
+
+        result = _execute_with_optional_auto_replan(
+            self._initial_spec(), rd)
+        assert result == "halted"
+        # Exactly one auto-replan was attempted (max_replans=1).
+        rev2 = rd / "dag_revisions" / "0002"
+        assert rev2.is_dir()
+        # And no rev 3 was created — the cap held.
+        assert not (rd / "dag_revisions" / "0003").exists()
+
+    def test_breakpoint_halt_does_not_trigger_auto_replan(
+            self, tmp_path, monkeypatch):
+        """Phase B auto-replan must only fire on real halts (kind=halt).
+        --steps debug breakpoints (kind=breakpoint) should never
+        trigger Planner re-entry."""
+        from runner.runtime import _execute_with_optional_auto_replan
+        proj = self._stage_halting_project(tmp_path)
+        rd = proj / ".camflow" / "run"
+        rd.mkdir(parents=True)
+        (rd / "prompt.txt").write_text("solve x")
+        self._stub_planner(monkeypatch, "should not be used")
+
+        # max_attempts=1 + retry: 1 + verify=false → hits the
+        # `breakpoint` kind via execute_dag's max_attempts path.
+        spec = self._initial_spec()
+        spec["nodes"][0]["retry"] = 3  # so the runtime breakpoints, not exhausts
+        result = _execute_with_optional_auto_replan(
+            spec, rd, max_attempts=1)
+        assert result == "halted"
+        halt = json.loads((rd / "halt.json").read_text())
+        assert halt["kind"] == "breakpoint"
+        # No auto-replan fired — breakpoints aren't real halts.
+        assert not (rd / "dag_revisions" / "0002").exists()
+
+    # ── status reporting ──────────────────────────────────────────────
+
+    def test_status_reports_replan_progress(self, tmp_path):
+        from runner.runtime import _summarize_status
+        rd = tmp_path / "rd"
+        rd.mkdir()
+        # Write a workflow.yaml that opts in.
+        (rd / "workflow.yaml").write_text(yaml.safe_dump({
+            "workflow": "w", "version": "1.1",
+            "on_halt": "replan", "max_replans": 2,
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"tool": "scripts/x.sh"}}],
+        }, sort_keys=False))
+        # Stage two recorded revisions: 0001 (initial) and 0002 (one replan).
+        (rd / "dag_revisions" / "0001").mkdir(parents=True)
+        (rd / "dag_revisions" / "0001" / "manifest.json").write_text(
+            json.dumps({"revision": 1, "parent_revision": None,
+                        "reason": "initial_plan"}))
+        (rd / "dag_revisions" / "0002").mkdir(parents=True)
+        (rd / "dag_revisions" / "0002" / "manifest.json").write_text(
+            json.dumps({"revision": 2, "parent_revision": 1,
+                        "reason": "auto_replan_after_halt",
+                        "replan_count": 1}))
+
+        s = _summarize_status(rd)
+        assert s["on_halt"] == "replan"
+        assert s["max_replans"] == 2
+        assert s["replan_count"] == 1
+
+    def test_status_human_render_shows_on_halt_line(self, tmp_path):
+        from runner.runtime import (_summarize_status,
+                                     _render_status_human)
+        rd = tmp_path / "rd"
+        rd.mkdir()
+        (rd / "workflow.yaml").write_text(yaml.safe_dump({
+            "workflow": "w", "version": "1.1",
+            "on_halt": "replan", "max_replans": 1,
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"tool": "scripts/x.sh"}}],
+        }, sort_keys=False))
+        s = _summarize_status(rd)
+        text = _render_status_human(s)
+        assert "on_halt: replan" in text
+        # Used 0/1 since no auto-replans have happened yet.
+        assert "0/1" in text or "0 / 1" in text
+
+    def test_status_human_render_omits_line_for_default_manual(self, tmp_path):
+        from runner.runtime import (_summarize_status,
+                                     _render_status_human)
+        rd = tmp_path / "rd"
+        rd.mkdir()
+        (rd / "workflow.yaml").write_text(yaml.safe_dump({
+            "workflow": "w", "version": "1.1",
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"tool": "scripts/x.sh"}}],
+        }, sort_keys=False))
+        s = _summarize_status(rd)
+        text = _render_status_human(s)
+        assert "on_halt:" not in text  # silent baseline preserved

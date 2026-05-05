@@ -49,6 +49,10 @@ VALID_TYPES = frozenset({"string", "integer", "number", "boolean", "array"})
 
 OUTPUT_FILENAME = "agent_output.json"
 
+# Phase B auto-replan hard ceiling. Even if a workflow declares
+# max_replans larger than this, runtime caps to prevent runaway loops.
+_MAX_REPLANS_HARD_CEILING = 3
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  EXPRESSIONS + TEMPLATES
@@ -236,6 +240,24 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
     # leaving it absent).
     if "goal" in wf and not isinstance(wf["goal"], str):
         errors.append("workflow.goal: must be a string when present")
+    # on_halt: opt-in auto-replan (Phase B). Default behavior (no field /
+    # explicit "manual") preserves Phase A: halt persists, operator
+    # types `camflow replan`. With "replan", runtime auto-invokes
+    # Planner re-entry on halt up to max_replans.
+    if "on_halt" in wf:
+        if wf["on_halt"] not in ("manual", "replan"):
+            errors.append(
+                "workflow.on_halt: must be \"manual\" or \"replan\" "
+                f"when present (got {wf['on_halt']!r})")
+    if "max_replans" in wf:
+        v = wf["max_replans"]
+        if isinstance(v, bool) or not isinstance(v, int):
+            errors.append(
+                "workflow.max_replans: must be an int when present")
+        elif v < 0 or v > _MAX_REPLANS_HARD_CEILING:
+            errors.append(
+                f"workflow.max_replans: must be 0..{_MAX_REPLANS_HARD_CEILING} "
+                f"(hard ceiling); got {v}")
 
     # Guard: each nodes[] element must be a dict before we can call .get().
     # Otherwise we'd raise AttributeError mid-pass and lose the rest of
@@ -1281,6 +1303,21 @@ class Workflow:
         # present it MUST be a string (validate_workflow enforces).
         self.goal: Optional[str] = (spec.get("goal")
                                     if isinstance(spec, dict) else None)
+        # Phase B opt-in auto-replan. Default behavior preserves Phase A.
+        self.on_halt: str = (
+            (spec.get("on_halt") if isinstance(spec, dict) else None)
+            or "manual"
+        )
+        # Effective max_replans: clamp to [0, hard_ceiling]. If on_halt is
+        # "replan" but no explicit max declared, default to 1 (single
+        # bounded auto-recovery — the supplement's safety-net default).
+        declared_max = (spec.get("max_replans")
+                        if isinstance(spec, dict) else None)
+        if isinstance(declared_max, int) and not isinstance(declared_max, bool):
+            self.max_replans = max(0, min(declared_max,
+                                          _MAX_REPLANS_HARD_CEILING))
+        else:
+            self.max_replans = 1 if self.on_halt == "replan" else 0
 
         self.trace_path = run_dir / "trace.jsonl"
         self.pid_path = run_dir / "runner.pid"
@@ -2066,9 +2103,85 @@ def _cmd_run(argv: list[str]) -> int:
         return 1
 
     print(f"executing compiled workflow → {run_dir}", file=sys.stderr)
-    result = run_workflow(user_spec, run_dir, max_attempts=args.steps)
+    result = _execute_with_optional_auto_replan(
+        user_spec, run_dir, max_attempts=args.steps)
     print(f"result: {result}", file=sys.stderr)
     return _result_to_exit(result)
+
+
+def _execute_with_optional_auto_replan(
+        user_spec: dict, run_dir: Path,
+        *, max_attempts: Optional[int] = None,
+        replan: bool = False) -> str:
+    """Run the user workflow; on halt, if `on_halt: replan` is declared
+    in the spec, automatically perform `_perform_replan` and re-execute
+    up to `max_replans` times. Without `on_halt: replan`, behaves
+    identically to a direct `run_workflow` call (Phase A behavior
+    preserved).
+
+    Phase B opt-in. Bounded by spec `max_replans` (clamped to
+    [0, _MAX_REPLANS_HARD_CEILING]). When the cap is reached the run
+    halts and the operator can still type `camflow replan` manually.
+    """
+    on_halt = user_spec.get("on_halt") or "manual"
+    declared_max = user_spec.get("max_replans")
+    if isinstance(declared_max, int) and not isinstance(declared_max, bool):
+        max_replans = max(0, min(declared_max, _MAX_REPLANS_HARD_CEILING))
+    else:
+        max_replans = 1 if on_halt == "replan" else 0
+
+    # First execution.
+    result = run_workflow(user_spec, run_dir,
+                          max_attempts=max_attempts, replan=replan)
+
+    if on_halt != "replan":
+        return result
+
+    replan_count = 0
+    while result == "halted" and replan_count < max_replans:
+        # Confirm halt artifact actually exists (vs. e.g. breakpoint —
+        # we only auto-replan on real halts, never on --steps debug stops).
+        halt_path = run_dir / "halt.json"
+        if not halt_path.exists():
+            break
+        try:
+            halt_info = json.loads(halt_path.read_text())
+        except json.JSONDecodeError:
+            break
+        if halt_info.get("kind") != "halt":
+            # breakpoint or unexpected kind — don't auto-replan.
+            break
+
+        replan_count += 1
+        print(f"on_halt=replan: auto-replanning (attempt "
+              f"{replan_count}/{max_replans}) → {run_dir}",
+              file=sys.stderr)
+        try:
+            outcome = _perform_replan(
+                run_dir, reason="auto_replan_after_halt",
+                replan_count=replan_count)
+        except _ReplanError as e:
+            print(f"auto-replan aborted: {e}", file=sys.stderr)
+            break
+
+        new_spec = outcome["user_spec"]
+        new_rev = outcome["new_revision"]
+        print(f"executing replanned workflow (revision {new_rev}) → "
+              f"{run_dir}", file=sys.stderr)
+        result = run_workflow(new_spec, run_dir,
+                              max_attempts=max_attempts, replan=True)
+        # Carry forward on_halt / max_replans from the new spec — the
+        # Planner may keep, raise, or drop them. Re-clamp.
+        on_halt = new_spec.get("on_halt") or "manual"
+        if on_halt != "replan":
+            break
+        nm = new_spec.get("max_replans")
+        if isinstance(nm, int) and not isinstance(nm, bool):
+            max_replans = max(replan_count,
+                              min(nm, _MAX_REPLANS_HARD_CEILING))
+        # else leave max_replans as-is.
+
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2189,13 +2302,152 @@ def _archive_prior_revision_artifacts(run_dir: Path,
         halt_src.unlink()
 
 
+class _ReplanError(Exception):
+    """Recoverable failure during a replan attempt — caller decides
+    whether to retry, report, or abort."""
+
+
+def _perform_replan(run_dir: Path, *, reason: str,
+                    replan_count: Optional[int] = None) -> dict:
+    """Shared core: re-invoke Planner with halt context, record the new
+    DAG revision, archive prior runtime artifacts, write the new active
+    workflow.yaml. Caller is responsible for actually executing the new
+    spec via run_workflow(replan=True).
+
+    Used by both `_cmd_replan` (manual CLI) and the auto-replan loop
+    (Phase B opt-in via `on_halt: replan`).
+
+    Returns: dict with `user_spec` (parsed compiled workflow) and
+    `new_revision` (int). Raises `_ReplanError` on any irrecoverable
+    failure (missing artifacts, planner halted, invalid YAML).
+    """
+    halt_path = run_dir / "halt.json"
+    if not halt_path.exists():
+        raise _ReplanError(
+            f"replan needs a halted run (no halt.json at {halt_path})")
+    prompt_path = run_dir / "prompt.txt"
+    if not prompt_path.exists():
+        raise _ReplanError(
+            f"original user prompt not found at {prompt_path}")
+    workflow_path = run_dir / "workflow.yaml"
+    if not workflow_path.exists():
+        raise _ReplanError(
+            f"prior workflow.yaml missing at {workflow_path}")
+
+    try:
+        halt_info = json.loads(halt_path.read_text())
+    except json.JSONDecodeError as e:
+        raise _ReplanError(f"halt.json is not valid JSON: {e}")
+    original_prompt = prompt_path.read_text()
+    prior_yaml_text = workflow_path.read_text()
+
+    # Determine prior revision number from disk.
+    rev_dir = run_dir / "dag_revisions"
+    prior_revision = 1
+    if rev_dir.is_dir():
+        nums = [int(sub.name) for sub in rev_dir.iterdir()
+                if sub.is_dir() and sub.name.isdigit()]
+        if nums:
+            prior_revision = max(nums)
+    new_revision = prior_revision + 1
+
+    events = _read_trace_events(run_dir / "trace.jsonl")
+    recent = events[-_REPLAN_RECENT_TRACE_LIMIT:]
+    replan_block = _build_replan_context(
+        prior_yaml_text, halt_info, recent, prior_revision)
+    extended_prompt = f"{original_prompt.strip()}\n\n{replan_block}\n"
+
+    # ── Phase 1: re-invoke Planner ──────────────────────────────────
+    planner_dir = _builtin_planner_dir()
+    planner_yaml = planner_dir / "workflow.yaml"
+    if not planner_yaml.exists():
+        raise _ReplanError(f"builtin Planner missing at {planner_yaml}")
+    planner_spec = yaml.safe_load(planner_yaml.read_text())
+    base_ctx = planner_spec.get("context") or ""
+    planner_spec["context"] = (
+        f"# Original user prompt + replan context\n"
+        f"{extended_prompt.strip()}\n\n---\n\n{base_ctx}"
+    )
+
+    errors = validate_workflow(planner_spec, project_root=planner_dir)
+    if errors:
+        raise _ReplanError(
+            "Planner spec validation failed: " + "; ".join(errors))
+
+    planner_run_dir = run_dir / f"planner-rev{new_revision}"
+    print(f"replanning via Planner → {planner_run_dir}", file=sys.stderr)
+    planner_wf = Workflow(planner_spec, planner_run_dir,
+                          project_root=planner_dir)
+    extra_trace = {"role": "planner-replan",
+                   "parent_revision": prior_revision,
+                   "new_revision": new_revision}
+    if replan_count is not None:
+        extra_trace["replan_count"] = replan_count
+    planner_wf.trace("workflow_started", run_id=planner_wf.run_id,
+                     **extra_trace)
+    try:
+        planner_result = planner_wf.execute_dag()
+    finally:
+        planner_wf.cleanup()
+
+    if planner_result != "done":
+        raise _ReplanError(
+            f"Planner halted during replan ({planner_result}); "
+            f"see {planner_run_dir}/halt.json")
+
+    render_node = planner_wf.nodes_by_id.get("render_yaml")
+    if render_node is None or not render_node.output:
+        raise _ReplanError(
+            "Planner finished but produced no render_yaml output")
+    yaml_text = (render_node.output.get("data") or {}).get("yaml_text")
+    if not yaml_text:
+        raise _ReplanError(
+            "Planner's render_yaml output is missing yaml_text")
+
+    # Resolve project root for skill/tool path validation.
+    parts = run_dir.resolve().parts
+    if ".camflow" in parts:
+        idx = parts.index(".camflow")
+        project_root = Path(*parts[:idx]) if idx > 0 else Path("/")
+    else:
+        project_root = Path.cwd().resolve()
+
+    try:
+        user_spec = parse_workflow_yaml(yaml_text,
+                                        project_root=project_root)
+    except WorkflowParseError as e:
+        raise _ReplanError(f"Planner produced invalid YAML on replan: {e}")
+
+    # ── Phase 2: archive prior revision's runtime artifacts ─────────
+    _archive_prior_revision_artifacts(run_dir, prior_revision)
+
+    # ── Phase 3: write the new active workflow.yaml + record rev ────
+    workflow_path.write_text(yaml.safe_dump(user_spec, sort_keys=False))
+    new_rev_dir = run_dir / "dag_revisions" / f"{new_revision:04d}"
+    new_rev_dir.mkdir(parents=True, exist_ok=True)
+    (new_rev_dir / "workflow.yaml").write_text(workflow_path.read_text())
+    manifest: dict = {
+        "revision": new_revision,
+        "parent_revision": prior_revision,
+        "reason": reason,
+        "workflow_goal": user_spec.get("goal"),
+        "halted_node": halt_info.get("halted_node"),
+        "halt_kind": halt_info.get("kind"),
+    }
+    if replan_count is not None:
+        manifest["replan_count"] = replan_count
+    (new_rev_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False)
+    )
+    return {"user_spec": user_spec, "new_revision": new_revision}
+
+
 def _cmd_replan(argv: list[str]) -> int:
     p = argparse.ArgumentParser(
         prog="camflow replan",
         description=(
             "Re-invoke the Planner on a halted run with halt context, "
-            "record a new DAG revision, and execute it. Manual only — "
-            "automatic halt-time replan is Phase B (not implemented)."))
+            "record a new DAG revision, and execute it."))
     p.add_argument("run_dir",
                    help="path to the halted run dir (.camflow/run/)")
     p.add_argument("--steps", type=int, default=None,
@@ -2206,150 +2458,16 @@ def _cmd_replan(argv: list[str]) -> int:
     if not run_dir.is_dir():
         print(f"ERROR: run dir not found: {run_dir}", file=sys.stderr)
         return 1
-    halt_path = run_dir / "halt.json"
-    if not halt_path.exists():
-        print(
-            f"ERROR: replan needs a halted run (no halt.json at "
-            f"{halt_path}). For a clean run, use `camflow run`. For a "
-            f"single-node retry, use `camflow resume`.",
-            file=sys.stderr)
-        return 1
-    prompt_path = run_dir / "prompt.txt"
-    if not prompt_path.exists():
-        print(
-            f"ERROR: original user prompt not found at {prompt_path}; "
-            f"replan needs the original prompt to preserve the goal.",
-            file=sys.stderr)
-        return 1
-    workflow_path = run_dir / "workflow.yaml"
-    if not workflow_path.exists():
-        print(
-            f"ERROR: prior workflow.yaml missing at {workflow_path}; "
-            f"replan operates on an existing compiled workflow.",
-            file=sys.stderr)
-        return 1
-
     try:
-        halt_info = json.loads(halt_path.read_text())
-    except json.JSONDecodeError as e:
-        print(f"ERROR: halt.json is not valid JSON: {e}", file=sys.stderr)
-        return 1
-    original_prompt = prompt_path.read_text()
-    prior_yaml_text = workflow_path.read_text()
-
-    # Determine prior revision number from disk.
-    rev_dir = run_dir / "dag_revisions"
-    prior_revision = 1
-    if rev_dir.is_dir():
-        nums = []
-        for sub in rev_dir.iterdir():
-            if sub.is_dir() and sub.name.isdigit():
-                nums.append(int(sub.name))
-        if nums:
-            prior_revision = max(nums)
-    new_revision = prior_revision + 1
-
-    # Pull recent trace events for the replan context.
-    events = _read_trace_events(run_dir / "trace.jsonl")
-    recent = events[-_REPLAN_RECENT_TRACE_LIMIT:]
-
-    # Build the extended prompt the Planner sees.
-    replan_block = _build_replan_context(
-        prior_yaml_text, halt_info, recent, prior_revision)
-    extended_prompt = f"{original_prompt.strip()}\n\n{replan_block}\n"
-
-    # ── Phase 1: re-invoke the Planner workflow ─────────────────────
-    planner_dir = _builtin_planner_dir()
-    planner_yaml = planner_dir / "workflow.yaml"
-    if not planner_yaml.exists():
-        print(f"ERROR: builtin Planner missing at {planner_yaml}",
-              file=sys.stderr)
-        return 1
-    planner_spec = yaml.safe_load(planner_yaml.read_text())
-    base_ctx = planner_spec.get("context") or ""
-    planner_spec["context"] = (
-        f"# Original user prompt + replan context\n"
-        f"{extended_prompt.strip()}\n\n---\n\n{base_ctx}"
-    )
-
-    errors = validate_workflow(planner_spec, project_root=planner_dir)
-    if errors:
-        for e in errors:
-            print(f"ERROR (Planner): {e}", file=sys.stderr)
+        outcome = _perform_replan(
+            run_dir, reason="manual_replan_after_halt")
+    except _ReplanError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
-    # Each replan gets its own planner sub-dir to keep the prior
-    # Planner artifacts intact for replay/debug.
-    planner_run_dir = run_dir / f"planner-rev{new_revision}"
-    print(f"replanning via Planner → {planner_run_dir}", file=sys.stderr)
-    planner_wf = Workflow(planner_spec, planner_run_dir,
-                          project_root=planner_dir)
-    planner_wf.trace("workflow_started", run_id=planner_wf.run_id,
-                     role="planner-replan",
-                     parent_revision=prior_revision,
-                     new_revision=new_revision)
-    try:
-        planner_result = planner_wf.execute_dag()
-    finally:
-        planner_wf.cleanup()
-
-    if planner_result != "done":
-        print(f"Planner halted during replan ({planner_result}). See "
-              f"{planner_run_dir}/halt.json for details. Original "
-              f"halted run dir is unchanged.", file=sys.stderr)
-        return _result_to_exit(planner_result)
-
-    render_node = planner_wf.nodes_by_id.get("render_yaml")
-    if render_node is None or not render_node.output:
-        print("ERROR: Planner finished but produced no render_yaml output",
-              file=sys.stderr)
-        return 1
-    yaml_text = (render_node.output.get("data") or {}).get("yaml_text")
-    if not yaml_text:
-        print("ERROR: Planner's render_yaml output is missing yaml_text",
-              file=sys.stderr)
-        return 1
-
-    # Resolve project root (the .camflow ancestor of the user run dir)
-    # so user-skill / user-tool resolution lines up with `camflow run`.
-    parts = run_dir.resolve().parts
-    if ".camflow" in parts:
-        idx = parts.index(".camflow")
-        project_root = Path(*parts[:idx]) if idx > 0 else Path("/")
-    else:
-        project_root = Path.cwd().resolve()
-
-    try:
-        user_spec = parse_workflow_yaml(yaml_text, project_root=project_root)
-    except WorkflowParseError as e:
-        print(f"ERROR: Planner produced invalid YAML on replan: {e}",
-              file=sys.stderr)
-        return 1
-
-    # ── Phase 2: archive prior revision's runtime artifacts ─────────
-    _archive_prior_revision_artifacts(run_dir, prior_revision)
-
-    # ── Phase 3: write the new active workflow.yaml + record rev ────
-    workflow_path.write_text(yaml.safe_dump(user_spec, sort_keys=False))
-    new_rev_dir = run_dir / "dag_revisions" / f"{new_revision:04d}"
-    new_rev_dir.mkdir(parents=True, exist_ok=True)
-    (new_rev_dir / "workflow.yaml").write_text(workflow_path.read_text())
-    manifest = {
-        "revision": new_revision,
-        "parent_revision": prior_revision,
-        "reason": "manual_replan_after_halt",
-        "workflow_goal": user_spec.get("goal"),
-        "halted_node": halt_info.get("halted_node"),
-        "halt_kind": halt_info.get("kind"),
-    }
-    (new_rev_dir / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False)
-    )
-
-    # ── Phase 4: execute the new DAG ─────────────────────────────────
-    print(f"executing replanned workflow (revision {new_revision}) → "
-          f"{run_dir}", file=sys.stderr)
-    result = run_workflow(user_spec, run_dir,
+    print(f"executing replanned workflow (revision "
+          f"{outcome['new_revision']}) → {run_dir}", file=sys.stderr)
+    result = run_workflow(outcome["user_spec"], run_dir,
                           max_attempts=args.steps, replan=True)
     print(f"result: {result}", file=sys.stderr)
     return _result_to_exit(result)
@@ -2494,6 +2612,17 @@ def _summarize_status(run_dir: Path, *,
                                 else None)
     summary["workflow_goal"] = (wf.get("goal") if isinstance(wf, dict)
                                 else None)
+    # Auto-replan policy (Phase B opt-in). on_halt defaults to "manual".
+    summary["on_halt"] = (
+        (wf.get("on_halt") if isinstance(wf, dict) else None) or "manual")
+    declared_max = (wf.get("max_replans") if isinstance(wf, dict)
+                    else None)
+    if isinstance(declared_max, int) and not isinstance(declared_max, bool):
+        summary["max_replans"] = max(0, min(declared_max,
+                                            _MAX_REPLANS_HARD_CEILING))
+    else:
+        summary["max_replans"] = (1 if summary["on_halt"] == "replan"
+                                  else 0)
     node_ids: list[str] = []
     if isinstance(wf, dict):
         for n in (wf.get("nodes") or []):
@@ -2547,6 +2676,12 @@ def _summarize_status(run_dir: Path, *,
                     pass
             revisions.append(man)
     summary["dag_revisions"] = revisions
+    # replan_count = number of revisions ≥ 2 (rev 1 is the initial plan,
+    # not a replan). Sourced from disk so it's accurate even if no
+    # trace events are tagged yet for the current revision.
+    summary["replan_count"] = sum(
+        1 for r in revisions
+        if isinstance(r.get("revision"), int) and r["revision"] >= 2)
     # Active revision = most recent (by sorted dir name); also pulled
     # from the last user-tagged trace event when available.
     active_rev: int | None = None
@@ -2658,6 +2793,14 @@ def _render_status_human(summary: dict, *,
         lines.append(f"goal:   {goal}")
     if summary.get("active_dag_revision"):
         lines.append(f"dag rev: {summary['active_dag_revision']}")
+    # Auto-replan policy line — only shown when the workflow actually
+    # opts in. Default ("manual") is the silent baseline.
+    if summary.get("on_halt") == "replan":
+        used = summary.get("replan_count", 0)
+        cap = summary.get("max_replans", 0)
+        lines.append(
+            f"on_halt: replan (auto-replan used {used}/{cap})"
+        )
 
     prog = summary.get("progress") or {}
     if prog.get("total"):
@@ -2807,7 +2950,8 @@ def main(argv: list[str] | None = None) -> int:
             "  camflow resume <run_dir> --steps N    resume but advance only N more attempts\n"
             "  camflow replan <run_dir>              re-invoke Planner on a halted run, record a new\n"
             "                                          DAG revision, and execute it (manual halt-time\n"
-            "                                          replan; auto-replan is Phase B)\n"
+            "                                          replan; auto-replan is opt-in via workflow's\n"
+            "                                          `on_halt: replan` + `max_replans: N`)\n"
             "  camflow status                        read-only summary of ./.camflow/run/\n"
             "  camflow status --json                 machine-readable summary\n"
             "  camflow status --events N             include last N trace events\n"
