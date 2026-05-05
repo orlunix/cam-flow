@@ -573,6 +573,23 @@ def normalize_envelope(raw: dict) -> dict:
     }
 
 
+def _envelope_requests_workflow_halt(envelope: dict) -> bool:
+    """True when a failing envelope is explicitly asking CamFlow to halt.
+
+    This is distinct from ordinary node failure. Ordinary failure can spend
+    retry budget; an explicit halt/replan signal should reach workflow-level
+    halt handling immediately so manual/auto replan can run.
+    """
+    data = envelope.get("data") if isinstance(envelope, dict) else None
+    if isinstance(data, dict):
+        if data.get("halt") is True or data.get("replan_required") is True:
+            return True
+
+    error = envelope.get("error") if isinstance(envelope, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code in {"ORACLE_HALT", "CAMFLOW_REPLAN_REQUIRED"}
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  PROMPT BUILDERS
 # ═══════════════════════════════════════════════════════════════════════
@@ -1602,6 +1619,19 @@ class Workflow:
                 continue
 
             # status = fail. Decide: retry or halt.
+            if _envelope_requests_workflow_halt(envelope):
+                reason = ((envelope.get("error") or {}).get("message")
+                          or envelope.get("feedback")
+                          or "node requested workflow halt")
+                self.trace("explicit_halt_requested", node=node.id,
+                           retry_count=node.retry_count,
+                           retry_max=node.retry_max,
+                           reason=reason)
+                node.lifecycle = "done"
+                node.result = "fail"
+                self.halt(node, reason, envelope)
+                return "halted"
+
             if node.retry_count < node.retry_max:
                 node.retry_count += 1
                 self.trace("retry_triggered", node=node.id,
@@ -2265,6 +2295,28 @@ def _build_replan_context(prior_workflow_yaml: str,
         for e in recent_events:
             lines.append(json.dumps(e, ensure_ascii=False))
         lines.append("```")
+    lines.append("")
+    lines.append("## Retry and explicit halt semantics")
+    lines.append(
+        "- `retry: N` means N additional attempts after the first attempt; "
+        "`retry: 1` means one retry, not zero retries."
+    )
+    lines.append(
+        "- Explicit halt/replan envelopes (`data.halt=true`, "
+        "`data.replan_required=true`, or `error.code=ORACLE_HALT`) bypass "
+        "node retry and become a workflow-level halt so manual or automatic "
+        "replan can run."
+    )
+    lines.append(
+        "- Do not set `retry: 0` merely to propagate an explicit halt. Keep "
+        "bounded retry for recoverable non-halt feedback, such as an oracle "
+        "returning a `phrase_hint` after a correct path submit."
+    )
+    lines.append(
+        "- On a retry, the previous envelope is available as "
+        "`input.previous`; tools and skill agents can use fields like "
+        "`input.previous.data.phrase_hint`."
+    )
     lines.append("")
     lines.append(
         "Decide whether the halt was a local issue (fix the failing "
@@ -2962,7 +3014,7 @@ def main(argv: list[str] | None = None) -> int:
             "Stop a run:     kill $(cat .camflow/run/runner.pid)\n",
             file=sys.stderr,
         )
-        return 2 if argv else 1
+        return 0 if argv else 1
     cmd = argv[0]
     if cmd == "run":
         return _cmd_run(argv[1:])

@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 import textwrap
 from pathlib import Path
 
@@ -901,6 +902,167 @@ fi
         # Only 1 attempt — request_human skipped retry
         attempts = list((rd / "nodes" / "n").iterdir())
         assert len(attempts) == 1
+
+    def test_explicit_oracle_halt_skips_node_retry(self, tmp_path):
+        """An explicit replan/halt envelope is not an ordinary failure.
+
+        Even with retry budget available, it must reach workflow halt so
+        manual or opt-in auto-replan can create a new DAG revision.
+        """
+        proj = tmp_path / "proj"
+        scripts = proj / "scripts"
+        scripts.mkdir(parents=True)
+        make_executable_tool(
+            scripts / "submit.sh",
+            (
+                'cat <<EOF\n'
+                '{"status":"fail",'
+                '"data":{"halt":true,"replan_required":true},'
+                '"error":{"code":"ORACLE_HALT",'
+                '"message":"controlled first-submit halt"},'
+                '"feedback":"replan at dag_revision >= 2",'
+                '"request_human":false}\n'
+                'EOF\n'
+            ),
+        )
+
+        wf = {
+            "workflow": "oracle_halt", "version": "1.1",
+            "nodes": [{
+                "id": "submit",
+                "goal": "submit path",
+                "steps": ["submit"],
+                "run": {"tool": "scripts/submit.sh"},
+                "retry": 3,
+            }],
+        }
+        rd = proj / ".camflow" / "run"
+        result = run_workflow(wf, rd)
+        assert result == "halted"
+        attempts = sorted((rd / "nodes" / "submit").iterdir())
+        assert [p.name for p in attempts] == ["attempt-1"]
+
+        events = [json.loads(line)
+                  for line in (rd / "trace.jsonl").read_text().splitlines()]
+        assert any(e["event"] == "explicit_halt_requested" for e in events)
+        assert not any(e["event"] == "retry_triggered" for e in events)
+        halt = json.loads((rd / "halt.json").read_text())
+        assert halt["halted_node"] == "submit"
+        assert halt["envelope"]["error"]["code"] == "ORACLE_HALT"
+
+    def test_recoverable_phrase_hint_uses_retry_previous(self, tmp_path):
+        """Non-halt oracle feedback still uses normal bounded retry.
+
+        Attempt 1 returns a phrase_hint. Attempt 2 reads it from
+        input.previous.data.phrase_hint and succeeds.
+        """
+        proj = tmp_path / "proj"
+        scripts = proj / "scripts"
+        scripts.mkdir(parents=True)
+        make_executable_tool(
+            scripts / "submit.sh",
+            r'''
+input_json=$(cat)
+phrase=$(INPUT_JSON="$input_json" python3 -c 'import json, os
+d = json.loads(os.environ["INPUT_JSON"])
+print(((d.get("previous") or {}).get("data") or {}).get("phrase_hint", ""))')
+if [ "$phrase" = "CAMFLOW-OPEN" ]; then
+  cat <<EOF
+{"status":"success","data":{"solved":true,"phrase":"$phrase"},"error":null,"feedback":null,"request_human":false}
+EOF
+else
+  cat <<EOF
+{"status":"fail","data":{"phrase_hint":"CAMFLOW-OPEN"},"error":{"code":"PHRASE_REQUIRED","message":"need phrase"},"feedback":"Use phrase_hint","request_human":false}
+EOF
+fi
+''',
+        )
+
+        wf = {
+            "workflow": "phrase_retry", "version": "1.1",
+            "nodes": [{
+                "id": "submit",
+                "goal": "submit path with optional phrase",
+                "steps": ["submit"],
+                "run": {"tool": "scripts/submit.sh"},
+                "output_schema": {"solved": "boolean", "phrase": "string"},
+                "verify": {"command": "true"},
+                "retry": 1,
+            }],
+        }
+        rd = proj / ".camflow" / "run"
+        result = run_workflow(wf, rd)
+        assert result == "done"
+        attempt2_input = json.loads(
+            (rd / "nodes" / "submit" / "attempt-2" / "input.json").read_text())
+        assert attempt2_input["previous"]["data"]["phrase_hint"] == "CAMFLOW-OPEN"
+        attempt2_output = json.loads(
+            (rd / "nodes" / "submit" / "attempt-2" / "output.json").read_text())
+        assert attempt2_output["data"]["phrase"] == "CAMFLOW-OPEN"
+
+
+class TestOracleMazeWrappers:
+    def test_maze_submit_uses_previous_phrase_hint(self, tmp_path):
+        """The real maze_submit wrapper must forward retry phrase_hint."""
+        repo = Path(__file__).resolve().parents[1]
+        wrapper = repo / "examples" / "oracle-maze" / "scripts" / "maze_submit.sh"
+        fake_bin = tmp_path / "bin"
+        make_executable_tool(
+            fake_bin / "curl",
+            r'''
+body=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-d" ]; then
+    shift
+    body="$1"
+  fi
+  shift || true
+done
+python3 - "$body" <<'PY'
+import json
+import sys
+
+request = json.loads(sys.argv[1])
+args = request["args"]
+if args.get("phrase") == "CAMFLOW-OPEN":
+    print(json.dumps({
+        "ok": True,
+        "solved": True,
+        "used_phrase": args["phrase"],
+    }))
+else:
+    print(json.dumps({
+        "ok": False,
+        "solved": False,
+        "phrase_hint": "CAMFLOW-OPEN",
+        "feedback": "need phrase",
+    }))
+PY
+''',
+        )
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+        env["CAMFLOW_ORACLE_BASE_URL"] = "http://fake-oracle"
+        env["CAMFLOW_ORACLE_SESSION_ID"] = "session"
+        env["CAMFLOW_DAG_REVISION"] = "2"
+        input_json = {
+            "upstream": {"infer": {"data": {"path": ["N", "E"]}}},
+            "previous": {"data": {"phrase_hint": "CAMFLOW-OPEN"}},
+            "dag_revision": 2,
+        }
+        cp = subprocess.run(
+            [str(wrapper)],
+            input=json.dumps(input_json),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=repo,
+            env=env,
+            check=True,
+        )
+        envelope = json.loads(cp.stdout)
+        assert envelope["status"] == "success", cp.stderr
+        assert envelope["data"]["used_phrase"] == "CAMFLOW-OPEN"
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -3152,3 +3314,19 @@ class TestPhaseBAutoReplan:
         s = _summarize_status(rd)
         text = _render_status_human(s)
         assert "on_halt:" not in text  # silent baseline preserved
+
+
+class TestCLI:
+    def test_help_flag_exits_success(self, capsys):
+        from runner.runtime import main
+
+        assert main(["--help"]) == 0
+        captured = capsys.readouterr()
+        assert "Usage:" in captured.err
+
+    def test_no_args_prints_usage_and_fails(self, capsys):
+        from runner.runtime import main
+
+        assert main([]) == 1
+        captured = capsys.readouterr()
+        assert "Usage:" in captured.err

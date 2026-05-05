@@ -5,10 +5,12 @@ version: "1.1"
 # fixture's PROMPT.txt. The solver node is a skill so the agent can
 # scan, probe iteratively, and decide a path. It then calls
 # maze_submit (via the wrapper or curl directly). On rev 1 the
-# oracle halts; rev 2 (after `camflow replan`) submits again and
-# succeeds.
+# oracle halts; auto-replan creates rev 2. If rev 2 returns a
+# phrase_hint, the bounded retry submits the same path with that phrase.
 
 goal: "Reach maze_status.solved=true on dag_revision >= 2 by inferring the hidden path through probes and submitting it."
+on_halt: replan
+max_replans: 1
 
 context: |
   Original task: solve the camflow-blind-maze-oracle.
@@ -28,6 +30,10 @@ context: |
   `on_halt: replan` + `max_replans: 1` so runtime auto-replans
   after the controlled halt.
 
+  Explicit halt envelopes bypass node retry and reach workflow-level
+  replan. Non-halt submit feedback is different: if dag_revision>=2
+  returns a phrase_hint, retry the submit once with phrase=<hint>.
+
 nodes:
   - id: solver
     goal: "Scan the maze, probe to infer the path (length from maze_scan), and submit it. Report the inferred path so a replan can re-use it."
@@ -36,6 +42,7 @@ nodes:
       - "Use scripts/maze_probe.sh iteratively (depth-first style), sized to the maze_scan path_length, to narrow down each step of the path."
       - "Once a full path of the maze_scan-reported length is justified by the probes, call scripts/maze_submit.sh with that path."
       - "If the oracle responds with halt=true (expected on dag_revision=1), report status=fail with the inferred path in data so the replan can re-use it."
+      - "If a dag_revision>=2 submit returns phrase_hint without halt=true, retry once with the same path and that phrase."
     run:
       skill: code_writer
     output_schema:

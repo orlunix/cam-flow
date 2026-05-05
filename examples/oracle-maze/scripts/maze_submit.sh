@@ -5,9 +5,9 @@
 #
 # IMPORTANT: oracle deliberately halts the FIRST submit on any session
 # at dag_revision=1 even when the path is correct. The runtime turns
-# our fail envelope into a workflow halt; the operator then runs
-# `camflow replan` so this script is invoked again with
-# CAMFLOW_DAG_REVISION>=2 and the oracle accepts.
+# that explicit halt envelope into a workflow halt so manual/auto replan
+# can create a fresh DAG revision. Later non-halt feedback such as
+# phrase_hint is recoverable through the normal retry path.
 set -e
 
 base="${CAMFLOW_ORACLE_BASE_URL:?CAMFLOW_ORACLE_BASE_URL must be set}"
@@ -24,6 +24,8 @@ path_json=$(jq -c '
 phrase=$(jq -r '
     if .phrase then .phrase
     elif .data and .data.phrase then .data.phrase
+    elif .previous and .previous.data and .previous.data.phrase then .previous.data.phrase
+    elif .previous and .previous.data and .previous.data.phrase_hint then .previous.data.phrase_hint
     else ""
     end' <<<"$stdin_json")
 
@@ -43,7 +45,7 @@ resp=$(curl -fsS -X POST "$base/tool" \
 # Translate oracle response → CamFlow envelope.
 # Three cases:
 #   solved=true                 → success
-#   halt=true                   → fail with feedback (triggers retry-or-halt)
+#   halt=true                   → fail with explicit halt feedback
 #   error / not solved / other  → fail
 jq -nc --argjson r "$resp" '
   ($r.solved // false) as $solved
