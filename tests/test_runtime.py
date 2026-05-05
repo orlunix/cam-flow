@@ -2472,6 +2472,47 @@ EOF
         assert out["data"]["env_rev"] == "1", out
         assert out["data"]["input_rev"] == "1", out
 
+    def test_workflow_init_exports_dag_revision_env(self, tmp_path,
+                                                     monkeypatch):
+        """Skill agents run inside camc-spawned tmux sessions and
+        inherit env from the runtime process. Workflow.__init__ must
+        export CAMFLOW_DAG_REVISION into os.environ so wrappers
+        invoked by skill agents (e.g. via Bash inside the agent's
+        tmux) see the active revision.
+
+        Live finding (codex-blind-maze-oracle): without this, skill
+        agents calling wrapper scripts always saw the wrapper's
+        fallback default of 1, so a replanned run kept submitting at
+        rev 1 to the oracle even when CamFlow was at rev 2/3."""
+        from runner.runtime import Workflow
+        monkeypatch.delenv("CAMFLOW_DAG_REVISION", raising=False)
+        rd = tmp_path / "proj" / ".camflow" / "run"
+        spec = {
+            "workflow": "wf", "version": "1.1",
+            "goal": "g.",
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"tool": "scripts/x.sh"}}],
+        }
+        Workflow(spec, rd)
+        assert os.environ.get("CAMFLOW_DAG_REVISION") == "1"
+
+    def test_workflow_init_planner_internal_does_not_export_env(
+            self, tmp_path, monkeypatch):
+        """Planner-internal workflows aren't the user-facing active
+        DAG; they shouldn't clobber the env var, which the user
+        workflow owns."""
+        from runner.runtime import Workflow
+        monkeypatch.setenv("CAMFLOW_DAG_REVISION", "42")
+        rd = tmp_path / "proj" / ".camflow" / "run" / "planner"
+        spec = {
+            "workflow": "planner", "version": "1.1",
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"tool": "scripts/x.sh"}}],
+        }
+        Workflow(spec, rd)
+        # Untouched — planner-internal init must not overwrite.
+        assert os.environ.get("CAMFLOW_DAG_REVISION") == "42"
+
     def test_input_json_includes_dag_revision_field(self, tmp_path):
         """Skill nodes don't get the env var (camc agents read input.json
         from disk inside their tmux session) — but they DO see the

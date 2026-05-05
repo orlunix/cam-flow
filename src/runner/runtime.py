@@ -1313,6 +1313,16 @@ class Workflow:
                 self.step_n = sum(1 for _ in self.trace_path.open())
             if self._is_user_workflow:
                 self.dag_revision = self._latest_recorded_revision() or 1
+            # Skill agents run inside camc-spawned tmux sessions and
+            # inherit env from the runtime process. exec_tool sets
+            # CAMFLOW_DAG_REVISION explicitly per call, but skill-node
+            # bash invocations (e.g. agents calling wrapper scripts)
+            # only see what the runtime process exported. Mirror the
+            # active revision into os.environ so wrappers like
+            # `${CAMFLOW_DAG_REVISION:-1}` resolve correctly across
+            # both tool and skill paths.
+            if self._is_user_workflow:
+                os.environ["CAMFLOW_DAG_REVISION"] = str(self.dag_revision)
         elif not resume:
             (run_dir / "workflow.yaml").write_text(
                 yaml.safe_dump(spec, sort_keys=False)
@@ -1329,6 +1339,7 @@ class Workflow:
                     parent_revision=None,
                     reason="initial_plan",
                 )
+                os.environ["CAMFLOW_DAG_REVISION"] = str(self.dag_revision)
         else:
             if self.trace_path.exists():
                 self.step_n = sum(1 for _ in self.trace_path.open())
@@ -1336,6 +1347,7 @@ class Workflow:
                 # On resume, pick up the last revision number from the
                 # recorded directory so trace tagging stays consistent.
                 self.dag_revision = self._latest_recorded_revision() or 1
+                os.environ["CAMFLOW_DAG_REVISION"] = str(self.dag_revision)
 
         self.pid_path.write_text(str(os.getpid()))
 
