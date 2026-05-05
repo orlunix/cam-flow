@@ -68,6 +68,30 @@ cp -R src builtin skills "$RELEASE_DIR/"
 cp pyproject.toml README.md LICENSE "$RELEASE_DIR/"
 find "$RELEASE_DIR" -type d \( -name __pycache__ -o -name '*.egg-info' \) \
   -prune -exec rm -rf {} +
+
+log "vendoring runtime dependencies ..."
+mkdir -p "$RELEASE_DIR/vendor"
+python3 - "$RELEASE_DIR/vendor" <<'PY'
+from pathlib import Path
+import shutil
+import sys
+
+vendor = Path(sys.argv[1])
+try:
+    import yaml
+except ImportError as exc:
+    raise SystemExit("PyYAML is required to build the release artifact") from exc
+
+yaml_dir = Path(yaml.__file__).resolve().parent
+target = vendor / "yaml"
+if target.exists():
+    shutil.rmtree(target)
+shutil.copytree(
+    yaml_dir,
+    target,
+    ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+)
+PY
 if [[ -d docs ]]; then
   mkdir -p "$RELEASE_DIR/docs"
   cp docs/spec.md "$RELEASE_DIR/docs/spec.md"
@@ -85,7 +109,13 @@ cat > "$WRAPPER" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 RELEASE_DIR="$SCRIPT_DIR/camflow-release"
 VERSION_FILE="$RELEASE_DIR/VERSION"
 
@@ -106,8 +136,25 @@ if [[ ! -d "$RELEASE_DIR/src" ]]; then
   exit 1
 fi
 
-export PYTHONPATH="$RELEASE_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
-exec python3 -m runner.runtime "$@"
+CAMFLOW_PYTHON="${CAMFLOW_PYTHON:-}"
+if [[ -z "$CAMFLOW_PYTHON" ]]; then
+  for candidate in python3.12 python3.11 python3.10 python3; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+        && "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
+             >/dev/null 2>&1; then
+      CAMFLOW_PYTHON="$candidate"
+      break
+    fi
+  done
+fi
+
+if [[ -z "$CAMFLOW_PYTHON" ]]; then
+  echo "ERROR: CamFlow requires Python >= 3.10; set CAMFLOW_PYTHON to a suitable interpreter" >&2
+  exit 1
+fi
+
+export PYTHONPATH="$RELEASE_DIR/vendor:$RELEASE_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "$CAMFLOW_PYTHON" -m runner.runtime "$@"
 EOF
 chmod +x "$WRAPPER"
 

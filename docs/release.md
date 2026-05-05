@@ -45,7 +45,9 @@ Outputs:
 - `dist/camflow-release.tar.gz`
 
 The wrapper is relocatable and runs `python3 -m runner.runtime` with the release
-tree on `PYTHONPATH`. Verify locally:
+tree plus vendored runtime dependencies on `PYTHONPATH`. It resolves symlinks
+before locating `camflow-release/` and chooses `python3.12`, `python3.11`,
+`python3.10`, then `python3`, requiring Python 3.10 or newer. Verify locally:
 
 ```bash
 dist/camflow version

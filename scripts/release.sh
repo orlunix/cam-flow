@@ -158,9 +158,9 @@ while IFS=$'\t' read -r name host user port; do
     printf '   ssh %s %s "mkdir -p ~/.cam"\n' "${SSH_OPTS[*]}" "$target"
     printf '   scp %s %s %s %s:%s/\n' \
       "${SCP_OPTS[*]}" "$WRAPPER" "$TARBALL" "$target" "$REMOTE_DIR"
-    printf '   ssh %s %s "tar -xzf %s -C %s && chmod +x %s && %s version"\n' \
+    printf '   ssh %s %s "tar -xzf %s -C %s && chmod +x %s && %s version && %s --help >/dev/null"\n' \
       "${SSH_OPTS[*]}" "$target" "$REMOTE_TARBALL" "$REMOTE_DIR" \
-      "$REMOTE_WRAPPER" "$REMOTE_WRAPPER"
+      "$REMOTE_WRAPPER" "$REMOTE_WRAPPER" "$REMOTE_WRAPPER"
     continue
   fi
 
@@ -185,6 +185,11 @@ while IFS=$'\t' read -r name host user port; do
   remote_ver="$(ssh "${SSH_OPTS[@]}" "$target" "$REMOTE_WRAPPER version" \
     2>/dev/null | head -1 | tr -d '\r' || true)"
   if [[ "$remote_ver" == "$LOCAL_VERSION" ]]; then
+    if ! ssh "${SSH_OPTS[@]}" "$target" "$REMOTE_WRAPPER --help" \
+        >/dev/null 2>&1; then
+      warn "   runtime smoke failed for $label"
+      failed=$((failed + 1)); failures+=("$name:runtime"); continue
+    fi
     ok "   $remote_ver"
     verified=$((verified + 1))
   else
@@ -200,7 +205,8 @@ cp -p $REMOTE_WRAPPER $SHARED_CURRENT_DIR/camflow && \
 tar -xzf $REMOTE_TARBALL -C $SHARED_CURRENT_DIR && \
 chmod 0755 $SHARED_CURRENT_DIR/camflow && \
 ln -sfn $SHARED_CURRENT_DIR/camflow $SHARED_BIN_PATH && \
-$SHARED_BIN_PATH version"
+$SHARED_BIN_PATH version >/dev/null && \
+$SHARED_BIN_PATH --help >/dev/null"
     if ssh "${SSH_OPTS[@]}" "$target" "$install_cmd" >/dev/null 2>&1; then
       ok "   shared: $SHARED_BIN_PATH -> $SHARED_CURRENT_DIR/camflow"
     else
