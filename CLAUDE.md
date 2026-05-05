@@ -150,8 +150,13 @@ camflow run "<your task description>"
 # resume after a halt
 camflow resume .camflow/run
 
-# inspect mid-run
-cat .camflow/run/trace.jsonl
+# inspect mid-run (read-only)
+camflow status                 # one-screen summary of ./.camflow/run/
+camflow status --json          # machine-readable
+camflow status --events 20     # include last 20 trace events
+camflow status --node <id>     # focus on one node
+camflow status --planner       # inspect the Planner sub-run
+cat .camflow/run/trace.jsonl   # raw trace stream
 cat .camflow/run/halt.json     # only if halted
 
 # stop a run

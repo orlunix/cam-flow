@@ -2112,3 +2112,309 @@ class TestWorkflowGoalInjection:
         out = build_verify_prompt(
             self._node(), {"status": "success", "data": {}})
         assert "# Workflow Goal" not in out
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  TestStatus — read-only `camflow status` MVP
+# ───────────────────────────────────────────────────────────────────────
+
+class TestStatus:
+    """`camflow status` is strictly read-only. Per the
+    codex-implement-camflow-status-readonly task, it must NEVER
+    instantiate Workflow (which writes workflow.yaml/pid/dag_revisions)
+    and must NEVER create/delete/modify run-dir files. State inference
+    is artifact-driven."""
+
+    def _make_run_dir(self, tmp_path: Path, *,
+                      workflow_name: str = "wf",
+                      goal: str | None = None,
+                      nodes: list[str] | None = None,
+                      events: list[dict] | None = None,
+                      pid: int | None = None,
+                      halt: dict | None = None,
+                      revisions: list[dict] | None = None) -> Path:
+        """Synthesize a run dir without touching Workflow."""
+        rd = tmp_path / "rd"
+        rd.mkdir(parents=True, exist_ok=True)
+        wf: dict = {"workflow": workflow_name, "version": "1.1"}
+        if goal:
+            wf["goal"] = goal
+        if nodes is None:
+            nodes = ["a"]
+        wf["nodes"] = [{"id": n, "goal": "g", "steps": ["s"],
+                        "run": {"tool": "scripts/x.sh"}} for n in nodes]
+        (rd / "workflow.yaml").write_text(yaml.safe_dump(wf, sort_keys=False))
+        if events:
+            (rd / "trace.jsonl").write_text(
+                "\n".join(json.dumps(e) for e in events) + "\n"
+            )
+        if pid is not None:
+            (rd / "runner.pid").write_text(str(pid))
+        if halt is not None:
+            (rd / "halt.json").write_text(json.dumps(halt))
+        if revisions:
+            for r in revisions:
+                rev_dir = rd / "dag_revisions" / f"{r['revision']:04d}"
+                rev_dir.mkdir(parents=True)
+                (rev_dir / "manifest.json").write_text(json.dumps(r))
+                (rev_dir / "workflow.yaml").write_text(
+                    yaml.safe_dump(wf, sort_keys=False)
+                )
+        return rd
+
+    def _make_attempt(self, run_dir: Path, node_id: str, attempt: int,
+                      *, output: dict | None = None,
+                      prompt: str | None = "P") -> Path:
+        att = run_dir / "nodes" / node_id / f"attempt-{attempt}"
+        att.mkdir(parents=True, exist_ok=True)
+        if prompt is not None:
+            (att / "prompt.txt").write_text(prompt)
+        if output is not None:
+            (att / "output.json").write_text(json.dumps(output))
+            (att / "agent_output.json").write_text(json.dumps(output))
+        return att
+
+    # ── state inference ───────────────────────────────────────────────
+
+    def test_state_done_when_workflow_completed_event(self, tmp_path):
+        from runner.runtime import _summarize_status
+        rd = self._make_run_dir(
+            tmp_path, nodes=["a"],
+            events=[
+                {"step": 1, "ts": "t", "event": "workflow_started"},
+                {"step": 2, "ts": "t", "event": "node_started", "node": "a"},
+                {"step": 3, "ts": "t", "event": "node_completed",
+                 "node": "a", "status": "success"},
+                {"step": 4, "ts": "t", "event": "workflow_completed",
+                 "status": "success"},
+            ])
+        s = _summarize_status(rd)
+        assert s["state"] == "success", s
+        assert s["progress"]["done"] == 1
+
+    def test_state_running_when_pid_alive(self, tmp_path):
+        from runner.runtime import _summarize_status
+        rd = self._make_run_dir(
+            tmp_path, pid=os.getpid(),  # this test process is alive
+            events=[{"step": 1, "ts": "t", "event": "node_started",
+                     "node": "a"}])
+        s = _summarize_status(rd)
+        assert s["state"] == "running"
+        assert s["pid_alive"] is True
+
+    def test_state_stale_when_pid_dead(self, tmp_path):
+        from runner.runtime import _summarize_status
+        # pid 999999999 is almost certainly dead (and nonexistent).
+        rd = self._make_run_dir(tmp_path, pid=999999999)
+        s = _summarize_status(rd)
+        assert s["state"] == "stale"
+        assert s["pid_alive"] is False
+
+    def test_state_halted_when_halt_json_present(self, tmp_path):
+        from runner.runtime import _summarize_status
+        halt = {
+            "halted_node": "a", "kind": "halt",
+            "reason": "retry exhausted",
+            "envelope": {"feedback": "missing reqK", "error": None},
+        }
+        rd = self._make_run_dir(tmp_path, halt=halt)
+        s = _summarize_status(rd)
+        assert s["state"] == "halted"
+        assert s["halt"]["halted_node"] == "a"
+
+    def test_state_unknown_when_empty(self, tmp_path):
+        from runner.runtime import _summarize_status
+        rd = tmp_path / "empty"
+        rd.mkdir()
+        s = _summarize_status(rd)
+        assert s["state"] == "unknown"
+
+    def test_state_missing_when_run_dir_absent(self, tmp_path):
+        from runner.runtime import _summarize_status
+        s = _summarize_status(tmp_path / "nope")
+        assert s["state"] == "missing"
+        assert s["exists"] is False
+
+    # ── progress + current node ───────────────────────────────────────
+
+    def test_current_node_is_first_unfinished(self, tmp_path):
+        from runner.runtime import _summarize_status
+        rd = self._make_run_dir(
+            tmp_path, nodes=["a", "b", "c"],
+            events=[
+                {"step": 1, "ts": "t", "event": "node_started", "node": "a"},
+                {"step": 2, "ts": "t", "event": "node_completed",
+                 "node": "a", "status": "success"},
+                {"step": 3, "ts": "t", "event": "node_started", "node": "b"},
+            ])
+        self._make_attempt(rd, "a", 1, output={"data": {}})
+        self._make_attempt(rd, "b", 1)
+        s = _summarize_status(rd)
+        assert s["progress"]["done"] == 1
+        assert s["progress"]["total"] == 3
+        assert s["current_node"]["id"] == "b"
+        assert s["current_node"]["phase"] == "running"
+
+    # ── --node focus ──────────────────────────────────────────────────
+
+    def test_node_focus_filters_to_one(self, tmp_path):
+        from runner.runtime import _summarize_status
+        rd = self._make_run_dir(tmp_path, nodes=["a", "b"])
+        self._make_attempt(rd, "a", 1)
+        self._make_attempt(rd, "b", 1)
+        s = _summarize_status(rd, focus_node="b")
+        assert len(s["nodes"]) == 1
+        assert s["nodes"][0]["id"] == "b"
+
+    # ── DAG revisions surfaced ────────────────────────────────────────
+
+    def test_dag_revisions_surfaced(self, tmp_path):
+        from runner.runtime import _summarize_status
+        rd = self._make_run_dir(
+            tmp_path,
+            revisions=[{
+                "revision": 1, "parent_revision": None,
+                "reason": "initial_plan", "workflow_goal": "G."}],
+            events=[
+                {"step": 1, "ts": "t", "event": "node_started",
+                 "node": "a", "dag_revision": 1},
+            ])
+        s = _summarize_status(rd)
+        assert s["active_dag_revision"] == 1
+        assert len(s["dag_revisions"]) == 1
+        assert s["dag_revisions"][0]["reason"] == "initial_plan"
+
+    # ── recent_events ─────────────────────────────────────────────────
+
+    def test_events_limit_returns_tail(self, tmp_path):
+        from runner.runtime import _summarize_status
+        rd = self._make_run_dir(
+            tmp_path,
+            events=[{"step": i, "ts": "t", "event": "x"}
+                    for i in range(1, 11)])
+        s = _summarize_status(rd, events_limit=3)
+        assert "recent_events" in s
+        assert len(s["recent_events"]) == 3
+        assert s["recent_events"][-1]["step"] == 10
+
+    # ── --json + --events via _cmd_status ─────────────────────────────
+
+    def test_cmd_status_json_round_trips(self, tmp_path, capsys):
+        from runner.runtime import _cmd_status
+        rd = self._make_run_dir(
+            tmp_path, goal="prove X.",
+            events=[{"step": 1, "ts": "t", "event": "workflow_started"}])
+        rc = _cmd_status(["--run-dir", str(rd), "--json"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        parsed = json.loads(out)
+        assert parsed["state"] == "unknown"  # no completed/halt/pid
+        assert parsed["workflow_goal"] == "prove X."
+
+    # ── --planner sub-run ─────────────────────────────────────────────
+
+    def test_planner_flag_targets_planner_subdir(self, tmp_path, capsys):
+        from runner.runtime import _cmd_status
+        # Synthesize a planner sub-run only (no user run).
+        proj = tmp_path / "proj"
+        planner_rd = proj / ".camflow" / "run" / "planner"
+        planner_rd.mkdir(parents=True)
+        (planner_rd / "workflow.yaml").write_text(
+            yaml.safe_dump({
+                "workflow": "planner", "version": "1.1", "goal": "compile",
+                "nodes": [{"id": "u", "goal": "g", "steps": ["s"],
+                           "run": {"tool": "scripts/x.sh"}}],
+            }, sort_keys=False))
+        # --planner with explicit --run-dir (which should append /planner).
+        rc = _cmd_status(["--run-dir", str(proj / ".camflow" / "run"),
+                          "--planner", "--json"])
+        assert rc == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["run_dir"].endswith("planner")
+        assert parsed["workflow_name"] == "planner"
+
+    # ── human render contains the right markers ───────────────────────
+
+    def test_human_render_shows_state_progress_halt(self, tmp_path):
+        from runner.runtime import _summarize_status, _render_status_human
+        halt = {
+            "halted_node": "a", "kind": "halt", "reason": "retry exhausted",
+            "envelope": {"feedback": "missed reqK", "error": None},
+        }
+        rd = self._make_run_dir(
+            tmp_path, goal="Prove X.", nodes=["a", "b"],
+            halt=halt,
+            events=[
+                {"step": 1, "ts": "t", "event": "node_started", "node": "a"},
+                {"step": 2, "ts": "t", "event": "workflow_halted",
+                 "node": "a", "reason": "retry exhausted"},
+            ])
+        self._make_attempt(rd, "a", 1, output={"status": "fail"})
+        s = _summarize_status(rd)
+        text = _render_status_human(s)
+        assert "state:" in text and "halted" in text
+        assert "goal:" in text and "Prove X." in text
+        assert "HALT:" in text
+        assert "missed reqK" in text
+        assert "camflow resume" in text
+        # Node table heading.
+        assert "phase" in text and "attempt" in text
+
+    # ── --output dumps focused node's output.json ─────────────────────
+
+    def test_output_flag_dumps_focused_output(self, tmp_path, capsys):
+        from runner.runtime import _cmd_status
+        rd = self._make_run_dir(tmp_path, nodes=["a"])
+        self._make_attempt(rd, "a", 1, output={"status": "success",
+                                                "data": {"k": "v"}})
+        rc = _cmd_status(["--run-dir", str(rd), "--node", "a", "--output"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert '"k": "v"' in out
+
+    # ── strictly no mutation ──────────────────────────────────────────
+
+    def test_no_mutation_invariant(self, tmp_path, capsys):
+        """Run status; assert every file in run_dir is byte-identical
+        before vs. after, and no files are added or removed."""
+        import hashlib
+        from runner.runtime import _cmd_status
+        rd = self._make_run_dir(
+            tmp_path, goal="Prove X.", nodes=["a", "b"],
+            pid=999999999,
+            events=[
+                {"step": 1, "ts": "t", "event": "node_started",
+                 "node": "a", "dag_revision": 1},
+            ],
+            revisions=[{"revision": 1, "parent_revision": None,
+                        "reason": "initial_plan", "workflow_goal": "Prove X."}])
+        self._make_attempt(rd, "a", 1, output={"status": "success",
+                                                "data": {}})
+
+        def snapshot(root: Path) -> dict[str, tuple[int, str]]:
+            snap = {}
+            for p in root.rglob("*"):
+                if p.is_file():
+                    rel = str(p.relative_to(root))
+                    data = p.read_bytes()
+                    snap[rel] = (len(data),
+                                 hashlib.sha256(data).hexdigest())
+            return snap
+
+        before = snapshot(rd)
+        # Run several status modes that exercise different code paths.
+        for argv in (
+            ["--run-dir", str(rd)],
+            ["--run-dir", str(rd), "--json"],
+            ["--run-dir", str(rd), "--events", "5"],
+            ["--run-dir", str(rd), "--node", "a", "--output"],
+        ):
+            rc = _cmd_status(argv)
+            assert rc == 0
+            capsys.readouterr()  # drain
+        after = snapshot(rd)
+        assert before == after, (
+            f"camflow status mutated run_dir!\n"
+            f"  added/removed: {set(before) ^ set(after)}\n"
+            f"  changed: { {k for k in before & after.keys() if before[k] != after[k]} }"
+        )

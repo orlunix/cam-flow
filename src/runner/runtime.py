@@ -2032,6 +2032,441 @@ def _cmd_run(argv: list[str]) -> int:
     return _result_to_exit(result)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  STATUS — read-only run-dir inspector (CLI convenience)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Strictly read-only: does NOT instantiate Workflow (which writes
+# workflow.yaml/pid/dag_revisions on construction). All state
+# inference is artifact-driven from disk.
+
+def _is_pid_alive(pid: int) -> bool:
+    """POSIX liveness check via signal-0. PermissionError treated as
+    alive (process exists, just isn't ours)."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _read_trace_events(trace_path: Path) -> list[dict]:
+    """Tolerant trace.jsonl reader. Bad lines are skipped silently."""
+    if not trace_path.exists():
+        return []
+    out: list[dict] = []
+    for line in trace_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _read_workflow_yaml(run_dir: Path) -> dict | None:
+    p = run_dir / "workflow.yaml"
+    if not p.exists():
+        return None
+    try:
+        return yaml.safe_load(p.read_text())
+    except yaml.YAMLError:
+        return None
+
+
+def _summarize_node(run_dir: Path, node_id: str,
+                    events: list[dict]) -> dict:
+    """Per-node summary from disk + trace. No mutation."""
+    nd = run_dir / "nodes" / node_id
+    attempts: list[int] = []
+    if nd.is_dir():
+        for sub in nd.iterdir():
+            if sub.is_dir() and sub.name.startswith("attempt-"):
+                try:
+                    attempts.append(int(sub.name.split("-", 1)[1]))
+                except ValueError:
+                    pass
+    attempts.sort()
+    latest_attempt = attempts[-1] if attempts else None
+
+    # Phase from latest trace event for this node.
+    phase = "waiting"
+    last_status: str | None = None
+    for e in events:
+        if e.get("node") != node_id:
+            continue
+        ev = e.get("event")
+        if ev == "node_started":
+            phase = "running"
+        elif ev == "verify_started":
+            phase = "verifying"
+        elif ev == "verify_failed":
+            phase = "running"  # will retry or halt
+        elif ev == "verify_completed":
+            phase = "running"
+        elif ev == "node_completed":
+            phase = "done"
+            last_status = e.get("status")
+        elif ev == "node_failed":
+            phase = "done"
+            last_status = "fail"
+        elif ev == "retry_triggered":
+            phase = "retrying"
+
+    info: dict = {
+        "id": node_id,
+        "phase": phase,
+        "latest_attempt": latest_attempt,
+        "attempt_count": len(attempts),
+        "status": last_status,
+    }
+    if latest_attempt is not None:
+        att_dir = nd / f"attempt-{latest_attempt}"
+        info["attempt_dir"] = str(att_dir)
+        for fname in ("prompt.txt", "agent_output.json", "output.json"):
+            fp = att_dir / fname
+            if fp.exists():
+                info[fname] = str(fp)
+    return info
+
+
+def _summarize_status(run_dir: Path, *,
+                      focus_node: str | None = None,
+                      events_limit: int | None = None) -> dict:
+    """Build a structured status summary from a run dir's artifacts.
+
+    Pure: never writes, never instantiates Workflow.
+    """
+    run_dir = Path(run_dir)
+    summary: dict = {
+        "run_dir": str(run_dir),
+        "exists": run_dir.is_dir(),
+    }
+    if not run_dir.is_dir():
+        summary["state"] = "missing"
+        return summary
+
+    # PID + liveness.
+    pid_path = run_dir / "runner.pid"
+    pid: int | None = None
+    pid_alive: bool | None = None
+    if pid_path.exists():
+        try:
+            pid = int((pid_path.read_text() or "").strip() or "0") or None
+        except ValueError:
+            pid = None
+        if pid is not None:
+            pid_alive = _is_pid_alive(pid)
+    summary["pid"] = pid
+    summary["pid_alive"] = pid_alive
+
+    # Workflow spec (if Planner has produced one).
+    wf = _read_workflow_yaml(run_dir)
+    summary["workflow_name"] = (wf.get("workflow") if isinstance(wf, dict)
+                                else None)
+    summary["workflow_goal"] = (wf.get("goal") if isinstance(wf, dict)
+                                else None)
+    node_ids: list[str] = []
+    if isinstance(wf, dict):
+        for n in (wf.get("nodes") or []):
+            if isinstance(n, dict) and isinstance(n.get("id"), str):
+                node_ids.append(n["id"])
+    summary["node_ids"] = node_ids
+
+    # Trace events.
+    events = _read_trace_events(run_dir / "trace.jsonl")
+    summary["trace_events_total"] = len(events)
+    summary["last_event"] = events[-1] if events else None
+
+    # Halt artifact.
+    halt_path = run_dir / "halt.json"
+    halt_info: dict | None = None
+    if halt_path.exists():
+        try:
+            halt_info = json.loads(halt_path.read_text())
+        except json.JSONDecodeError:
+            halt_info = None
+    summary["halt"] = halt_info
+
+    # State inference (artifact-driven).
+    last_event = events[-1] if events else None
+    if halt_info is not None:
+        state = "halted"
+    elif last_event and last_event.get("event") == "workflow_completed":
+        state = last_event.get("status") or "done"
+    elif pid is not None and pid_alive:
+        state = "running"
+    elif pid is not None and pid_alive is False:
+        state = "stale"
+    else:
+        state = "unknown"
+    summary["state"] = state
+
+    # DAG revisions.
+    rev_dir = run_dir / "dag_revisions"
+    revisions: list[dict] = []
+    if rev_dir.is_dir():
+        for sub in sorted(rev_dir.iterdir(),
+                          key=lambda p: p.name):
+            if not sub.is_dir():
+                continue
+            mp = sub / "manifest.json"
+            man: dict = {"name": sub.name}
+            if mp.exists():
+                try:
+                    man.update(json.loads(mp.read_text()))
+                except json.JSONDecodeError:
+                    pass
+            revisions.append(man)
+    summary["dag_revisions"] = revisions
+    # Active revision = most recent (by sorted dir name); also pulled
+    # from the last user-tagged trace event when available.
+    active_rev: int | None = None
+    for e in reversed(events):
+        if "dag_revision" in e:
+            try:
+                active_rev = int(e["dag_revision"])
+                break
+            except (TypeError, ValueError):
+                pass
+    if active_rev is None and revisions:
+        try:
+            active_rev = int(revisions[-1].get("revision")
+                             or revisions[-1].get("name"))
+        except (TypeError, ValueError):
+            pass
+    summary["active_dag_revision"] = active_rev
+
+    # Per-node summaries.
+    # If workflow.yaml is missing but nodes/ has subdirs, fall back to
+    # the on-disk node ids so a partial run still reports something.
+    nodes_dir = run_dir / "nodes"
+    if not node_ids and nodes_dir.is_dir():
+        node_ids = sorted(
+            [d.name for d in nodes_dir.iterdir() if d.is_dir()]
+        )
+        summary["node_ids"] = node_ids
+
+    nodes_info: list[dict] = []
+    for nid in node_ids:
+        if focus_node and nid != focus_node:
+            continue
+        nodes_info.append(_summarize_node(run_dir, nid, events))
+    summary["nodes"] = nodes_info
+
+    # Progress: done/total.
+    done_count = sum(1 for n in nodes_info if n.get("phase") == "done")
+    summary["progress"] = {
+        "done": done_count,
+        "total": len(nodes_info) if focus_node is None else len(node_ids),
+    }
+
+    # Current node:
+    #   - if halted, the halted node (so "what's the workflow doing?"
+    #     answers the user's intuition);
+    #   - else the first node in DAG order that isn't done yet;
+    #   - else the most recently started node from the trace.
+    current: dict | None = None
+    if not focus_node:
+        if halt_info is not None:
+            halted_id = halt_info.get("halted_node")
+            for n in nodes_info:
+                if n.get("id") == halted_id:
+                    current = n
+                    break
+        if current is None:
+            for n in nodes_info:
+                if n.get("phase") != "done":
+                    current = n
+                    break
+        if current is None:
+            # Fall back to last node mentioned in the trace.
+            for e in reversed(events):
+                if e.get("event") == "node_started":
+                    nid = e.get("node")
+                    for n in nodes_info:
+                        if n.get("id") == nid:
+                            current = n
+                            break
+                    if current:
+                        break
+    summary["current_node"] = current
+
+    # Optional: trim trace events for the caller.
+    if events_limit is not None and events_limit > 0:
+        summary["recent_events"] = events[-events_limit:]
+    elif events_limit == 0:
+        summary["recent_events"] = []
+
+    return summary
+
+
+def _render_status_human(summary: dict, *,
+                         show_output: bool = False) -> str:
+    """One-screen human-readable formatter."""
+    if not summary.get("exists"):
+        return f"camflow status: no run dir at {summary['run_dir']}\n"
+
+    lines: list[str] = []
+    rd = summary["run_dir"]
+    state = summary["state"]
+    pid = summary.get("pid")
+    pid_alive = summary.get("pid_alive")
+    if pid is not None:
+        liveness = "alive" if pid_alive else ("dead" if pid_alive is False
+                                              else "?")
+        pid_label = f"  pid: {pid} ({liveness})"
+    else:
+        pid_label = ""
+    lines.append(f"run:    {rd}")
+    lines.append(f"state:  {state}{pid_label}")
+
+    if summary.get("workflow_name"):
+        lines.append(f"workflow: {summary['workflow_name']}")
+    if summary.get("workflow_goal"):
+        goal = summary["workflow_goal"].strip()
+        if len(goal) > 200:
+            goal = goal[:197] + "..."
+        lines.append(f"goal:   {goal}")
+    if summary.get("active_dag_revision"):
+        lines.append(f"dag rev: {summary['active_dag_revision']}")
+
+    prog = summary.get("progress") or {}
+    if prog.get("total"):
+        lines.append(
+            f"nodes:  {prog['done']}/{prog['total']} done"
+        )
+
+    cur = summary.get("current_node")
+    if cur:
+        latest = cur.get("latest_attempt")
+        att = f" attempt-{latest}" if latest else ""
+        lines.append(
+            f"current: {cur['id']} ({cur['phase']}{att})"
+        )
+
+    last = summary.get("last_event") or {}
+    if last:
+        ev = last.get("event", "?")
+        ts = last.get("ts", "")
+        node = last.get("node", "")
+        node_part = f" {node}" if node else ""
+        lines.append(f"latest: {ev}{node_part}  {ts}")
+
+    nodes = summary.get("nodes") or []
+    if nodes:
+        lines.append("")
+        lines.append("  node                        phase       attempt  status")
+        for n in nodes:
+            att = (str(n.get("latest_attempt"))
+                   if n.get("latest_attempt") is not None else "—")
+            st = n.get("status") or "—"
+            lines.append(
+                f"  {n['id']:<28}{n['phase']:<11} {att:<8}{st}"
+            )
+
+    halt = summary.get("halt")
+    if halt:
+        lines.append("")
+        lines.append("HALT:")
+        lines.append(
+            f"  node:   {halt.get('halted_node')} (kind={halt.get('kind')})")
+        if halt.get("reason"):
+            lines.append(f"  reason: {halt['reason']}")
+        env = halt.get("envelope") or {}
+        fb = env.get("feedback") or (env.get("error") or {}).get("message")
+        if fb:
+            fb_short = fb if len(fb) <= 200 else fb[:197] + "..."
+            lines.append(f"  feedback: {fb_short}")
+        lines.append(f"  resume:  camflow resume {rd}")
+
+    # Artifact paths.
+    trace_path = Path(rd) / "trace.jsonl"
+    if trace_path.exists():
+        lines.append("")
+        lines.append(f"trace:  {trace_path}")
+    if cur:
+        for k in ("prompt.txt", "output.json"):
+            v = cur.get(k)
+            if v:
+                lines.append(f"{k:<7} {v}")
+
+    # Recent events (when --events N).
+    recent = summary.get("recent_events")
+    if recent:
+        lines.append("")
+        lines.append(f"recent events (last {len(recent)}):")
+        for e in recent:
+            lines.append(
+                f"  step {e.get('step', '?')}: "
+                f"{e.get('event')}  {e.get('node', '')}  "
+                f"{e.get('ts', '')}".rstrip()
+            )
+
+    # Optionally dump the focused node's latest output.json.
+    if show_output and nodes:
+        n = nodes[0]
+        op = n.get("output.json")
+        if op and Path(op).exists():
+            lines.append("")
+            lines.append(f"output ({op}):")
+            try:
+                lines.append(Path(op).read_text())
+            except OSError as e:
+                lines.append(f"  (could not read: {e})")
+
+    return "\n".join(lines) + "\n"
+
+
+def _resolve_status_run_dir(args_run_dir: str | None,
+                            planner: bool) -> Path:
+    """If --run-dir given, use it; else <project>/.camflow/run/.
+    --planner appends /planner for inspecting the Planner sub-run."""
+    if args_run_dir:
+        rd = Path(args_run_dir).resolve()
+    else:
+        rd = Path.cwd().resolve() / ".camflow" / "run"
+    if planner:
+        rd = rd / "planner"
+    return rd
+
+
+def _cmd_status(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(
+        prog="camflow status",
+        description="Read-only inspection of a camflow run.")
+    p.add_argument("--run-dir", default=None,
+                   help="path to .camflow/run/ (default: ./.camflow/run/)")
+    p.add_argument("--planner", action="store_true",
+                   help="inspect the Planner sub-run instead of the user run")
+    p.add_argument("--json", action="store_true",
+                   help="emit machine-readable JSON instead of human view")
+    p.add_argument("--events", type=int, default=None, metavar="N",
+                   help="include the last N trace events")
+    p.add_argument("--node", default=None, metavar="ID",
+                   help="focus output on one node id")
+    p.add_argument("--output", action="store_true",
+                   help="also dump the focused node's latest output.json")
+    args = p.parse_args(argv)
+
+    rd = _resolve_status_run_dir(args.run_dir, args.planner)
+    summary = _summarize_status(
+        rd, focus_node=args.node, events_limit=args.events)
+
+    if args.json:
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return 0
+
+    print(_render_status_human(summary, show_output=args.output), end="")
+    # Exit code: 0 if reachable; 1 if run dir missing.
+    return 0 if summary.get("exists") else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(argv) if argv is not None else sys.argv[1:]
     if not argv or argv[0] in ("-h", "--help"):
@@ -2047,8 +2482,13 @@ def main(argv: list[str] | None = None) -> int:
             "                                           use --run-dir to point elsewhere)\n"
             "  camflow resume <run_dir>              resume a halted run\n"
             "  camflow resume <run_dir> --steps N    resume but advance only N more attempts\n"
+            "  camflow status                        read-only summary of ./.camflow/run/\n"
+            "  camflow status --json                 machine-readable summary\n"
+            "  camflow status --events N             include last N trace events\n"
+            "  camflow status --node <id>            focus on one node\n"
+            "  camflow status --planner              inspect the Planner sub-run\n"
             "\n"
-            "Inspect a run:  cat .camflow/run/trace.jsonl\n"
+            "Inspect a run:  cat .camflow/run/trace.jsonl  (or `camflow status`)\n"
             "Stop a run:     kill $(cat .camflow/run/runner.pid)\n",
             file=sys.stderr,
         )
@@ -2058,6 +2498,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_run(argv[1:])
     if cmd == "resume":
         return _cmd_resume(argv[1:])
+    if cmd == "status":
+        return _cmd_status(argv[1:])
     print(f"ERROR: unknown subcommand '{cmd}'. "
           f"Try `camflow --help`.", file=sys.stderr)
     return 1
