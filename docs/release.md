@@ -97,6 +97,7 @@ Remote layout:
 
 ```text
 ~/.cam/camflow
+~/.cam/camflow.py
 ~/.cam/camflow-release/
 ~/.cam/camflow-release.tar.gz
 ```
@@ -105,6 +106,7 @@ If `/home/prgn_share/bin` is writable, the script also installs:
 
 ```text
 /home/prgn_share/bin/camflow -> /home/prgn_share/tools/camflow/current/camflow
+/home/prgn_share/bin/camflow.py
 /home/prgn_share/tools/camflow/current/camflow-release/
 ```
 

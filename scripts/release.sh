@@ -21,12 +21,15 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MACHINES_FILE="${CAMC_MACHINES_FILE:-$HOME/.cam/machines.json}"
 DIST_DIR="$REPO_ROOT/dist"
 WRAPPER="$DIST_DIR/camflow"
+SINGLE_FILE="$DIST_DIR/camflow.py"
 TARBALL="$DIST_DIR/camflow-release.tar.gz"
 REMOTE_DIR="~/.cam"
 REMOTE_WRAPPER="$REMOTE_DIR/camflow"
+REMOTE_SINGLE="$REMOTE_DIR/camflow.py"
 REMOTE_TARBALL="$REMOTE_DIR/camflow-release.tar.gz"
 SHARED_BIN_DIR="/home/prgn_share/bin"
 SHARED_BIN_PATH="$SHARED_BIN_DIR/camflow"
+SHARED_SINGLE_PATH="$SHARED_BIN_DIR/camflow.py"
 SHARED_CURRENT_DIR="/home/prgn_share/tools/camflow/current"
 SHARED_RELEASES_DIR="/home/prgn_share/tools/camflow/releases"
 SSH_TIMEOUT=10
@@ -61,6 +64,7 @@ cd "$REPO_ROOT"
 
 if [[ $SKIP_BUILD -eq 1 ]]; then
   [[ -x "$WRAPPER" ]] || { err "--skip-build but $WRAPPER is missing"; exit 1; }
+  [[ -x "$SINGLE_FILE" ]] || { err "--skip-build but $SINGLE_FILE is missing"; exit 1; }
   [[ -f "$TARBALL" ]] || { err "--skip-build but $TARBALL is missing"; exit 1; }
   log "skip build (using existing dist/)"
 else
@@ -76,6 +80,7 @@ ok "local: $LOCAL_VERSION"
 VER_TOKEN="$(printf '%s' "$LOCAL_VERSION" | awk '{print $2}')"
 SHORT_HASH="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || true)"
 ARCHIVE_NAME="camflow-${VER_TOKEN:-unknown}${SHORT_HASH:+-$SHORT_HASH}.tar.gz"
+SINGLE_ARCHIVE_NAME="camflow-${VER_TOKEN:-unknown}${SHORT_HASH:+-$SHORT_HASH}.py"
 
 [[ -f "$MACHINES_FILE" ]] || { err "machines file not found: $MACHINES_FILE"; exit 1; }
 
@@ -156,11 +161,13 @@ while IFS=$'\t' read -r name host user port; do
 
   if [[ $DRY_RUN -eq 1 ]]; then
     printf '   ssh %s %s "mkdir -p ~/.cam"\n' "${SSH_OPTS[*]}" "$target"
-    printf '   scp %s %s %s %s:%s/\n' \
-      "${SCP_OPTS[*]}" "$WRAPPER" "$TARBALL" "$target" "$REMOTE_DIR"
+    printf '   scp %s %s %s %s %s:%s/\n' \
+      "${SCP_OPTS[*]}" "$WRAPPER" "$SINGLE_FILE" "$TARBALL" "$target" "$REMOTE_DIR"
     printf '   ssh %s %s "tar -xzf %s -C %s && chmod +x %s && %s version && %s --help >/dev/null"\n' \
       "${SSH_OPTS[*]}" "$target" "$REMOTE_TARBALL" "$REMOTE_DIR" \
       "$REMOTE_WRAPPER" "$REMOTE_WRAPPER" "$REMOTE_WRAPPER"
+    printf '   ssh %s %s "chmod +x %s && %s version && %s --help >/dev/null"\n' \
+      "${SSH_OPTS[*]}" "$target" "$REMOTE_SINGLE" "$REMOTE_SINGLE" "$REMOTE_SINGLE"
     continue
   fi
 
@@ -169,13 +176,13 @@ while IFS=$'\t' read -r name host user port; do
     failed=$((failed + 1)); failures+=("$name:mkdir"); continue
   fi
 
-  if ! scp "${SCP_OPTS[@]}" "$WRAPPER" "$TARBALL" "$target:$REMOTE_DIR/" \
+  if ! scp "${SCP_OPTS[@]}" "$WRAPPER" "$SINGLE_FILE" "$TARBALL" "$target:$REMOTE_DIR/" \
       </dev/null >/dev/null 2>&1; then
     err "   scp failed on $label"
     failed=$((failed + 1)); failures+=("$name:scp"); continue
   fi
 
-  deploy_cmd="tar -xzf $REMOTE_TARBALL -C $REMOTE_DIR && chmod +x $REMOTE_WRAPPER"
+  deploy_cmd="tar -xzf $REMOTE_TARBALL -C $REMOTE_DIR && chmod +x $REMOTE_WRAPPER $REMOTE_SINGLE"
   if ! ssh "${SSH_OPTS[@]}" "$target" "$deploy_cmd" >/dev/null 2>&1; then
     err "   extract/chmod failed on $label"
     failed=$((failed + 1)); failures+=("$name:extract"); continue
@@ -189,6 +196,17 @@ while IFS=$'\t' read -r name host user port; do
         >/dev/null 2>&1; then
       warn "   runtime smoke failed for $label"
       failed=$((failed + 1)); failures+=("$name:runtime"); continue
+    fi
+    single_ver="$(ssh "${SSH_OPTS[@]}" "$target" "$REMOTE_SINGLE version" \
+      2>/dev/null | head -1 | tr -d '\r' || true)"
+    if [[ "$single_ver" != "$LOCAL_VERSION" ]]; then
+      warn "   single-file version mismatch: expected '$LOCAL_VERSION', got '$single_ver'"
+      failed=$((failed + 1)); failures+=("$name:single-mismatch"); continue
+    fi
+    if ! ssh "${SSH_OPTS[@]}" "$target" "$REMOTE_SINGLE --help" \
+        >/dev/null 2>&1; then
+      warn "   single-file smoke failed for $label"
+      failed=$((failed + 1)); failures+=("$name:single-runtime"); continue
     fi
     ok "   $remote_ver"
     verified=$((verified + 1))
@@ -205,8 +223,12 @@ cp -p $REMOTE_WRAPPER $SHARED_CURRENT_DIR/camflow && \
 tar -xzf $REMOTE_TARBALL -C $SHARED_CURRENT_DIR && \
 chmod 0755 $SHARED_CURRENT_DIR/camflow && \
 ln -sfn $SHARED_CURRENT_DIR/camflow $SHARED_BIN_PATH && \
+cp -p $REMOTE_SINGLE $SHARED_SINGLE_PATH && \
+chmod 0755 $SHARED_SINGLE_PATH && \
 $SHARED_BIN_PATH version >/dev/null && \
-$SHARED_BIN_PATH --help >/dev/null"
+$SHARED_BIN_PATH --help >/dev/null && \
+$SHARED_SINGLE_PATH version >/dev/null && \
+$SHARED_SINGLE_PATH --help >/dev/null"
     if ssh "${SSH_OPTS[@]}" "$target" "$install_cmd" >/dev/null 2>&1; then
       ok "   shared: $SHARED_BIN_PATH -> $SHARED_CURRENT_DIR/camflow"
     else
@@ -214,7 +236,7 @@ $SHARED_BIN_PATH --help >/dev/null"
     fi
   fi
 
-  archive_cmd="mkdir -p $SHARED_RELEASES_DIR && cp -p $REMOTE_TARBALL $SHARED_RELEASES_DIR/$ARCHIVE_NAME"
+  archive_cmd="mkdir -p $SHARED_RELEASES_DIR && cp -p $REMOTE_TARBALL $SHARED_RELEASES_DIR/$ARCHIVE_NAME && cp -p $REMOTE_SINGLE $SHARED_RELEASES_DIR/$SINGLE_ARCHIVE_NAME"
   if ssh "${SSH_OPTS[@]}" "$target" "$archive_cmd" >/dev/null 2>&1; then
     ok "   archived: $SHARED_RELEASES_DIR/$ARCHIVE_NAME"
   else
