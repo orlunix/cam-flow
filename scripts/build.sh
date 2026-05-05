@@ -5,6 +5,7 @@
 #   dist/camflow                  wrapper executable
 #   dist/camflow-release/         extracted release tree
 #   dist/camflow-release.tar.gz   tarball for remote deployment
+#   dist/camflow.py               zero-install single-file launcher
 #
 # Usage:
 #   scripts/build.sh
@@ -16,6 +17,7 @@ DIST_DIR="$REPO_ROOT/dist"
 RELEASE_DIR="$DIST_DIR/camflow-release"
 WRAPPER="$DIST_DIR/camflow"
 TARBALL="$DIST_DIR/camflow-release.tar.gz"
+SINGLE_FILE="$DIST_DIR/camflow.py"
 
 SKIP_TESTS=0
 
@@ -61,7 +63,7 @@ else
 fi
 
 log "staging release tree ..."
-rm -rf "$RELEASE_DIR" "$WRAPPER" "$TARBALL"
+rm -rf "$RELEASE_DIR" "$WRAPPER" "$TARBALL" "$SINGLE_FILE"
 mkdir -p "$RELEASE_DIR"
 
 cp -R src builtin skills "$RELEASE_DIR/"
@@ -161,9 +163,17 @@ chmod +x "$WRAPPER"
 log "packing tarball ..."
 tar -C "$DIST_DIR" -czf "$TARBALL" camflow-release
 
+log "building single-file launcher ..."
+python3 "$REPO_ROOT/scripts/build_single.py" \
+  --release-dir "$RELEASE_DIR" \
+  --output "$SINGLE_FILE" >/dev/null
+
 log "local smoke ..."
 "$WRAPPER" version >/dev/null
 "$WRAPPER" --help >/dev/null 2>&1
+"$SINGLE_FILE" version >/dev/null
+"$SINGLE_FILE" --help >/dev/null 2>&1
 
 ok "built $WRAPPER"
 ok "built $TARBALL"
+ok "built $SINGLE_FILE"

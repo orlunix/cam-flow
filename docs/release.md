@@ -43,6 +43,7 @@ Outputs:
 - `dist/camflow`
 - `dist/camflow-release/`
 - `dist/camflow-release.tar.gz`
+- `dist/camflow.py`
 
 The wrapper is relocatable and runs `python3 -m runner.runtime` with the release
 tree plus vendored runtime dependencies on `PYTHONPATH`. It resolves symlinks
@@ -52,7 +53,16 @@ before locating `camflow-release/` and chooses `python3.12`, `python3.11`,
 ```bash
 dist/camflow version
 dist/camflow --help
+dist/camflow.py version
+dist/camflow.py --help
 ```
+
+`dist/camflow.py` is the camc-style zero-install single-file launcher. It uses
+only the stdlib at startup, re-execs into Python 3.10+ if the default
+interpreter is older, extracts an embedded immutable release tree into
+`~/.cache/camflow/single-file/<payload-hash>/`, then runs the same runtime with
+vendored dependencies. Set `CAMFLOW_SINGLE_FILE_CACHE` to override the cache
+location.
 
 ## 3. Dry Run
 
