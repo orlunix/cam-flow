@@ -27,6 +27,7 @@ REMOTE_WRAPPER="$REMOTE_DIR/camflow"
 REMOTE_TARBALL="$REMOTE_DIR/camflow-release.tar.gz"
 SHARED_BIN_DIR="/home/prgn_share/bin"
 SHARED_BIN_PATH="$SHARED_BIN_DIR/camflow"
+SHARED_CURRENT_DIR="/home/prgn_share/tools/camflow/current"
 SHARED_RELEASES_DIR="/home/prgn_share/tools/camflow/releases"
 SSH_TIMEOUT=10
 
@@ -191,11 +192,17 @@ while IFS=$'\t' read -r name host user port; do
     failed=$((failed + 1)); failures+=("$name:mismatch"); continue
   fi
 
-  if ssh "${SSH_OPTS[@]}" "$target" "test -d $SHARED_BIN_DIR -a -w $SHARED_BIN_DIR" \
-      >/dev/null 2>&1; then
-    install_cmd="cp -p $REMOTE_WRAPPER $SHARED_BIN_PATH && chmod 0755 $SHARED_BIN_PATH"
+  if ssh "${SSH_OPTS[@]}" "$target" \
+      "test -d $SHARED_BIN_DIR -a -w $SHARED_BIN_DIR" >/dev/null 2>&1; then
+    install_cmd=\
+"mkdir -p $SHARED_CURRENT_DIR && \
+cp -p $REMOTE_WRAPPER $SHARED_CURRENT_DIR/camflow && \
+tar -xzf $REMOTE_TARBALL -C $SHARED_CURRENT_DIR && \
+chmod 0755 $SHARED_CURRENT_DIR/camflow && \
+ln -sfn $SHARED_CURRENT_DIR/camflow $SHARED_BIN_PATH && \
+$SHARED_BIN_PATH version"
     if ssh "${SSH_OPTS[@]}" "$target" "$install_cmd" >/dev/null 2>&1; then
-      ok "   shared: $SHARED_BIN_PATH"
+      ok "   shared: $SHARED_BIN_PATH -> $SHARED_CURRENT_DIR/camflow"
     else
       warn "   shared install failed for $label"
     fi

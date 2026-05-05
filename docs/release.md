@@ -92,7 +92,8 @@ Remote layout:
 If `/home/prgn_share/bin` is writable, the script also installs:
 
 ```text
-/home/prgn_share/bin/camflow
+/home/prgn_share/bin/camflow -> /home/prgn_share/tools/camflow/current/camflow
+/home/prgn_share/tools/camflow/current/camflow-release/
 ```
 
 If `/home/prgn_share/tools/camflow/releases` is writable, it archives the
