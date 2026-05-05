@@ -231,6 +231,74 @@ output_schema:
 This applies to every node you produce, including audit tool nodes
 and reviewer nodes — same five type names everywhere.
 
+## Audit-node mandatory check
+
+**If `upstream.understand.data.deterministic_test_scripts` is
+non-empty, you MUST include one `run.tool` audit node per script
+listed there.** Each entry has the shape
+`{path: <script_path>, envelope_data_fields: [<field>, ...]}` —
+use both fields when designing the audit node. Per audit node:
+
+- `run: { tool: <script_path> }` (the `path` comes verbatim from
+  the analyzer's entry).
+- `needs: [<implementer-class-node>]`.
+- `output_schema` MUST match the script's **actual** envelope —
+  declare ONLY the fields listed in this script's
+  `envelope_data_fields` (mapped to the right v1.1 type:
+  `passed: boolean`, `tests_run: integer`, `output: string`,
+  `failed_tests: array`, etc.). **Two scripts with different
+  `envelope_data_fields` get different schemas — don't generate a
+  uniform schema across audit nodes.** The runtime accepts
+  envelopes with extra `data` fields; it REJECTS envelopes missing
+  declared fields, so under-declaring is safe and over-declaring
+  halts the node.
+  Minimum-viable audit schema if a script emits at least
+  `{passed, tests_run, output}`:
+  ```yaml
+  output_schema:
+    passed: boolean
+    tests_run: integer
+    output: string
+  ```
+  Add `failed_tests: array` ONLY for scripts whose
+  `envelope_data_fields` includes `"failed_tests"`. If the analyzer
+  surfaced a `path` but no `envelope_data_fields` summary (or just
+  a string path under an older shape), default to the minimum
+  schema.
+- `verify.command: 'test "$(jq -r .data.passed agent_output.json)"
+  = "true"'` (the audit's own pass/fail gate).
+- Listed in the reviewer node's `needs` so the reviewer can cite the
+  envelopes as per-class evidence.
+
+**Why this is mandatory and not optional:** the implementer's
+`verify.command` is a node-local quality gate — it tells you "the
+implementer's attempt passed all tests" but it does NOT produce a
+structured envelope a downstream reviewer or operator can cite as
+independent evidence. Audit tool nodes produce
+`agent_output.json` envelopes that live in `nodes/<id>/attempt-N/`
+and become first-class citation targets. Skipping them when valid
+envelope-emitting scripts exist is a regression — you lose the
+per-class structured evidence trail and force the reviewer to do
+its citation work from prose-level inference.
+
+**If `deterministic_test_scripts` is empty** (the analyzer didn't
+find any envelope-emitting runners), do NOT invent invalid
+`run.tool` nodes. Two valid alternatives:
+
+1. **Skill-based audit node** — a node with `run: { skill: ... }` if
+   you have a registered skill that runs tests and emits the
+   envelope (none of the shipped repo skills do this directly today;
+   reach for project-specific custom skills if available).
+2. **Lean on implementer.verify.command** — it's still a real
+   deterministic gate, just without the structured per-class
+   evidence. Reviewer must then cite tests by name from prose
+   inference. Acceptable but weaker.
+
+Don't fabricate a `run.tool` node pointing at a script that emits
+raw test output (e.g. `pytest -q` returning to stdout). The runtime
+will reject the envelope as `TOOL_BAD_OUTPUT` and the audit node
+will halt instead of producing evidence.
+
 ## Common shape: implement code per spec
 
 When the task is "implement / modify code to satisfy a written spec
@@ -323,9 +391,12 @@ markers and commands; the structure should stay the same.
   steps:
     - "Run the visible test command from the project root."
     - "Capture pass/fail and a count of tests run."
-    - "Emit envelope with data.passed, data.tests_run."
+    - "Emit envelope with data.passed and data.tests_run."
   run:
     tool: scripts/<run_visible.sh>
+  # Minimum-viable schema. If you've read the script and confirmed it
+  # also emits failed_tests, add `failed_tests: array` here too —
+  # otherwise omit (declared-but-missing fields halt the node).
   output_schema:
     passed: boolean
     tests_run: integer
@@ -343,6 +414,9 @@ markers and commands; the structure should stay the same.
     - "Emit envelope with data.passed, data.tests_run, data.failed_tests."
   run:
     tool: scripts/<run_invariants.sh>
+  # This schema includes failed_tests because run_invariants.sh
+  # explicitly emits it. Match each script's ACTUAL envelope —
+  # don't assume both audit scripts share a shape.
   output_schema:
     passed: boolean
     tests_run: integer

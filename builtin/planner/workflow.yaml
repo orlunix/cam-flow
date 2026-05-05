@@ -38,8 +38,9 @@ nodes:
       constraints: array
       ambiguities: array
       test_files: array
+      deterministic_test_scripts: array
     verify:
-      criterion: "task_statement faithfully covers what the user asked; constraints + ambiguities are accurate; test_files lists any test/spec artifacts the downstream designer should plan around (empty list if none)"
+      criterion: "task_statement faithfully covers what the user asked; constraints + ambiguities are accurate; test_files lists any test/spec artifacts the downstream designer should plan around (empty list if none); deterministic_test_scripts lists ONLY paths that the analyzer has read and confirmed emit JSON envelopes (empty if none qualify)"
     retry: 2
 
   - id: design_dag
@@ -57,7 +58,7 @@ nodes:
       dag: array
       context: string
     verify:
-      criterion: "DAG covers the task statement; needs are consistent (no orphan, no cycle); each node references a real skill or tool"
+      criterion: "DAG covers the task statement; needs are consistent (no orphan, no cycle); each node references a real skill or tool; AND if upstream.understand.data.deterministic_test_scripts is non-empty (envelope-emitting test runners exist), the DAG MUST include one run.tool audit node per such script after the implementer-class node, with each audit node feeding into the reviewer's needs — implementer.verify.command is a quality gate, NOT a substitute for independent audit envelopes"
     retry: 3
 
   - id: render_yaml

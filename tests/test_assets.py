@@ -149,6 +149,91 @@ class TestBuiltinPlanner:
             "understand.output_schema must include test_files: array"
         )
 
+    def test_planner_workflow_yaml_includes_deterministic_test_scripts(self):
+        """understand.output_schema must carry deterministic_test_scripts
+        so the designer's audit-node mandatory check has a structured
+        signal. design_dag.verify.criterion must reference it so the
+        gate fires."""
+        spec = yaml.safe_load(_read(BUILTIN_PLANNER_YAML))
+        understand = next(n for n in spec["nodes"] if n["id"] == "understand")
+        assert "deterministic_test_scripts" in (
+            understand.get("output_schema") or {}), (
+            "understand.output_schema must include "
+            "deterministic_test_scripts: array"
+        )
+        design = next(n for n in spec["nodes"] if n["id"] == "design_dag")
+        verify_crit = (design.get("verify") or {}).get("criterion") or ""
+        assert "deterministic_test_scripts" in verify_crit, (
+            "design_dag.verify.criterion must reference "
+            "deterministic_test_scripts so audit-node-mandatory is "
+            "actually gated."
+        )
+
+    def test_prompt_analyzer_declares_deterministic_test_scripts(self):
+        """prompt_analyzer must declare the deterministic_test_scripts
+        field with the envelope-emitting contract so it doesn't
+        misclassify raw-output scripts."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "prompt_analyzer" /
+                     "SKILL.md")
+        assert "deterministic_test_scripts" in text
+        # The envelope contract must be spelled out — otherwise the
+        # analyzer might list any script with "test" in its name.
+        assert "envelope-emitting" in text.lower() or \
+               "JSON envelope" in text
+
+    def test_workflow_designer_has_audit_node_mandatory_check(self):
+        """workflow_designer must include the MUST rule for audit
+        nodes when deterministic_test_scripts is non-empty.
+        Per codex-planner-audit-nodes-minimal-fix."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "workflow_designer" /
+                     "SKILL.md")
+        assert "Audit-node mandatory check" in text
+        # The MUST rule itself, not just the heading.
+        assert "you MUST include one `run.tool` audit node" in text or \
+               "MUST include one run.tool audit node" in text or \
+               "MUST include one `run.tool`" in text
+        # Reference the structured signal (avoid silent skipping).
+        assert "deterministic_test_scripts" in text
+
+    def test_workflow_designer_audit_schema_matches_actual_envelope(self):
+        """codex-audit-node-schema-followup: each audit node's
+        output_schema must match the SPECIFIC script's actual envelope
+        fields. The previous uniform-schema assumption halted runs when
+        scripts emitted different shapes (e.g. only invariant runner
+        emits failed_tests). The SKILL.md must teach: declare only what
+        the script emits; minimum-viable schema is
+        passed/tests_run/output; failed_tests added only when the
+        analyzer confirms the script emits it."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "workflow_designer" /
+                     "SKILL.md")
+        # Must caution against uniform schema across audit nodes.
+        assert "envelope_data_fields" in text, (
+            "designer must reference the analyzer's per-script "
+            "envelope_data_fields summary, not assume a uniform shape."
+        )
+        # Must spell out the rejection-on-missing-field rule so the
+        # LLM understands why over-declaring is dangerous.
+        normalized = " ".join(text.split()).lower()
+        assert ("rejects envelopes missing declared fields" in normalized
+                or "missing declared fields" in normalized
+                or "declared-but-missing fields halt" in normalized)
+        # Minimum-viable schema must be named.
+        assert "minimum-viable" in text.lower() or \
+               "minimum viable" in text.lower()
+
+    def test_prompt_analyzer_deterministic_scripts_carries_field_summary(self):
+        """prompt_analyzer's deterministic_test_scripts must surface
+        per-script envelope_data_fields so the designer can declare a
+        matching audit-node schema. List-of-paths alone is not enough
+        (caused the canonical-003 default_audit halt)."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "prompt_analyzer" /
+                     "SKILL.md")
+        assert "envelope_data_fields" in text, (
+            "prompt_analyzer must declare a per-script "
+            "envelope_data_fields summary so the designer can match "
+            "the audit node's schema to what the script actually emits."
+        )
+
     def test_workflow_designer_lists_repo_skills(self):
         """Designer must point at concrete repo skills it can reach for
         — without this, LLMs invent names like gather_context /
