@@ -1737,7 +1737,7 @@ class TestVerifyAgentShape:
         monkeypatch.setattr(rt.camc, "run_and_collect", fake_run_and_collect)
         wf_dummy = type("W", (), {"run_dir": kw_path(monkeypatch),
                                   "tag": "t",
-                                  "spec": {}})()
+                                  "spec": {}, "goal": None})()
         ok, _ = verify_with_agent(self._node(2), wf_dummy,
                                   {"status": "success"}, 1)
         assert ok is True
@@ -1755,7 +1755,7 @@ class TestVerifyAgentShape:
         monkeypatch.setattr(rt.camc, "run_and_collect", fake_run_and_collect)
         wf_dummy = type("W", (), {"run_dir": kw_path(monkeypatch),
                                   "tag": "t",
-                                  "spec": {}})()
+                                  "spec": {}, "goal": None})()
         ok, fb = verify_with_agent(self._node(2), wf_dummy,
                                    {"status": "success"}, 1)
         assert ok is False
@@ -1780,7 +1780,7 @@ class TestVerifyAgentShape:
         monkeypatch.setattr(rt.camc, "run_and_collect", fake_run_and_collect)
         wf_dummy = type("W", (), {"run_dir": kw_path(monkeypatch),
                                   "tag": "t",
-                                  "spec": {}})()
+                                  "spec": {}, "goal": None})()
         ok, fb = verify_with_agent(self._node(2), wf_dummy,
                                    {"status": "success"}, 1)
         assert ok is False
@@ -1807,7 +1807,7 @@ class TestVerifyAgentShape:
         monkeypatch.setattr(rt.camc, "run_and_collect", fake_run_and_collect)
         wf_dummy = type("W", (), {"run_dir": kw_path(monkeypatch),
                                   "tag": "t",
-                                  "spec": {}})()
+                                  "spec": {}, "goal": None})()
         ok, fb = verify_with_agent(self._node(2), wf_dummy,
                                    {"status": "success"}, 1)
         assert ok is False
@@ -1834,7 +1834,7 @@ class TestVerifyAgentShape:
         monkeypatch.setattr(rt.camc, "run_and_collect", fake_run_and_collect)
         wf_dummy = type("W", (), {"run_dir": kw_path(monkeypatch),
                                   "tag": "t",
-                                  "spec": {}})()
+                                  "spec": {}, "goal": None})()
         ok, _ = verify_with_agent(self._node(2), wf_dummy,
                                   {"status": "success"}, 1)
         assert ok is True
@@ -2019,3 +2019,96 @@ class TestGoalDriven:
         out = build_run_prompt(node, {})
         assert "Goal-driven retry" not in out
         assert "previous attempt failed" not in out
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  TestWorkflowGoalInjection — goal-driven supplement, prompt-side
+#  Per codex-post-implementation-scope-review: Workflow.goal is stored
+#  but the agent must actually SEE it in the prompt for goal-driven
+#  retry/verify to mean anything.
+# ───────────────────────────────────────────────────────────────────────
+
+class TestWorkflowGoalInjection:
+    """Run + verify prompts must carry workflow.goal verbatim under a
+    `# Workflow Goal` section when supplied. Absent goal omits cleanly."""
+
+    GOAL = "Implement parse_record satisfying SPEC.md Req 1-4."
+
+    def _node(self, *, goal_text: str = "the local node objective"):
+        return Node.from_dict({
+            "id": "n", "goal": goal_text, "steps": ["s1", "s2"],
+            "run": {"skill": "analyzer"},
+        })
+
+    # ── run prompt ─────────────────────────────────────────────────────
+
+    def test_run_prompt_carries_workflow_goal_verbatim(self):
+        out = build_run_prompt(self._node(), {},
+                               workflow_goal=self.GOAL)
+        assert "# Workflow Goal" in out
+        assert self.GOAL in out, (
+            "the literal Workflow.goal text must appear in the run "
+            "prompt — otherwise retry can't actually re-read it."
+        )
+
+    def test_run_prompt_workflow_goal_precedes_workflow_context(self):
+        out = build_run_prompt(self._node(), {},
+                               workflow_goal=self.GOAL,
+                               workflow_context="shared facts here")
+        wg = out.index("# Workflow Goal")
+        wc = out.index("# Workflow Context")
+        assert wg < wc, (
+            "# Workflow Goal must precede # Workflow Context so the "
+            "persistent objective is read first."
+        )
+
+    def test_run_prompt_omits_workflow_goal_when_absent(self):
+        out = build_run_prompt(self._node(), {},
+                               workflow_context="shared facts")
+        assert "# Workflow Goal" not in out
+
+    def test_run_prompt_omits_workflow_goal_when_empty_string(self):
+        out = build_run_prompt(self._node(), {}, workflow_goal="   ")
+        assert "# Workflow Goal" not in out
+
+    # ── retry prompt path: literal goal text alongside directive ───────
+
+    def test_retry_prompt_contains_both_goal_text_and_directive(self):
+        out = build_run_prompt(
+            self._node(),
+            {"previous": {"status": "fail", "feedback": "missed reqK"}},
+            workflow_goal=self.GOAL,
+        )
+        # The literal goal text must be present (so re-read is possible).
+        assert self.GOAL in out
+        # And the goal-driven directive that tells the agent to do so.
+        assert "Goal-driven retry" in out
+        assert "Workflow.goal" in out or "workflow.goal" in out.lower()
+
+    # ── verify prompt ──────────────────────────────────────────────────
+
+    def test_verify_prompt_carries_workflow_goal_verbatim(self):
+        envelope = {"status": "success", "data": {"x": 1}}
+        out = build_verify_prompt(self._node(), envelope,
+                                  workflow_goal=self.GOAL)
+        assert "# Workflow Goal" in out
+        assert self.GOAL in out, (
+            "verify prompt must carry the literal Workflow.goal so the "
+            "evaluator can judge against the persistent objective, not "
+            "only against the local checklist."
+        )
+
+    def test_verify_prompt_workflow_goal_precedes_workflow_context(self):
+        out = build_verify_prompt(
+            self._node(), {"status": "success", "data": {}},
+            workflow_goal=self.GOAL,
+            workflow_context="shared facts",
+        )
+        wg = out.index("# Workflow Goal")
+        wc = out.index("# Workflow Context")
+        assert wg < wc
+
+    def test_verify_prompt_omits_workflow_goal_when_absent(self):
+        out = build_verify_prompt(
+            self._node(), {"status": "success", "data": {}})
+        assert "# Workflow Goal" not in out

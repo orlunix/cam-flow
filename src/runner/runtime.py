@@ -571,21 +571,30 @@ def _format_steps_for_prompt(steps: list[str]) -> str:
 
 def build_run_prompt(node: "Node", input_dict: dict,
                      skill_md: str | None = None,
-                     workflow_context: str | None = None) -> str:
+                     workflow_context: str | None = None,
+                     workflow_goal: str | None = None) -> str:
     """Compose the prompt for a run agent (skill mode).
 
     Layout:
       [skill template]
+      [Workflow Goal]         ← persistent run objective, optional
       [Workflow Context]      ← shared across every node, optional
-      [Goal]
+      [Goal]                  ← this Node.goal
       [Steps]
       [Upstream Outputs]      ← auto-injected from `needs`, optional
       [Note: previous]         ← only on retry
       [Output schema + delivery protocol]
+
+    `workflow_goal` is the v1.1 Workflow.goal (the persistent run
+    objective from top-level YAML `goal:`). When supplied, it appears
+    as a dedicated section before Workflow Context so the goal-driven
+    retry instructions can actually re-read it.
     """
     parts = []
     if skill_md:
         parts.append(skill_md.strip())
+    if workflow_goal and workflow_goal.strip():
+        parts.append(f"# Workflow Goal\n{workflow_goal.strip()}")
     if workflow_context and workflow_context.strip():
         parts.append(f"# Workflow Context\n{workflow_context.strip()}")
     parts.append(f"# Goal\n{node.goal}")
@@ -612,8 +621,10 @@ def build_run_prompt(node: "Node", input_dict: dict,
             + json.dumps(input_dict["previous"], indent=2, ensure_ascii=False)
             + "\n```\n"
             "Goal-driven retry — before redoing this attempt:\n"
-            "1. Re-read the Workflow Context above (the persistent "
-            "Workflow.goal). What outcome must the run as a whole prove?\n"
+            "1. Re-read the # Workflow Goal section above (the persistent "
+            "Workflow.goal). What outcome must the run as a whole prove? "
+            "(If # Workflow Goal is absent, fall back to the Workflow "
+            "Context block.)\n"
             "2. Re-read the # Goal section (this Node.goal). Which part of "
             "the Workflow.goal does this node advance or prove?\n"
             "3. Read previous.feedback (or error.message) as evidence of "
@@ -657,15 +668,23 @@ def build_run_prompt(node: "Node", input_dict: dict,
 
 
 def build_verify_prompt(node: "Node", run_envelope: dict,
-                        workflow_context: str | None = None) -> str:
+                        workflow_context: str | None = None,
+                        workflow_goal: str | None = None) -> str:
     """Compose the prompt for the verify-agent (default verify path).
 
     Verify-agent's data shape is fixed: {approved, step_results, reasoning}.
+
+    `workflow_goal` is the v1.1 Workflow.goal (persistent run
+    objective). When supplied, the evaluator can judge whether this
+    node's run actually advanced the persistent goal, not only
+    whether the local checklist was satisfied.
     """
     criterion = (node.verify_config or {}).get("criterion") or ""
     parts = [
         f"You are evaluating whether the previous node `{node.id}` did its job.",
     ]
+    if workflow_goal and workflow_goal.strip():
+        parts.append(f"# Workflow Goal\n{workflow_goal.strip()}")
     if workflow_context and workflow_context.strip():
         parts.append(f"# Workflow Context\n{workflow_context.strip()}")
     if criterion:
@@ -811,10 +830,12 @@ def exec_tool(tool_path: Path, input_dict: dict, workspace: Path) -> dict:
 
 def exec_skill(skill_md: str, node: "Node", input_dict: dict,
                workspace: Path, attempt_n: int, run_id_tag: str,
-               workflow_context: str | None = None) -> dict:
+               workflow_context: str | None = None,
+               workflow_goal: str | None = None) -> dict:
     """Spawn a camc agent loaded with the skill template + run prompt."""
     prompt = build_run_prompt(node, input_dict, skill_md=skill_md,
-                              workflow_context=workflow_context)
+                              workflow_context=workflow_context,
+                              workflow_goal=workflow_goal)
     (workspace / "prompt.txt").write_text(prompt)
     agent_name = f"{node.id}-attempt-{attempt_n}"
     try:
@@ -937,6 +958,7 @@ def verify_with_agent(node: "Node", workflow: "Workflow", envelope: dict,
     prompt = build_verify_prompt(
         node, envelope,
         workflow_context=workflow.spec.get("context"),
+        workflow_goal=workflow.goal,
     )
     (sub_dir / "prompt.txt").write_text(prompt)
     try:
@@ -1167,7 +1189,8 @@ class Node:
             skill_md = skill_path.read_text() if skill_path else ""
             return exec_skill(skill_md, self, input_dict, att_dir,
                               attempt_n, workflow.tag,
-                              workflow_context=workflow.spec.get("context"))
+                              workflow_context=workflow.spec.get("context"),
+                              workflow_goal=workflow.goal)
         if "tool" in self.run_config:
             tool_path = _resolve_tool_path(self.run_config["tool"],
                                            workflow.project_root)
