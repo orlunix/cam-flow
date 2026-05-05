@@ -1,4 +1,4 @@
-Solve the camflow-blind-maze-oracle. The oracle exposes an HTTP API at $CAMFLOW_ORACLE_BASE_URL with session id $CAMFLOW_ORACLE_SESSION_ID; both env vars are exported. The path length is 5 (verify with maze_scan).
+Solve the camflow-blind-maze-oracle. The oracle exposes an HTTP API at $CAMFLOW_ORACLE_BASE_URL with session id $CAMFLOW_ORACLE_SESSION_ID; both env vars are exported. **`maze_scan` is the authoritative source for `path_length` and the action alphabet** — call it first and use its returned `path_length` to size the rest of the workflow (probe enumeration, submit path arity, etc.). Do NOT hardcode any specific path length in the compiled workflow's goal or in any node's logic; the path length varies by oracle session.
 
 Tools (all POST /tool with JSON body {session_id, tool, dag_revision, args}):
 

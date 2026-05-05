@@ -8,30 +8,33 @@ version: "1.1"
 # oracle halts; rev 2 (after `camflow replan`) submits again and
 # succeeds.
 
-goal: "Reach maze_status.solved=true on dag_revision >= 2 by inferring the hidden 5-step path through probes and submitting it."
+goal: "Reach maze_status.solved=true on dag_revision >= 2 by inferring the hidden path through probes and submitting it."
 
 context: |
   Original task: solve the camflow-blind-maze-oracle.
   Oracle base URL: $CAMFLOW_ORACLE_BASE_URL
   Session id:     $CAMFLOW_ORACLE_SESSION_ID
-  Path length:    5 (verify via maze_scan)
   Action set:     N, E, S, W
+  Path length:    determined by maze_scan (varies by oracle session;
+                  do NOT hardcode any specific value).
   Tool wrappers:  scripts/maze_{scan,probe,submit,status}.sh
   Each wrapper reads CAMFLOW_DAG_REVISION from env and emits a
   CamFlow envelope with data=<oracle response>.
 
   Important: the oracle deliberately halts the FIRST submit on
   dag_revision=1 even when the path is correct. The solve must
-  come from dag_revision>=2 — the operator runs `camflow replan`
-  between the halt and the second attempt.
+  come from dag_revision>=2 — either the operator runs
+  `camflow replan`, or (Phase B) the workflow opts in via top-level
+  `on_halt: replan` + `max_replans: 1` so runtime auto-replans
+  after the controlled halt.
 
 nodes:
   - id: solver
-    goal: "Scan the maze, probe to infer the 5-step path, and submit it. Report the inferred path so a replan can re-use it."
+    goal: "Scan the maze, probe to infer the path (length from maze_scan), and submit it. Report the inferred path so a replan can re-use it."
     steps:
-      - "Run scripts/maze_scan.sh to confirm path_length=5 and exits."
-      - "Use scripts/maze_probe.sh iteratively (depth-first style) to narrow down each step of the path."
-      - "Once a full 5-step path is justified by the probes, call scripts/maze_submit.sh with that path."
+      - "Run scripts/maze_scan.sh to read the authoritative path_length and exits."
+      - "Use scripts/maze_probe.sh iteratively (depth-first style), sized to the maze_scan path_length, to narrow down each step of the path."
+      - "Once a full path of the maze_scan-reported length is justified by the probes, call scripts/maze_submit.sh with that path."
       - "If the oracle responds with halt=true (expected on dag_revision=1), report status=fail with the inferred path in data so the replan can re-use it."
     run:
       skill: code_writer
