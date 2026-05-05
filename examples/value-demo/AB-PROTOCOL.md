@@ -8,6 +8,13 @@ csvparser fixture. Both sides receive the **same** prompt
 The 100-point rubric is in [`docs/e2e-ab-score-protocol-codex-2026-05-04.md`](../../docs/e2e-ab-score-protocol-codex-2026-05-04.md);
 `scripts/score.py` automates the objective rows.
 
+This directory is a regression benchmark asset. Keep `PROMPT.txt`,
+`fixture/`, `workflow-reference.yaml`, `scripts/setup-fixture.sh`,
+`scripts/score.py`, and this protocol in the repo so future Planner or
+Runtime changes can be scored against the same task and compared to
+prior runs. Do not replace the fixture to make a new score look better;
+add a new benchmark instead.
+
 ---
 
 ## What gets compared

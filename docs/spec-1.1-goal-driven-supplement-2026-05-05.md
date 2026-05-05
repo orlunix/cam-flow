@@ -138,6 +138,10 @@ These semantics should remain in the architecture plan, but should not
 be required for the immediate implementation. They are the second
 category: must preserve in design, implement after the MVP is stable.
 
+They are also a version boundary. Implementing these semantics changes
+CamFlow beyond the v1.1 goal-driven MVP and should be treated as the
+next spec version or an explicit RFC, not as a quiet v1.1 patch.
+
 ### 4.1 Planner Logical Residency
 
 Planner should become logically resident for the lifetime of a run.
@@ -193,7 +197,24 @@ Automated replan should wait until manual replan is reliable. It must
 preserve the same original objective, record the DAG revision, and keep
 a clear audit trail of why the plan changed.
 
-## 5. Explicitly Out Of Scope For This Supplement
+## 5. Post-v1.1 TODO
+
+Keep these TODOs visible until they are either implemented in the next
+spec version or explicitly rejected:
+
+1. Define Planner logical residency precisely: what state is persisted,
+   how Planner is re-entered, and which artifacts it reads.
+2. Add halt-time Planner review as an advisory pass over `trace.jsonl`,
+   `halt.json`, node outputs, `Workflow.goal`, and the active DAG
+   revision.
+3. Define manual replan revision: how a proposed `workflow.yaml` becomes
+   the active DAG revision, and what approval is required.
+4. Define invalidation rules for DAG revisions: which prior node outputs
+   can be carried forward and which descendants must re-run.
+5. Only after manual replan is reliable, consider automated replan with
+   a recorded DAG revision and a clear audit trail.
+
+## 6. Explicitly Out Of Scope For This Supplement
 
 Do not introduce these in the first goal-driven implementation:
 
@@ -206,12 +227,24 @@ Do not introduce these in the first goal-driven implementation:
 - unbounded retry or retry-as-progress scoring;
 - automatic replan without a recorded DAG revision.
 
-## 6. Implementation Guidance
+## 7. Regression Benchmark Asset
+
+`examples/value-demo/` is the canonical scored regression benchmark for
+this line of work. Keep its fixture, prompt, setup script, scorer, and
+protocol in the repo so future Planner/runtime changes can be scored
+against the same task and compared to prior runs.
+
+The benchmark is not the spec, but it is the regression guard for the
+spec's value claim: CamFlow should outperform a single `camc run` by
+producing inspectable multi-step workflows with independent audit
+evidence.
+
+## 8. Implementation Guidance
 
 This section is guidance, not extra spec semantics. The Developer may
 choose different code structure if it preserves the requirements above.
 
-### 6.1 Planner Prompt Changes
+### 8.1 Planner Prompt Changes
 
 The first implementation should prefer prompt and sentinel-test changes
 over runtime machinery.
@@ -228,7 +261,7 @@ Planner should generate workflows where:
 This keeps the change close to the existing Planner work and avoids
 changing the v1.1 YAML schema.
 
-### 6.2 Retry Prompt Changes
+### 8.2 Retry Prompt Changes
 
 Retry should use the existing `previous.feedback` channel. Do not add a
 new retry state field for the first version.
@@ -243,7 +276,7 @@ The retry prompt or skill instructions should make the agent answer:
 If the node cannot close the gap locally, it should fail clearly rather
 than loop on unrelated edits.
 
-### 6.3 Final Audit Shape
+### 8.3 Final Audit Shape
 
 For now, final goal audit should be a normal generated node. It should
 depend on implementation and independent audit/test nodes where those
@@ -263,7 +296,7 @@ The important part is the evidence discipline: every explicit
 requirement from the original goal should have concrete supporting
 evidence.
 
-### 6.4 DAG Revision Recording
+### 8.4 DAG Revision Recording
 
 The first DAG revision implementation can be mechanical:
 
@@ -276,7 +309,7 @@ The first DAG revision implementation can be mechanical:
 This should not affect scheduling, retry, or verification behavior. It
 is an audit/replay artifact first.
 
-### 6.5 Tests
+### 8.5 Tests
 
 Use focused sentinel tests before broad runtime tests:
 
@@ -290,7 +323,7 @@ Use focused sentinel tests before broad runtime tests:
 These tests should protect the goal-driven behavior without requiring
 automatic replan yet.
 
-## 7. Immediate Implementation Order
+## 9. Immediate Implementation Order
 
 1. Strengthen Planner prompts so `workflow.goal` is clear and node goals
    map back to it.
