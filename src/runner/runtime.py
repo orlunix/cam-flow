@@ -230,6 +230,12 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
         return ["workflow.nodes is missing or empty"]
     if "context" in wf and not isinstance(wf["context"], str):
         errors.append("workflow.context: must be a string")
+    # Top-level Workflow.goal — optional in v1.1, but if present it MUST be
+    # a string (the supplement landed 2026-05-05 expects compiled user
+    # workflows to start emitting it; existing fixtures stay valid by
+    # leaving it absent).
+    if "goal" in wf and not isinstance(wf["goal"], str):
+        errors.append("workflow.goal: must be a string when present")
 
     # Guard: each nodes[] element must be a dict before we can call .get().
     # Otherwise we'd raise AttributeError mid-pass and lose the rest of
@@ -605,8 +611,21 @@ def build_run_prompt(node: "Node", input_dict: dict,
             "```json\n"
             + json.dumps(input_dict["previous"], indent=2, ensure_ascii=False)
             + "\n```\n"
-            "Read `feedback` (or `error.message`) to know what went wrong; "
-            "address it in this attempt."
+            "Goal-driven retry — before redoing this attempt:\n"
+            "1. Re-read the Workflow Context above (the persistent "
+            "Workflow.goal). What outcome must the run as a whole prove?\n"
+            "2. Re-read the # Goal section (this Node.goal). Which part of "
+            "the Workflow.goal does this node advance or prove?\n"
+            "3. Read previous.feedback (or error.message) as evidence of "
+            "what is still missing — not as a diff to literally apply.\n"
+            "4. If the local plan is sound, fix the specific gap "
+            "previous.feedback names and proceed.\n"
+            "5. If the gap is structural (the plan itself is wrong, you "
+            "need data the DAG didn't fetch, the node goal can't be met "
+            "by a local fix), fail clearly with status=fail and a concrete "
+            "error.message naming the plan mismatch — do NOT loop on "
+            "unrelated edits to make the same local error go away. Retry "
+            "is a bounded safety net, not progress."
         )
     schema_section = _format_schema_for_prompt(node.output_schema)
     parts.append(
@@ -1221,16 +1240,14 @@ class Workflow:
         self.run_id = gen_run_id()
         self.tag = f"camflow:{self.run_id}"
 
+        # Workflow.goal — the persistent objective for the run, per the
+        # 2026-05-05 goal-driven supplement §3.1. Optional in v1.1; when
+        # present it MUST be a string (validate_workflow enforces).
+        self.goal: Optional[str] = (spec.get("goal")
+                                    if isinstance(spec, dict) else None)
+
         self.trace_path = run_dir / "trace.jsonl"
         self.pid_path = run_dir / "runner.pid"
-
-        if not resume:
-            (run_dir / "workflow.yaml").write_text(
-                yaml.safe_dump(spec, sort_keys=False)
-            )
-        else:
-            if self.trace_path.exists():
-                self.step_n = sum(1 for _ in self.trace_path.open())
 
         # project_root: explicit override (used by builtin Planner workflow)
         # OR derived from run_dir's .camflow ancestor.
@@ -1244,6 +1261,37 @@ class Workflow:
             else:
                 self.project_root = Path.cwd().resolve()
 
+        # dag_revision: which compiled-DAG revision is currently active.
+        # User-workflow trace events get tagged with this; Planner-internal
+        # workflows skip the field (their run_dir is .camflow/run/planner/,
+        # i.e. has a 'planner' parts segment).
+        self._is_user_workflow = self._detect_user_workflow_role()
+        self.dag_revision: int = 1
+
+        if not resume:
+            (run_dir / "workflow.yaml").write_text(
+                yaml.safe_dump(spec, sort_keys=False)
+            )
+            # Record the active execution DAG before user nodes run, so a
+            # future replay tool can reconstruct which plan was active for
+            # each node attempt. Mechanical; no scheduling/retry/verify
+            # behavior change. Skipped for the Planner-internal workflow —
+            # the user-facing active DAG is the one needing replay
+            # bookkeeping.
+            if self._is_user_workflow:
+                self._record_dag_revision(
+                    revision=1,
+                    parent_revision=None,
+                    reason="initial_plan",
+                )
+        else:
+            if self.trace_path.exists():
+                self.step_n = sum(1 for _ in self.trace_path.open())
+            if self._is_user_workflow:
+                # On resume, pick up the last revision number from the
+                # recorded directory so trace tagging stays consistent.
+                self.dag_revision = self._latest_recorded_revision() or 1
+
         self.pid_path.write_text(str(os.getpid()))
 
         # Crash-safety net.
@@ -1256,12 +1304,73 @@ class Workflow:
         except (ValueError, OSError):
             pass
 
+    # ─── DAG revision (per goal-driven supplement §3.6) ───────────────
+
+    def _detect_user_workflow_role(self) -> bool:
+        """True iff this Workflow is the user-facing active DAG.
+
+        Heuristic: the Planner builtin runs inside <project>/.camflow/run/
+        planner/, so its run_dir has a 'planner' segment under .camflow/.
+        Real user workflows live one level shallower (just .camflow/run/).
+        Misclassification is a forward-incompatibility risk if a user
+        ever names their project literally "planner"; that's accepted as
+        an MVP simplification per the supplement's "keep it mechanical".
+        """
+        parts = self.run_dir.resolve().parts
+        return not (".camflow" in parts and "planner" in parts)
+
+    def _dag_revisions_dir(self) -> Path:
+        return self.run_dir / "dag_revisions"
+
+    @staticmethod
+    def _rev_dirname(n: int) -> str:
+        return f"{n:04d}"
+
+    def _latest_recorded_revision(self) -> Optional[int]:
+        d = self._dag_revisions_dir()
+        if not d.is_dir():
+            return None
+        nums = []
+        for sub in d.iterdir():
+            if sub.is_dir() and sub.name.isdigit():
+                nums.append(int(sub.name))
+        return max(nums) if nums else None
+
+    def _record_dag_revision(self, *, revision: int,
+                             parent_revision: Optional[int],
+                             reason: str) -> None:
+        """Copy the active workflow.yaml into dag_revisions/<NNNN>/ +
+        manifest.json. Mechanical; no scheduling/retry/verify change.
+        """
+        rev_dir = self._dag_revisions_dir() / self._rev_dirname(revision)
+        rev_dir.mkdir(parents=True, exist_ok=True)
+        active = self.run_dir / "workflow.yaml"
+        if active.exists():
+            (rev_dir / "workflow.yaml").write_text(active.read_text())
+        manifest = {
+            "revision": revision,
+            "parent_revision": parent_revision,
+            "reason": reason,
+            "workflow_goal": self.goal,  # may be None for legacy/synthetic
+        }
+        (rev_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False)
+        )
+        self.dag_revision = revision
+
     # ─── Persistence + tracing ────────────────────────────────────────
 
     def trace(self, event: str, **fields):
         self.step_n += 1
         rec = {"step": self.step_n, "ts": utcnow_iso(),
-               "event": event, **fields}
+               "event": event}
+        # Tag user-workflow events with the active DAG revision so a
+        # future replay tool can reconstruct which plan was active for
+        # each node attempt (supplement §3.6). Planner-internal workflows
+        # skip this field — the active execution DAG is the user's.
+        if self._is_user_workflow:
+            rec["dag_revision"] = self.dag_revision
+        rec.update(fields)
         with self.trace_path.open("a") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 

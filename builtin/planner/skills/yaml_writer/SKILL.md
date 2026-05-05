@@ -5,8 +5,8 @@ produced by `workflow_designer` and emit a syntactically valid
 camflow `workflow.yaml` as a single string.
 
 The upstream `workflow_designer` envelope is in your input under
-`upstream.design_dag`. Use its `data.dag` (list of node dicts) and
-`data.context` (string).
+`upstream.design_dag`. Use its `data.workflow_goal` (string), `data.dag`
+(list of node dicts), and `data.context` (string).
 
 ## What you must produce
 
@@ -21,6 +21,13 @@ The upstream `workflow_designer` envelope is in your input under
 ```yaml
 workflow: <descriptive_snake_case_name>
 version: "1.1"
+
+goal: |
+  <one-sentence concrete restatement of the user's objective — the
+   value of upstream.design_dag.data.workflow_goal verbatim. This is
+   the v1.1 Workflow.goal field; retry/review/final-audit judge against
+   it. MUST be present and a non-empty string for any non-trivial
+   workflow.>
 
 context: |
   <multi-line text from design_dag's context;
@@ -46,23 +53,28 @@ nodes:
 
 1. Output is `yaml_text`, **a string** — not a dict. The runtime parses
    it back into a dict before running it.
-2. **No `state:` or `inputs:` section.** they don't exist.
-3. **No `run.input:` field.** Cross-node data flows through `needs`
+2. **Carry `workflow_goal` through to top-level `goal:`.** Take
+   `upstream.design_dag.data.workflow_goal` verbatim and write it as
+   the workflow's top-level `goal:` block. Don't skip it; don't
+   paraphrase it. This is the persistent objective the retry/review/
+   final-audit chain judges against.
+3. **No `state:` or `inputs:` section.** they don't exist.
+4. **No `run.input:` field.** Cross-node data flows through `needs`
    automatically.
-4. **Match the spec exactly.** If `verify` is omitted, the runtime
+5. **Match the spec exactly.** If `verify` is omitted, the runtime
    uses default agent verify with the steps as criterion. Don't write
    `verify: { agent: ... }` — that's not a thing.
-5. **Quote strings that contain colons or special YAML chars.**
-6. **`verify: human` is opt-in.** Carry it through ONLY if `design_dag`
+6. **Quote strings that contain colons or special YAML chars.**
+7. **`verify: human` is opt-in.** Carry it through ONLY if `design_dag`
    actually put it on a node, which it should only do when the user's
    original prompt asked for review/approval. Don't add `verify: human`
    on your own; don't drop it if it was intentionally placed.
-7. **`run.tool:` is rare.** Carry it through ONLY if `design_dag`
+8. **`run.tool:` is rare.** Carry it through ONLY if `design_dag`
    placed it (which means design_dag judged the §10 5-criterion bar is
    met). Don't change a `skill` to a `tool`. Don't change a `tool` to a
    `skill`. The decision belongs to design_dag, not yaml_writer.
 
-8. **`output_schema` types — strict allow-list of five names.** Every
+9. **`output_schema` types — strict allow-list of five names.** Every
    value in any node's `output_schema` map MUST be exactly one of:
    `string`, `integer`, `number`, `boolean`, `array`. If `design_dag`
    handed you anything else (`bool`, `int`, `float`, `list`,

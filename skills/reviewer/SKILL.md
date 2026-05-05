@@ -32,10 +32,16 @@ which test is still failing).
 
 ## Per-requirement evidence — required on approve
 
-**Approval is only valid when every requirement has concrete
-evidence.** For each requirement in
-`upstream.analyzer.data.requirements`, your `reasoning` (or a
-`per_requirement_evidence` summary inside it) must cite **one of**:
+**Approval is only valid when every requirement traces back to the
+original Workflow.goal with concrete evidence.** Read
+`# Workflow Context` at the top of your prompt — it carries the
+persistent `Workflow.goal`. Every requirement you cite below should
+clearly advance or prove some part of that goal; node-level success
+alone is necessary but NOT sufficient.
+
+For each requirement in `upstream.analyzer.data.requirements`, your
+`reasoning` (or a `per_requirement_evidence` summary inside it) must
+cite **one of**:
 
 1. **A `file:line` range** in the implementation that satisfies the
    requirement (e.g. `lib/csvparser.py:14-22 — quoted-field branch
@@ -57,6 +63,15 @@ If you cannot find concrete evidence for a requirement, that
 requirement is missing — reject with feedback that names the
 missing requirement and what specific file:line / test would
 satisfy it.
+
+**Final-audit perspective.** When you are the last node before
+workflow completion, your approve doubles as the run's goal-audit:
+it must demonstrate that **the original `Workflow.goal` is met**,
+not only that the upstream nodes returned status=success. Every
+explicit requirement implied by `Workflow.goal` should appear in
+your `per_requirement_evidence` map with a concrete citation. A
+clean upstream trace with no per-requirement evidence is a hollow
+approve.
 
 ## Decision rubric
 

@@ -221,6 +221,41 @@ class TestBuiltinPlanner:
         assert "minimum-viable" in text.lower() or \
                "minimum viable" in text.lower()
 
+    def test_workflow_designer_emits_workflow_goal(self):
+        """Goal-driven supplement §3.1 — workflow_designer must emit
+        a top-level workflow_goal field as a concrete restatement of
+        the user's objective; the runtime persists this as v1.1
+        Workflow.goal."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "workflow_designer" /
+                     "SKILL.md")
+        assert "workflow_goal" in text, (
+            "workflow_designer must declare a workflow_goal output field "
+            "(persisted as Workflow.goal at the top of the compiled YAML)."
+        )
+        # Section heading proving the discipline is the new official
+        # rule, not a stray hint.
+        assert "Workflow goal" in text
+        # Must also tie Node.goal back to workflow_goal.
+        normalized = " ".join(text.split()).lower()
+        assert ("must map back to workflow_goal" in normalized
+                or "non-trivial node.goal must map back" in normalized
+                or "every non-trivial node.goal must map back" in normalized)
+
+    def test_yaml_writer_emits_top_level_goal(self):
+        """yaml_writer must carry workflow_goal through to the
+        compiled YAML's top-level `goal:` block (the existing v1.1
+        Workflow.goal field). Without this rule, the LLM may drop the
+        field even if design_dag emits it."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "yaml_writer" /
+                     "SKILL.md")
+        # The format example must show top-level goal:.
+        assert "\ngoal: |" in text or "\ngoal:" in text
+        # The rule itself — strip backticks and lowercase before matching
+        # so "Carry `workflow_goal` through" matches "carry workflow_goal
+        # through".
+        plain = text.replace("`", "").lower()
+        assert "carry workflow_goal through" in plain
+
     def test_prompt_analyzer_deterministic_scripts_carries_field_summary(self):
         """prompt_analyzer's deterministic_test_scripts must surface
         per-script envelope_data_fields so the designer can declare a
@@ -385,6 +420,20 @@ class TestReviewerSkill:
         assert "hollow approves" in text.lower() or \
                "not evidence" in text.lower() or \
                "Generic statements are NOT evidence" in text
+
+    def test_evidence_tied_to_workflow_goal(self):
+        """Goal-driven supplement §3.4 — final audit must prove the
+        original Workflow.goal, not just node success. Reviewer
+        SKILL.md must say evidence traces back to Workflow.goal."""
+        text = _read(self.REVIEWER_SKILL)
+        # Workflow.goal must be referenced explicitly so the reviewer
+        # judges against the persistent objective, not the last error.
+        assert "Workflow.goal" in text
+        # The "node success isn't sufficient" guardrail must be present.
+        normalized = " ".join(text.split()).lower()
+        assert ("necessary but not sufficient" in normalized
+                or "necessary but NOT sufficient".lower() in normalized
+                or "node-level success alone is necessary" in normalized)
 
 
 # ─── shipped skills/ ──────────────────────────────────────────────────

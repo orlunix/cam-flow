@@ -22,6 +22,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+import yaml
 
 from runner import camc_lib  # noqa
 from runner.runtime import (
@@ -1872,3 +1873,149 @@ class TestPromptOrdering:
             "spec §8 puts retry note before # Output; got note at "
             f"{note_idx} and output at {output_idx}"
         )
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  TestGoalDriven — goal-driven supplement 2026-05-05
+# ───────────────────────────────────────────────────────────────────────
+
+class TestGoalDriven:
+    """Goal-driven supplement (docs/spec-1.1-goal-driven-supplement-2026-05-05.md).
+    Implementation MVP: Workflow.goal persisted; retry prompt is
+    goal-driven; DAG revision recorded for the active user workflow."""
+
+    # ── Workflow.goal storage + validation ─────────────────────────────
+
+    def test_workflow_goal_stored_when_present(self, tmp_path):
+        from runner.runtime import Workflow
+        spec = {
+            "workflow": "wf", "version": "1.1",
+            "goal": "The persistent objective for this run.",
+            "nodes": [{
+                "id": "x", "goal": "g", "steps": ["s"],
+                "run": {"tool": "scripts/x.sh"},
+            }],
+        }
+        wf = Workflow(spec, tmp_path / "rd")
+        assert wf.goal == "The persistent objective for this run."
+
+    def test_workflow_goal_absent_means_none(self, tmp_path):
+        from runner.runtime import Workflow
+        spec = {
+            "workflow": "wf", "version": "1.1",
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"tool": "scripts/x.sh"}}],
+        }
+        wf = Workflow(spec, tmp_path / "rd")
+        assert wf.goal is None
+
+    def test_validate_rejects_non_string_goal(self):
+        from runner.runtime import validate_workflow
+        spec = {
+            "workflow": "wf", "version": "1.1",
+            "goal": ["not", "a", "string"],
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"skill": "analyzer"}}],
+        }
+        errs = validate_workflow(spec)
+        assert any("workflow.goal" in e and "string" in e for e in errs)
+
+    # ── DAG revision recording ─────────────────────────────────────────
+
+    def test_dag_revision_recorded_for_user_workflow(self, tmp_path):
+        """Per supplement §3.6 — every execution DAG Runtime runs is
+        recorded under .camflow/run/dag_revisions/0001/ before
+        execution. Mechanical; no scheduling/retry/verify change."""
+        from runner.runtime import Workflow
+        proj = tmp_path / "proj"
+        rd = proj / ".camflow" / "run"
+        spec = {
+            "workflow": "wf", "version": "1.1",
+            "goal": "Prove X.",
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"tool": "scripts/x.sh"}}],
+        }
+        wf = Workflow(spec, rd)
+        rev = rd / "dag_revisions" / "0001"
+        assert rev.is_dir()
+        assert (rev / "workflow.yaml").is_file()
+        # The recorded YAML round-trips to the same dict as the active
+        # workflow.yaml.
+        active = yaml.safe_load((rd / "workflow.yaml").read_text())
+        recorded = yaml.safe_load((rev / "workflow.yaml").read_text())
+        assert active == recorded
+        manifest = json.loads((rev / "manifest.json").read_text())
+        assert manifest["revision"] == 1
+        assert manifest["parent_revision"] is None
+        assert manifest["reason"] == "initial_plan"
+        assert manifest["workflow_goal"] == "Prove X."
+        assert wf.dag_revision == 1
+
+    def test_planner_internal_workflow_skips_dag_revision(self, tmp_path):
+        """Planner-internal workflows live under .camflow/run/planner/
+        and represent the compiler workflow, not the user-facing active
+        DAG. They should NOT spawn a dag_revisions/ subdir."""
+        from runner.runtime import Workflow
+        rd = tmp_path / "proj" / ".camflow" / "run" / "planner"
+        spec = {
+            "workflow": "planner", "version": "1.1",
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"tool": "scripts/x.sh"}}],
+        }
+        Workflow(spec, rd)
+        assert not (rd / "dag_revisions").exists()
+
+    def test_user_workflow_trace_carries_dag_revision(self, tmp_path):
+        """User-workflow trace events get tagged with dag_revision so
+        a future replay tool can reconstruct the active plan per
+        attempt. Planner-internal events skip the field."""
+        from runner.runtime import Workflow
+        rd = tmp_path / "proj" / ".camflow" / "run"
+        spec = {
+            "workflow": "wf", "version": "1.1",
+            "goal": "G.",
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"tool": "scripts/x.sh"}}],
+        }
+        wf = Workflow(spec, rd)
+        wf.trace("workflow_started", run_id="probe")
+        line = (rd / "trace.jsonl").read_text().splitlines()[-1]
+        rec = json.loads(line)
+        assert rec.get("dag_revision") == 1, rec
+
+    # ── Goal-driven retry prompt ───────────────────────────────────────
+
+    def test_retry_prompt_is_goal_driven(self):
+        """Per supplement §3.3 — retry prompt directs the agent to
+        re-read Workflow.goal, Node.goal, and previous.feedback;
+        surface plan mismatch instead of looping."""
+        node = Node.from_dict({
+            "id": "n", "goal": "advance the workflow goal X",
+            "steps": ["s"], "run": {"skill": "analyzer"},
+        })
+        out = build_run_prompt(
+            node,
+            {"previous": {"status": "fail", "feedback": "missed reqK"}},
+        )
+        # Workflow.goal mentioned (so agent re-reads workflow context).
+        assert "Workflow.goal" in out or "workflow.goal" in out.lower()
+        # Node.goal mentioned (so agent re-reads its local goal).
+        assert "Node.goal" in out or "node.goal" in out.lower()
+        # Plan-mismatch escape: the agent must know retry is bounded
+        # and that looping on the same local error is wrong.
+        normalized = " ".join(out.split()).lower()
+        assert ("fail clearly" in normalized
+                or "do not loop" in normalized
+                or "do NOT loop".lower() in normalized
+                or "retry is a bounded" in normalized)
+
+    def test_no_retry_no_goal_driven_block(self):
+        """The goal-driven retry directive only appears when there's a
+        previous attempt. Fresh attempts get the regular Goal/Steps."""
+        node = Node.from_dict({
+            "id": "n", "goal": "g", "steps": ["s"],
+            "run": {"skill": "analyzer"},
+        })
+        out = build_run_prompt(node, {})
+        assert "Goal-driven retry" not in out
+        assert "previous attempt failed" not in out

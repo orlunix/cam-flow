@@ -25,6 +25,11 @@ A JSON envelope written to `agent_output.json`. Required `data` fields:
 
 - `task_statement`: a faithful, concise rewrite of what the user asked.
   No invention; if the user said little, your task_statement is short.
+  The downstream designer condenses this to a one-sentence
+  `workflow_goal` (the persistent run objective). Phrase the
+  `task_statement` so the workflow-goal sentence falls out of it
+  cleanly — name the artifact and the success outcome, not just the
+  steps to get there.
 - `constraints`: explicit preconditions (e.g. "uses pytest", "must not
   modify CI config", "Python 3.10+"). Empty list if none stated.
 - `ambiguities`: things that would benefit from user clarification. Empty

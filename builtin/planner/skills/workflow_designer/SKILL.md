@@ -13,10 +13,11 @@ A JSON envelope written to `agent_output.json`. Required `data` fields:
 
 ```json
 {
+  "workflow_goal": "<one-sentence concrete restatement of the user's objective — the persistent objective for the run>",
   "dag": [
     {
       "id": "...",
-      "goal": "...",
+      "goal": "<this node's local objective — for non-trivial nodes, must name the part of workflow_goal it advances or proves>",
       "steps": ["...", "..."],
       "needs": [],
       "run": {"skill": "..."},
@@ -28,6 +29,32 @@ A JSON envelope written to `agent_output.json`. Required `data` fields:
   "context": "<text to put in workflow.context — shared facts every node sees>"
 }
 ```
+
+## Workflow goal — the persistent objective for the run
+
+Every workflow you design has a top-level `workflow_goal` field —
+**you must produce one** as a single concise sentence that restates
+the user's objective in concrete terms. It's what `analyzer.task_statement`
+condenses to one outcome sentence. The runtime persists this as the
+compiled workflow's top-level `goal:` (the existing v1.1 `Workflow.goal`).
+Retry, review, and final audit are judged against this goal — not
+just the last local error.
+
+**Every non-trivial Node.goal must map back to workflow_goal.** A
+non-trivial node is any skill node or any audit/reviewer node — not
+boilerplate set-up tools. Phrase Node.goal so it names the *part* of
+workflow_goal the node advances or proves: "extract the requirement
+list workflow_goal will be measured against", "implement the artifact
+satisfying workflow_goal", "audit one test class proving part of
+workflow_goal", "independently confirm workflow_goal is met with
+per-requirement evidence". A node-goal that's just a verb ("read
+files", "run pytest") without naming the workflow-goal connection is
+weak — the retry / reviewer machinery needs that connection to know
+what evidence still counts.
+
+The trivial set-up exception: a one-shot tool that does an obviously
+mechanical thing (e.g., `chmod +x`, copying a fixture) doesn't need a
+workflow-goal sentence. When in doubt, link the goal.
 
 ## Design rules
 
