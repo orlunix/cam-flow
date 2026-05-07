@@ -51,6 +51,10 @@ def _parse_timeout_env(name: str) -> int | None:
 DEFAULT_SKILL_TIMEOUT_S = _parse_timeout_env("CAMFLOW_SKILL_TIMEOUT")
 POLL_INTERVAL_S = float(os.environ.get("CAMFLOW_SKILL_POLL_INTERVAL", "2"))
 
+
+def _agent_tool_env() -> str:
+    return (os.environ.get("CAMFLOW_AGENT_TOOL") or "").strip()
+
 # camc's `run` prints "Starting <tool> agent <hex>"; we regex it out
 # until camc supports `run --json`.
 _AGENT_ID_RE = re.compile(r"^Starting [a-z]+ agent ([0-9a-f]{6,})", re.MULTILINE)
@@ -70,12 +74,18 @@ class CamcTimeout(CamcError):
 
 def spawn(prompt: str, workspace: Path, name: str, tag: str) -> str:
     """`camc run` → return agent_id. Raises CamcError on any failure."""
+    cmd = ["camc", "run"]
+    agent_tool = _agent_tool_env()
+    if agent_tool:
+        cmd += ["--tool", agent_tool]
+    cmd += [
+        "--path", str(workspace),
+        "--name", name,
+        "--tag", tag,
+        prompt,
+    ]
     proc = subprocess.run(
-        ["camc", "run",
-         "--path", str(workspace),
-         "--name", name,
-         "--tag", tag,
-         prompt],
+        cmd,
         capture_output=True, text=True, timeout=30,
     )
     if proc.returncode != 0:
