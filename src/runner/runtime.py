@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import ast
 import atexit
+import hashlib
 import json
 import os
 import re
@@ -489,6 +490,76 @@ def gen_run_id() -> str:
     return f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
 
 
+# ─── CamFlow-managed agent naming ─────────────────────────────────────
+#
+# Every camc child agent CamFlow spawns gets a short, human-readable
+# name so `camc list` is scannable and operators can see at a glance
+# which agents are CamFlow-owned and which workflow/node they belong
+# to. Naming convention (per the user's spec):
+#
+#   work / skill agent : cf__{flow}_{node}_a{attempt}
+#   verifier agent     : cf__{flow}_{node}_v{attempt}
+#
+# Slug rules: lowercase a-z0-9 only, separators collapsed to "_",
+# leading/trailing "_" stripped. Caps: flow ~8 chars, node ~14 chars.
+# When truncation occurs, append a tiny stable hash so distinct
+# inputs that share a prefix don't collide on display.
+#
+# These names are for human readability ONLY. Camc identifies agents
+# by their hex `id`; the cleanup/filter source-of-truth remains the
+# `camflow:<run_id>` tag, which is unchanged.
+
+_FLOW_SLUG_CAP = 8
+_NODE_SLUG_CAP = 14
+_AGENT_NAME_HASH_LEN = 4
+_SLUG_SEP_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _slug(text: str, *, cap: int) -> str:
+    """Sanitize+truncate `text` for use as a slug component.
+
+    Lowercases, collapses runs of non-alnum chars to a single "_",
+    strips leading/trailing "_". When the sanitized form exceeds
+    `cap`, returns the first (cap - 1 - hash_len) chars + "_" + a
+    short stable hash of the ORIGINAL input (so two inputs that
+    truncate to the same prefix are still distinguishable). Never
+    returns the empty string — falls back to a hash-only slug when
+    sanitizing produces nothing alphanumeric.
+    """
+    if not text:
+        return _short_hash("", n=_AGENT_NAME_HASH_LEN)
+    s = _SLUG_SEP_RE.sub("_", text.lower()).strip("_")
+    if not s:
+        return _short_hash(text, n=_AGENT_NAME_HASH_LEN)
+    if len(s) <= cap:
+        return s
+    keep = max(0, cap - 1 - _AGENT_NAME_HASH_LEN)
+    head = s[:keep].rstrip("_")
+    return f"{head}_{_short_hash(text, n=_AGENT_NAME_HASH_LEN)}"
+
+
+def _short_hash(text: str, *, n: int = 4) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:n]
+
+
+def _make_agent_name(flow: Optional[str], node_id: str,
+                     attempt_n: int, *,
+                     verifier: bool = False,
+                     fallback_flow: str = "") -> str:
+    """Compose a CamFlow-managed agent display name.
+
+    `flow` is normally the workflow's top-level `workflow:` field;
+    `fallback_flow` (e.g. workflow.run_id) is used when `flow` is
+    missing or sanitizes to empty. The returned name is bounded
+    (~30 chars) and stable across runs.
+    """
+    flow_input = flow or fallback_flow or "wf"
+    flow_slug = _slug(flow_input, cap=_FLOW_SLUG_CAP)
+    node_slug = _slug(node_id or "n", cap=_NODE_SLUG_CAP)
+    suffix = f"_v{attempt_n}" if verifier else f"_a{attempt_n}"
+    return f"cf__{flow_slug}_{node_slug}{suffix}"
+
+
 def default_run_dir(project_root: Path) -> Path:
     """Return <project>/.camflow/run/, archiving any prior run first."""
     cam = project_root / ".camflow"
@@ -878,13 +949,21 @@ def exec_tool(tool_path: Path, input_dict: dict, workspace: Path) -> dict:
 def exec_skill(skill_md: str, node: "Node", input_dict: dict,
                workspace: Path, attempt_n: int, run_id_tag: str,
                workflow_context: str | None = None,
-               workflow_goal: str | None = None) -> dict:
-    """Spawn a camc agent loaded with the skill template + run prompt."""
+               workflow_goal: str | None = None,
+               flow: str | None = None,
+               fallback_flow: str = "") -> dict:
+    """Spawn a camc agent loaded with the skill template + run prompt.
+
+    `flow` is the source workflow's display name (top-level
+    `workflow:` field) used for human-readable agent names; falls
+    back to `fallback_flow` (e.g. run_id) when missing.
+    """
     prompt = build_run_prompt(node, input_dict, skill_md=skill_md,
                               workflow_context=workflow_context,
                               workflow_goal=workflow_goal)
     (workspace / "prompt.txt").write_text(prompt)
-    agent_name = f"{node.id}-attempt-{attempt_n}"
+    agent_name = _make_agent_name(flow, node.id, attempt_n,
+                                  fallback_flow=fallback_flow)
     try:
         _aid, raw = camc.run_and_collect(
             prompt=prompt,
@@ -1008,11 +1087,14 @@ def verify_with_agent(node: "Node", workflow: "Workflow", envelope: dict,
         workflow_goal=workflow.goal,
     )
     (sub_dir / "prompt.txt").write_text(prompt)
+    agent_name = _make_agent_name(
+        workflow.spec.get("workflow"), node.id, attempt_n,
+        verifier=True, fallback_flow=getattr(workflow, "run_id", ""))
     try:
         _aid, raw = camc.run_and_collect(
             prompt=prompt,
             workspace=sub_dir,
-            name=f"{node.id}-verify-{attempt_n}",
+            name=agent_name,
             tag=workflow.tag,
             output_file=OUTPUT_FILENAME,
             timeout_s=camc.DEFAULT_SKILL_TIMEOUT_S,
@@ -1241,7 +1323,9 @@ class Node:
             return exec_skill(skill_md, self, input_dict, att_dir,
                               attempt_n, workflow.tag,
                               workflow_context=workflow.spec.get("context"),
-                              workflow_goal=workflow.goal)
+                              workflow_goal=workflow.goal,
+                              flow=workflow.spec.get("workflow"),
+                              fallback_flow=workflow.run_id)
         if "tool" in self.run_config:
             tool_path = _resolve_tool_path(self.run_config["tool"],
                                            workflow.project_root)

@@ -114,20 +114,23 @@ def _make_fake_camc(project_root: Path):
             )
             return (aid, envelope)
 
-        # Branch: regular run (`-attempt-`) vs verify-agent (`-verify-`).
-        if "-verify-" in name:
-            # name format: "<node_id>-verify-<n>"
-            node_id = name.rsplit("-verify-", 1)[0]
+        # CamFlow-managed names follow the cf__<flow>_<node>_a<n> /
+        # _v<n> convention; the workspace path is more reliable than
+        # name parsing for dispatch (the runtime always lays out
+        # nodes/<node_id>/attempt-N[/verify]). Use it.
+        ws_parts = Path(workspace).parts
+        is_verifier = ws_parts[-1] == "verify"
+        attempt_part = ws_parts[-2] if is_verifier else ws_parts[-1]
+        attempt_n = int(attempt_part.split("-", 1)[1])
+        node_id = (ws_parts[-3] if is_verifier else ws_parts[-2])
+
+        if is_verifier:
             n_steps_by_node = {
                 "analyzer": 3,
                 "reviewer": 4,
             }
             return _emit(_approve_evaluator_envelope(
                 n_steps_by_node[node_id]), "verify-aid")
-
-        # Regular skill run. name format: "<node_id>-attempt-<n>"
-        node_id, _, attempt_s = name.rpartition("-attempt-")
-        attempt_n = int(attempt_s)
 
         if node_id == "analyzer":
             return _emit({
@@ -296,18 +299,19 @@ def test_workflow_reference_e2e(tmp_path, monkeypatch):
     assert (run_dir / "nodes" / "test_runner" / "attempt-1" /
             "raw_stdout.txt").is_file()
 
-    # 12. Sanity on the call log.
+    # 12. Sanity on the call log. Names follow the CamFlow-managed
+    # convention cf__<flow>_<node>_a<n> / _v<n>. The reference
+    # workflow's `workflow: csvparser_implementation` field slugs
+    # (cap=8) to a truncated-with-hash stem.
+    from runner.runtime import _slug
+    flow_slug = _slug("csvparser_implementation", cap=8)
     names = [c["name"] for c in calls]
-    # Expect at minimum: analyzer-attempt-1, analyzer-verify-1,
-    # implementer-attempt-1, implementer-attempt-2, reviewer-attempt-1,
-    # reviewer-verify-1. (Implementer/tool nodes have command verifies,
-    # so no -verify- calls there.)
-    assert "analyzer-attempt-1" in names
-    assert "analyzer-verify-1" in names
-    assert "implementer-attempt-1" in names
-    assert "implementer-attempt-2" in names
-    assert "reviewer-attempt-1" in names
-    assert "reviewer-verify-1" in names
+    assert f"cf__{flow_slug}_analyzer_a1" in names
+    assert f"cf__{flow_slug}_analyzer_v1" in names
+    assert f"cf__{flow_slug}_implementer_a1" in names
+    assert f"cf__{flow_slug}_implementer_a2" in names
+    assert f"cf__{flow_slug}_reviewer_a1" in names
+    assert f"cf__{flow_slug}_reviewer_v1" in names
 
 
 def test_setup_fixture_script_refuses_existing(tmp_path):

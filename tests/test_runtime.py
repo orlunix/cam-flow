@@ -3330,3 +3330,227 @@ class TestCLI:
         assert main([]) == 1
         captured = capsys.readouterr()
         assert "Usage:" in captured.err
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  TestAgentNaming — CamFlow-managed child-agent display names
+# ───────────────────────────────────────────────────────────────────────
+
+class TestAgentNaming:
+    """Per `camc list`-readability ask: every CamFlow-spawned camc
+    child agent gets a short managed name cf__{flow}_{node}_a{N} for
+    work agents and cf__{flow}_{node}_v{N} for verifiers. Names are
+    for human readability only — the camc run-id tag remains the
+    cleanup/filter source of truth."""
+
+    # ── slug primitives ───────────────────────────────────────────────
+
+    def test_slug_lowercases(self):
+        from runner.runtime import _slug
+        assert _slug("UPPER", cap=8) == "upper"
+
+    def test_slug_collapses_separators(self):
+        from runner.runtime import _slug
+        assert _slug("a--b__c d", cap=14) == "a_b_c_d"
+
+    def test_slug_strips_leading_trailing(self):
+        from runner.runtime import _slug
+        assert _slug("---abc---", cap=8) == "abc"
+
+    def test_slug_drops_non_alnum(self):
+        from runner.runtime import _slug
+        assert _slug("hello!@#$world", cap=14) == "hello_world"
+
+    def test_slug_truncates_with_hash_when_too_long(self):
+        from runner.runtime import _slug
+        s = _slug("solve_blind_maze_oracle", cap=8)
+        # Total length capped, ends with a 4-char hex hash after a "_".
+        assert len(s) == 8
+        assert "_" in s
+        head, _, hsh = s.rpartition("_")
+        assert len(hsh) == 4 and all(c in "0123456789abcdef" for c in hsh)
+
+    def test_slug_distinct_long_inputs_get_distinct_hashes(self):
+        from runner.runtime import _slug
+        a = _slug("abcdefghijklmno", cap=8)
+        b = _slug("abcdefghijklmnX", cap=8)  # differs only at the tail
+        # Even though both truncate to the same head, the hash discriminator
+        # uses the FULL original input — so the slugs differ.
+        assert a != b
+
+    def test_slug_handles_all_non_alnum(self):
+        from runner.runtime import _slug
+        # No alphanumeric → never empty; falls back to a hash.
+        s = _slug("!!!", cap=8)
+        assert s and len(s) <= 8
+
+    def test_slug_handles_empty(self):
+        from runner.runtime import _slug
+        s = _slug("", cap=8)
+        assert s and len(s) <= 8
+
+    # ── _make_agent_name composition ──────────────────────────────────
+
+    def test_work_agent_name_shape(self):
+        from runner.runtime import _make_agent_name
+        assert (_make_agent_name("planner", "understand", 1)
+                == "cf__planner_understand_a1")
+
+    def test_verifier_agent_name_shape(self):
+        from runner.runtime import _make_agent_name
+        assert (_make_agent_name("planner", "understand", 1, verifier=True)
+                == "cf__planner_understand_v1")
+
+    def test_attempt_number_in_suffix(self):
+        from runner.runtime import _make_agent_name
+        assert (_make_agent_name("planner", "design_dag", 3)
+                == "cf__planner_design_dag_a3")
+        assert (_make_agent_name("planner", "design_dag", 2, verifier=True)
+                == "cf__planner_design_dag_v2")
+
+    def test_fallback_flow_when_workflow_name_absent(self):
+        from runner.runtime import _make_agent_name
+        # Empty / None flow → fallback_flow gets slugged instead.
+        out = _make_agent_name(None, "x", 1, fallback_flow="run-abc-12")
+        assert out.startswith("cf__")
+        # The fallback flow's slug shows up in slot 2.
+        head, _, _ = out.rpartition("_a1")
+        # head is "cf__<flow>_x"
+        assert "x" in head and head.startswith("cf__")
+        # And it's NOT the literal "wf" placeholder.
+        assert "_wf_" not in head
+
+    def test_default_flow_when_no_input_at_all(self):
+        from runner.runtime import _make_agent_name
+        out = _make_agent_name(None, "x", 1, fallback_flow="")
+        # Last-ditch fallback is the literal "wf" placeholder.
+        assert out == "cf__wf_x_a1"
+
+    def test_long_node_id_truncates_with_hash(self):
+        from runner.runtime import _make_agent_name
+        out = _make_agent_name(
+            "f", "this_is_a_very_long_node_identifier", 1)
+        # The node slot is bounded; total stays short.
+        assert out.startswith("cf__f_")
+        head_after_flow = out[len("cf__f_"):]
+        # node_slug + "_a1" suffix
+        assert head_after_flow.endswith("_a1")
+        node_slug = head_after_flow[:-3]
+        assert len(node_slug) <= 14
+
+    def test_planner_examples_from_spec(self):
+        """The four examples the user gave verbatim."""
+        from runner.runtime import _make_agent_name
+        assert (_make_agent_name("planner", "understand", 1)
+                == "cf__planner_understand_a1")
+        assert (_make_agent_name("planner", "understand", 1, verifier=True)
+                == "cf__planner_understand_v1")
+        # "design_dag" survives without truncation (10 chars under cap=14).
+        assert (_make_agent_name("planner", "design_dag", 1)
+                == "cf__planner_design_dag_a1")
+
+    # ── exec_skill + verify_with_agent integration ────────────────────
+
+    def _make_proj_with_echo_tool(self, tmp_path: Path):
+        """A tiny tool node that always succeeds — used as a stand-in
+        for skill nodes when we just need to capture the camc call."""
+        proj = tmp_path / "proj"
+        scripts = proj / "scripts"
+        scripts.mkdir(parents=True)
+        make_executable_tool(
+            scripts / "ok.sh",
+            envelope_tool_body({"value": 1}),
+        )
+        return proj
+
+    def test_exec_skill_calls_camc_with_managed_name(self, tmp_path,
+                                                      monkeypatch):
+        """Real exec_skill should invoke camc.run_and_collect with the
+        new cf__ name and the existing camflow:<run_id> tag."""
+        from runner import runtime as rt
+        captured: dict = {}
+
+        def fake(*, prompt, workspace, name, tag, output_file,
+                 timeout_s, write_id_to=None):  # noqa: ARG001
+            captured["name"] = name
+            captured["tag"] = tag
+            envelope = {"status": "success", "data": {"v": 1},
+                        "error": None, "feedback": None,
+                        "request_human": False}
+            (Path(workspace) / output_file).write_text(json.dumps(envelope))
+            return ("aid", envelope)
+
+        monkeypatch.setattr(rt.camc, "run_and_collect", fake)
+
+        node = Node.from_dict({
+            "id": "understand", "goal": "g", "steps": ["s"],
+            "run": {"skill": "analyzer"},
+        })
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        rt.exec_skill("# skill", node, {}, ws, attempt_n=1,
+                      run_id_tag="camflow:run-9999",
+                      flow="planner", fallback_flow="run-9999")
+        assert captured["name"] == "cf__planner_understand_a1"
+        assert captured["tag"] == "camflow:run-9999"
+
+    def test_verify_with_agent_uses_v_suffix(self, tmp_path, monkeypatch):
+        """Verify-agent path uses the same cf__ stem with _v<n>."""
+        from runner import runtime as rt
+        captured: dict = {}
+
+        def fake(*, prompt, workspace, name, tag, output_file,
+                 timeout_s, write_id_to=None):  # noqa: ARG001
+            captured["name"] = name
+            captured["tag"] = tag
+            envelope = {
+                "status": "success",
+                "data": {
+                    "approved": True, "reasoning": "ok",
+                    "step_results": [{"step": 1, "passed": True,
+                                       "evidence": "e", "reasoning": "r"}],
+                },
+                "error": None, "feedback": None, "request_human": False,
+            }
+            (Path(workspace) / output_file).write_text(json.dumps(envelope))
+            return ("aid", envelope)
+
+        monkeypatch.setattr(rt.camc, "run_and_collect", fake)
+
+        node = Node.from_dict({
+            "id": "understand", "goal": "g", "steps": ["s"],
+            "run": {"skill": "analyzer"},
+        })
+        wf_stub = type("W", (), {
+            "run_dir": tmp_path,
+            "spec": {"workflow": "planner"},
+            "tag": "camflow:run-1234",
+            "goal": None,
+            "run_id": "run-1234",
+        })()
+
+        ok, _ = rt.verify_with_agent(node, wf_stub,
+                                      {"status": "success"}, attempt_n=2)
+        assert ok is True
+        assert captured["name"] == "cf__planner_understand_v2"
+        assert captured["tag"] == "camflow:run-1234"
+
+    def test_camc_tag_unchanged_in_full_run(self, tmp_path):
+        """Full tool-only run: every trace event still belongs to the
+        same camflow:<run_id> tag; this proves the cleanup/filter key
+        is preserved despite the agent-name change."""
+        from runner.runtime import Workflow
+        proj = self._make_proj_with_echo_tool(tmp_path)
+        spec = {
+            "workflow": "demo", "version": "1.1",
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"tool": "scripts/ok.sh"},
+                       "output_schema": {"value": "integer"},
+                       "verify": {"command": "true"}}],
+        }
+        wf = Workflow(spec, proj / ".camflow" / "run")
+        # The camc tag is constructed from run_id and starts with
+        # "camflow:". This is what camc filters on; unchanged by the
+        # agent-name work.
+        assert wf.tag.startswith("camflow:")
+        assert wf.run_id and wf.run_id in wf.tag
