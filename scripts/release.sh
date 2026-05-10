@@ -225,6 +225,7 @@ while IFS=$'\t' read -r name host user port; do
     install_cmd=\
 "mkdir -p $SHARED_CURRENT_DIR && \
 cp -p $REMOTE_WRAPPER $SHARED_CURRENT_DIR/camflow && \
+rm -rf $SHARED_CURRENT_DIR/camflow-release && \
 tar -xzf $REMOTE_TARBALL -C $SHARED_CURRENT_DIR && \
 chmod 0755 $SHARED_CURRENT_DIR/camflow && \
 ln -sfn $SHARED_CURRENT_DIR/camflow $SHARED_BIN_PATH && \
