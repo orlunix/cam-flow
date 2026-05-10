@@ -10,7 +10,7 @@ version: "1.1"
 #   * implementer.verify runs the FULL pytest invocation (visible +
 #     invariants), so any missed requirement triggers automatic retry
 #     with previous.feedback — this is the recovery loop.
-#   * test_runner / invariant_checker are downstream AUDIT tool nodes
+#   * test_runner / invariant_checker are downstream command_runner audit nodes
 #     that emit structured pass/fail envelopes for the reviewer to
 #     cite as evidence.
 
@@ -69,13 +69,19 @@ nodes:
       - "Capture pass/fail and recent output."
       - "Emit envelope with data.passed and data.tests_run."
     run:
-      tool: scripts/run_default_tests.sh
+      skill: command_runner
     output_schema:
       passed: boolean
       tests_run: integer
       output: string
     verify:
-      command: 'test "$(jq -r .data.passed agent_output.json)" = "true"'
+      command: |
+        python3 - <<'PY'
+        import json
+        with open("agent_output.json") as f:
+            env = json.load(f)
+        raise SystemExit(0 if env.get("data", {}).get("passed") is True else 1)
+        PY
     retry: 1
 
   - id: invariant_checker
@@ -86,14 +92,20 @@ nodes:
       - "Capture pass/fail and any failed test names."
       - "Emit envelope with data.passed, data.tests_run, data.failed_tests."
     run:
-      tool: scripts/run_invariants.sh
+      skill: command_runner
     output_schema:
       passed: boolean
       tests_run: integer
       failed_tests: array
       output: string
     verify:
-      command: 'test "$(jq -r .data.passed agent_output.json)" = "true"'
+      command: |
+        python3 - <<'PY'
+        import json
+        with open("agent_output.json") as f:
+            env = json.load(f)
+        raise SystemExit(0 if env.get("data", {}).get("passed") is True else 1)
+        PY
     retry: 1
 
   - id: reviewer

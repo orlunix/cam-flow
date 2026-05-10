@@ -1,20 +1,14 @@
 """On-disk asset path resolution for the camflow runtime.
 
-Centralizes the four lookups runtime needs:
-  * _camflow_repo_root  — where this package was installed from
+Centralizes the runtime's on-disk lookups:
+  * _camflow_repo_root   — where this package was installed from
   * _builtin_planner_dir — the builtin Planner workflow's home
-  * _resolve_skill_path — `run.skill: <name>` → SKILL.md on disk
-  * _resolve_tool_path  — `run.tool: <path>` → executable file on disk
+  * _resolve_skill_path  — `run.skill: <name>` → SKILL.md on disk
+  * _resolve_tool_path   — legacy compatibility helper for direct tests
 
-This is purely a path layer: no registry, no caching, no manifest. The
-filesystem itself is the source of truth (per spec doctrine #6: skills
-must pre-exist; the directory's existence is its registration).
-
-Per docs/camflow-asset-management-plan-001-2026-05-03.md §5 P2:
-extracting these into a small module gives them ONE place to evolve
-when we eventually add `importlib.resources` support for pip-installed
-packages (P3). Until then, behavior is identical to the inline runtime
-helpers it replaces.
+v1.2 dropped `run.tool` as a workflow executor — workflows are
+skill-only. Deterministic command paths live in `verify.command` and
+are validated through `_resolve_command_path` inside runtime.py.
 """
 from __future__ import annotations
 
@@ -54,15 +48,11 @@ def _resolve_skill_path(name: str, project_root: Path) -> Optional[Path]:
 
 
 def _resolve_tool_path(rel: str, project_root: Path) -> Optional[Path]:
-    """`run.tool: <path>` resolves to <project_root>/<rel> if it's an
-    executable regular file CONTAINED within project_root.
+    """Legacy tool-path resolver kept for internal compatibility tests.
 
-    Spec §10 says tools resolve as <project>/<path>. Reject:
-      * absolute paths (`/etc/...`)
-      * `..`-traversal that escapes project_root
-      * symlink targets outside project_root
-    All three are caught by checking that the resolved final path is a
-    descendant of `project_root.resolve()`.
+    Active workflow YAML rejects `run.tool`; normal command execution
+    belongs inside skills or `verify.command`. This helper still enforces
+    containment for old direct runtime callers that bypass YAML validation.
     """
     if Path(rel).is_absolute():
         return None
@@ -71,6 +61,5 @@ def _resolve_tool_path(rel: str, project_root: Path) -> Optional[Path]:
     try:
         p.relative_to(project_root_resolved)
     except ValueError:
-        # Final resolved path escaped project_root (via .. or symlink).
         return None
     return p if p.is_file() and os.access(p, os.X_OK) else None

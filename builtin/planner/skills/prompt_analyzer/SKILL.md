@@ -61,8 +61,9 @@ A JSON envelope written to `agent_output.json`. Required `data` fields:
   `failed_tests`, those are two different shapes — list each
   script's actual fields verbatim. If a test runner exists but
   emits raw pytest output (not JSON envelopes), do NOT list it;
-  the designer will treat it as a command-only gate, not an
-  audit-node tool source. Empty list if none qualify.
+  the designer will treat it as a command-only `verify.command`
+  gate, not as input to a skill-based audit node. Empty list if
+  none qualify.
 - Don't propose a DAG yet. That's the next node's job.
 
 ## On reading files

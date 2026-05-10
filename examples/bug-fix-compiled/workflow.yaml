@@ -51,10 +51,16 @@ nodes:
       - "Run python -m pytest"
       - "Capture pass/fail"
     run:
-      tool: scripts/apply_and_test.sh
+      skill: command_runner
     output_schema:
       passed: boolean
       tests_run: integer
     verify:
-      command: "test $(jq -r .data.passed agent_output.json) = 'true'"
+      command: |
+        python3 - <<'PY'
+        import json
+        with open("agent_output.json") as f:
+            env = json.load(f)
+        raise SystemExit(0 if env.get("data", {}).get("passed") is True else 1)
+        PY
     retry: 1

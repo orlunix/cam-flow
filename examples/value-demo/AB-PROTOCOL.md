@@ -39,8 +39,8 @@ directory, and the lib/ stub. Neither side gets the rubric.
 * `camflow` installed (`pip install -e .` from the camflow repo).
 * `camc` installed and configured.
 * `pytest` available.
-* `jq` available (needed for the verify=command checks in the
-  reference workflow).
+* Python 3 available (the reference workflow uses Python stdlib JSON
+  parsing in `verify.command`; no `jq` dependency).
 
 The harness does NOT auto-clean its output dirs. Pick fresh paths
 (`/tmp/ab-<timestamp>/...`) so a new run never collides with an old
@@ -208,19 +208,19 @@ Planner should produce a workflow whose **shape** is close to
   e.g. `pytest tests/ tests/invariants/` or `bash scripts/run_all_tests.sh`).
   This is what makes a missed Req 2/3/4 trigger retry-with-feedback
   rather than a hollow self-approval.
-* **At least one audit tool node** that runs pytest and emits a
-  structured envelope (`data.passed`, `data.tests_run`,
-  `data.failed_tests`). The reference DAG splits this into two —
-  `test_runner` for `tests/` and `invariant_checker` for
-  `tests/invariants/` — but a single combined audit node is also
-  acceptable.
+* **At least one skill-backed audit node** (normally
+  `command_runner`) that runs pytest and emits a structured envelope
+  (`data.passed`, `data.tests_run`, `data.failed_tests`). The reference
+  DAG splits this into two — `test_runner` for `tests/` and
+  `invariant_checker` for `tests/invariants/` — but a single combined
+  audit node is also acceptable.
 * **A reviewer node** that depends on the analyzer + implementer + the
   audit node(s), and is told to cite per-requirement evidence.
 
 The Planner is an LLM, not a deterministic compiler — exact node
 names, counts, and `retry:` values will vary run-to-run. What we're
 checking is whether the structural shape lines up. If the produced
-workflow skipped the audit tool node, used `verify: agent` on the
+workflow skipped the skill-backed audit node, used `verify: agent` on the
 implementer despite the deterministic test command being available,
 or collapsed everything into 2-3 generic nodes — flag it as Planner
 drift and re-run; if it persists, treat it as a Planner-prompt

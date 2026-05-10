@@ -3,13 +3,13 @@
 Layout:
 - TestExpressions   — eval_expr + render_str + render_deep, strict mode.
 - TestValidate      — workflow YAML structural validation, mutex rules,
-                      skill/tool resolution, cycle detection.
+                      skill resolution, cycle detection.
 - TestNode          — Node.from_dict, lifecycle, retry counter.
 - TestEnvelope      — empty_envelope, normalize_envelope, status enum.
 - TestVerify        — auto_schema_check, verify_with_command.
-- TestE2E           — ★ end-to-end multi-node DAG with real tool executor:
+- TestE2E           — ★ end-to-end multi-node DAG with skill executor:
                       run YAML → load → validate → execute → archive.
-                      No LLM cost (uses tool nodes only).
+                      No LLM cost (camc is stubbed).
 
 Run:    pytest tests/test_runtime.py -q
 """
@@ -53,25 +53,119 @@ from runner.runtime import (
 # ───────────────────────────────────────────────────────────────────────
 #  Helpers
 # ───────────────────────────────────────────────────────────────────────
+#
+# v1.2: workflows execute exclusively via run.skill, so test fixtures
+# stub the camc subprocess instead of dropping shell scripts on disk.
+# `install_skill_stub` writes a SKILL.md so workflow-load passes; an
+# `EnvelopeDispatch` is monkey-patched onto camc.run_and_collect so each
+# node attempt resolves to a deterministic envelope without an LLM.
 
-def make_executable_tool(path: Path, body: str) -> None:
-    """Write a shell script + chmod +x. body is the script contents
-    after the shebang line."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("#!/usr/bin/env bash\nset -e\n" + body)
-    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+def install_skill_stub(project_root: Path, skill_name: str,
+                       body: str = "") -> Path:
+    """Write `<project>/skills/<name>/SKILL.md` and return its path."""
+    sk = project_root / "skills" / skill_name
+    sk.mkdir(parents=True, exist_ok=True)
+    md = sk / "SKILL.md"
+    md.write_text(body or f"# Skill: {skill_name}\n")
+    return md
 
 
-def envelope_tool_body(data: dict, status: str = "success") -> str:
-    """Bash that prints an envelope JSON to stdout."""
+def install_command_runner_skill(project_root: Path) -> Path:
+    """Tests that reference the shipped `command_runner` skill use the
+    repo-level installation; helper kept for compatibility."""
+    return project_root / "skills" / "command_runner" / "SKILL.md"
+
+
+def envelope(data: dict, status: str = "success", **rest) -> dict:
+    """Build a normalized envelope dict for fake_camc to write."""
     payload = {
         "status": status,
-        "data": data,
+        "data": dict(data),
         "error": None,
         "feedback": None,
         "request_human": False,
     }
-    return f"cat <<'EOF'\n{json.dumps(payload)}\nEOF\n"
+    payload.update(rest)
+    return payload
+
+
+def make_envelope_dispatch(node_envelopes: dict):
+    """Return a fake `camc.run_and_collect` that resolves the active
+    node from the workspace path and writes the matching envelope.
+
+    `node_envelopes` keys are node ids; values are either:
+      * a dict envelope (used verbatim), or
+      * a callable `(input_dict) -> envelope` for envelopes that depend
+        on upstream data (replaces the old shell-script `cat $stdin |
+        python3 …` patterns).
+
+    Verify-agent calls (workspace ends in `verify/`) auto-return an
+    "approved" envelope that satisfies the v1.1 evaluator schema, so
+    tests that don't override verify still pass schema checks.
+    """
+    def fake_camc(*, prompt, workspace, name, tag, output_file,
+                  timeout_s, write_id_to=None):  # noqa: ARG001
+        wp = Path(workspace)
+        is_verify = wp.name == "verify"
+        node_id = None
+        for i, part in enumerate(wp.parts):
+            if part == "nodes" and i + 1 < len(wp.parts):
+                node_id = wp.parts[i + 1]
+                break
+        if is_verify:
+            # Find how many steps this node has — verify-agent shape
+            # check requires step_results length == len(node.steps).
+            # Parse the node-id's run dir back up to workflow.yaml.
+            steps_count = 1
+            run_dir = wp
+            while run_dir.name != "run" and run_dir.parent != run_dir:
+                run_dir = run_dir.parent
+            wf_path = run_dir / "workflow.yaml"
+            if wf_path.is_file():
+                spec = yaml.safe_load(wf_path.read_text()) or {}
+                for n in spec.get("nodes") or []:
+                    if isinstance(n, dict) and n.get("id") == node_id:
+                        steps_count = len(n.get("steps") or []) or 1
+                        break
+            env = envelope({
+                "approved": True,
+                "step_results": [
+                    {
+                        "step": i + 1,
+                        "passed": True,
+                        "evidence": "stub",
+                        "reasoning": "stub",
+                    }
+                    for i in range(steps_count)
+                ],
+                "reasoning": "stub verify",
+            })
+            (wp / output_file).write_text(json.dumps(env))
+            return ("aid", env)
+        spec = node_envelopes.get(node_id)
+        if callable(spec):
+            inp_path = wp / "input.json"
+            inp = json.loads(inp_path.read_text()) if inp_path.is_file() \
+                else {}
+            env = spec(inp)
+        elif spec is not None:
+            env = spec
+        else:
+            env = envelope({})
+        (wp / output_file).write_text(json.dumps(env))
+        return ("aid", env)
+    return fake_camc
+
+
+def patch_camc(monkeypatch, node_envelopes: dict):
+    """Convenience: patch rt.camc.run_and_collect with a dispatcher.
+
+    Returns the dispatcher, in case a test wants to swap it mid-run.
+    """
+    from runner import runtime as rt
+    fake = make_envelope_dispatch(node_envelopes)
+    monkeypatch.setattr(rt.camc, "run_and_collect", fake)
+    return fake
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -146,7 +240,7 @@ class TestValidate:
             "id": "n",
             "goal": "do x",
             "steps": ["one"],
-            "run": {"tool": "scripts/x.sh"},
+            "run": {"skill": "analyzer"},
         }
         node.update(node_overrides)
         return {"workflow": "t", "version": "1.0", "nodes": [node]}
@@ -172,15 +266,15 @@ class TestValidate:
         errs = validate_workflow(wf)
         assert any("steps" in e for e in errs)
 
-    def test_run_must_have_skill_or_tool(self):
+    def test_run_must_have_skill(self):
         wf = self._wf(run={})
         errs = validate_workflow(wf)
-        assert any("skill" in e and "tool" in e for e in errs)
+        assert any("run: must have `skill`" in e for e in errs)
 
-    def test_run_skill_xor_tool(self):
+    def test_run_tool_rejected_even_with_skill(self):
         wf = self._wf(run={"skill": "x", "tool": "y"})
         errs = validate_workflow(wf)
-        assert any("exactly one" in e for e in errs)
+        assert any("run.tool: unsupported" in e for e in errs)
 
     def test_verify_criterion_xor_command(self):
         wf = self._wf(verify={"criterion": "x", "command": "y"})
@@ -197,9 +291,9 @@ class TestValidate:
             "workflow": "c", "version": "1.0",
             "nodes": [
                 {"id": "a", "goal": "x", "steps": ["s"],
-                 "needs": ["b"], "run": {"tool": "x.sh"}},
+                 "needs": ["b"], "run": {"skill": "analyzer"}},
                 {"id": "b", "goal": "y", "steps": ["s"],
-                 "needs": ["a"], "run": {"tool": "y.sh"}},
+                 "needs": ["a"], "run": {"skill": "analyzer"}},
             ],
         }
         errs = validate_workflow(wf)
@@ -217,15 +311,12 @@ class TestValidate:
         errs = validate_workflow(wf, project_root=proj)
         assert any("'nonexistent_skill' not found" in e for e in errs)
 
-    def test_tool_must_be_executable(self, tmp_path):
+    def test_run_tool_is_unsupported(self, tmp_path):
         proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        # Write file but DON'T chmod +x
-        (scripts / "noexec.sh").write_text("#!/bin/bash\necho hi")
+        proj.mkdir()
         wf = self._wf(run={"tool": "scripts/noexec.sh"})
         errs = validate_workflow(wf, project_root=proj)
-        assert any("not found or not executable" in e for e in errs)
+        assert any("run.tool: unsupported" in e for e in errs)
 
     def test_verify_command_dependencies_ignore_general_linux_commands(self):
         wf = self._wf(verify={
@@ -406,7 +497,7 @@ class TestValidate:
         assert captured.err == ""
 
     def test_parse_yaml_strips_fences(self):
-        text = "```yaml\nworkflow: t\nversion: '1.0'\nnodes:\n  - id: n\n    goal: x\n    steps: [a]\n    run: {tool: x.sh}\n```"
+        text = "```yaml\nworkflow: t\nversion: '1.0'\nnodes:\n  - id: n\n    goal: x\n    steps: [a]\n    run: {skill: analyzer}\n```"
         wf = parse_workflow_yaml(text)
         assert wf["workflow"] == "t"
 
@@ -655,7 +746,7 @@ class TestVerifyHuman:
         wf = {
             "nodes": [{
                 "id": "n", "goal": "g", "steps": ["s"],
-                "run": {"tool": "x.sh"},
+                "run": {"skill": "analyzer"},
                 "verify": {"human": "Looks good?"},
             }],
         }
@@ -666,7 +757,7 @@ class TestVerifyHuman:
         wf = {
             "nodes": [{
                 "id": "n", "goal": "g", "steps": ["s"],
-                "run": {"tool": "x.sh"},
+                "run": {"skill": "analyzer"},
                 "verify": {"human": "ok?", "command": "true"},
             }],
         }
@@ -765,7 +856,7 @@ class TestValidateContext:
             "context": "shared facts",
             "nodes": [{
                 "id": "n", "goal": "g", "steps": ["s"],
-                "run": {"tool": "x.sh"},
+                "run": {"skill": "analyzer"},
             }],
         }
         # may have skill/tool errors when project_root passed; we only
@@ -778,7 +869,7 @@ class TestValidateContext:
             "context": {"a": "b"},  # dict, not string
             "nodes": [{
                 "id": "n", "goal": "g", "steps": ["s"],
-                "run": {"tool": "x.sh"},
+                "run": {"skill": "analyzer"},
             }],
         }
         errs = validate_workflow(wf)
@@ -803,40 +894,31 @@ class TestE2E:
     """
 
     def _setup_project(self, tmp_path: Path) -> Path:
-        """Build a project dir with 3 tools."""
+        """Build a project dir with 3 skill stubs."""
         proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
+        proj.mkdir(parents=True, exist_ok=True)
+        install_skill_stub(proj, "diagnose_skill")
+        install_skill_stub(proj, "fix_skill")
+        install_skill_stub(proj, "test_skill")
+        return proj
 
-        # Tool 1: produce a fixed root_cause + confidence.
-        make_executable_tool(
-            scripts / "diagnose.sh",
-            envelope_tool_body({
+    def _patch_three_node_envelopes(self, monkeypatch,
+                                    test_passed: bool = True):
+        """Wire fake camc to return the canonical 3-node envelopes."""
+        def fix_dispatch(inp):
+            cause = inp["upstream"]["diagnose"]["data"]["root_cause"]
+            return envelope({
+                "patch": "FIXED: " + cause,
+                "files_changed": ["foo.py"],
+            })
+        patch_camc(monkeypatch, {
+            "diagnose": envelope({
                 "root_cause": "null deref at line 42",
                 "confidence": 0.9,
             }),
-        )
-
-        # Tool 2: read upstream diagnose's root_cause from input, return a patch.
-        # Runtime auto-injects upstream envelopes under input.upstream.<id>.
-        make_executable_tool(
-            scripts / "fix.sh",
-            r"""
-input_json=$(cat)
-cause=$(echo "$input_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['upstream']['diagnose']['data']['root_cause'])")
-cat <<EOF
-{"status":"success","data":{"patch":"FIXED: $cause","files_changed":["foo.py"]},"error":null,"feedback":null,"request_human":false}
-EOF
-""",
-        )
-
-        # Tool 3: deterministic pass — always returns passed=true.
-        make_executable_tool(
-            scripts / "test.sh",
-            envelope_tool_body({"passed": True, "tests_run": 5}),
-        )
-
-        return proj
+            "fix": fix_dispatch,
+            "test": envelope({"passed": test_passed, "tests_run": 5}),
+        })
 
     def _three_node_workflow(self) -> dict:
         return {
@@ -847,7 +929,7 @@ EOF
                     "id": "diagnose",
                     "goal": "Find the root cause",
                     "steps": ["read bug", "extract cause"],
-                    "run": {"tool": "scripts/diagnose.sh"},
+                    "run": {"skill": "diagnose_skill"},
                     "output_schema": {
                         "root_cause": "string",
                         "confidence": "number",
@@ -863,7 +945,7 @@ EOF
                     "goal": "Write a patch addressing the cause",
                     "steps": ["read cause", "write patch"],
                     "needs": ["diagnose"],
-                    "run": {"tool": "scripts/fix.sh"},
+                    "run": {"skill": "fix_skill"},
                     "output_schema": {
                         "patch": "string",
                         "files_changed": "array",
@@ -875,7 +957,7 @@ EOF
                     "goal": "Run tests",
                     "steps": ["execute tests", "report"],
                     "needs": ["fix"],
-                    "run": {"tool": "scripts/test.sh"},
+                    "run": {"skill": "test_skill"},
                     "output_schema": {
                         "passed": "boolean",
                         "tests_run": "integer",
@@ -890,13 +972,14 @@ EOF
         }
 
     # ── test 1: full happy path through 3-node DAG ─────────────────────
-    def test_three_node_dag_completes(self, tmp_path):
+    def test_three_node_dag_completes(self, tmp_path, monkeypatch):
         proj = self._setup_project(tmp_path)
+        self._patch_three_node_envelopes(monkeypatch)
         wf = self._three_node_workflow()
 
-        # validate (with project_root → checks tool existence)
+        # v1.2: validation must succeed under skill-only policy.
         errors = validate_workflow(wf, project_root=proj)
-        assert errors == [], f"validation errors: {errors}"
+        assert errors == []
 
         run_dir = proj / ".camflow" / "run"
         result = run_workflow(wf, run_dir)
@@ -941,9 +1024,10 @@ EOF
         assert not (run_dir / "runner.pid").exists()
 
     # ── test 2: rerun auto-archives the prior run ──────────────────────
-    def test_rerun_archives_prior(self, tmp_path):
+    def test_rerun_archives_prior(self, tmp_path, monkeypatch):
         from runner.runtime import default_run_dir
         proj = self._setup_project(tmp_path)
+        self._patch_three_node_envelopes(monkeypatch)
         wf = self._three_node_workflow()
 
         # First run
@@ -959,13 +1043,10 @@ EOF
         assert any("success" in a.name for a in archives)
 
     # ── test 3: verify-command gates correctly ─────────────────────────
-    def test_verify_command_failure_halts(self, tmp_path):
+    def test_verify_command_failure_halts(self, tmp_path, monkeypatch):
         proj = self._setup_project(tmp_path)
-        # Override test.sh to always return passed=false
-        make_executable_tool(
-            proj / "scripts" / "test.sh",
-            envelope_tool_body({"passed": False, "tests_run": 5}),
-        )
+        # Use the canonical envelopes but flip test → passed=false
+        self._patch_three_node_envelopes(monkeypatch, test_passed=False)
         wf = self._three_node_workflow()
         result = run_workflow(wf, proj / ".camflow" / "run")
         assert result == "halted"
@@ -974,31 +1055,22 @@ EOF
         assert halt["halted_node"] == "test"
 
     # ── test 4: retry-then-success ─────────────────────────────────────
-    def test_retry_succeeds_on_second_attempt(self, tmp_path):
+    def test_retry_succeeds_on_second_attempt(self, tmp_path, monkeypatch):
         proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
+        proj.mkdir(parents=True)
+        install_skill_stub(proj, "flaky_skill")
 
-        # Tool that fails on first attempt (sentinel file approach)
-        sentinel = proj / ".attempt_count"
-        sentinel.write_text("0")
-        make_executable_tool(
-            scripts / "flaky.sh",
-            f"""
-n=$(cat {sentinel})
-n=$((n+1))
-echo "$n" > {sentinel}
-if [ "$n" -lt 2 ]; then
-  cat <<EOF
-{{"status":"fail","data":{{}},"error":{{"code":"FLAKY","message":"first attempt fails"}},"feedback":null,"request_human":false}}
-EOF
-else
-  cat <<EOF
-{{"status":"success","data":{{"x":42}},"error":null,"feedback":null,"request_human":false}}
-EOF
-fi
-""",
-        )
+        call_count = {"n": 0}
+
+        def flaky(inp):
+            call_count["n"] += 1
+            if call_count["n"] < 2:
+                return envelope({}, status="fail",
+                                error={"code": "FLAKY",
+                                       "message": "first attempt fails"})
+            return envelope({"x": 42})
+
+        patch_camc(monkeypatch, {"n": flaky})
 
         wf = {
             "workflow": "retry_demo", "version": "1.0",
@@ -1006,7 +1078,7 @@ fi
                 "id": "n",
                 "goal": "succeed eventually",
                 "steps": ["try"],
-                "run": {"tool": "scripts/flaky.sh"},
+                "run": {"skill": "flaky_skill"},
                 "output_schema": {"x": "integer"},
                 "verify": {"command": "true"},
                 "retry": 3,
@@ -1019,17 +1091,14 @@ fi
         assert len(attempts) == 2
 
     # ── test 5: retry exhausted → halt ─────────────────────────────────
-    def test_retry_exhausted_halts(self, tmp_path):
+    def test_retry_exhausted_halts(self, tmp_path, monkeypatch):
         proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        # Always-fails tool
-        make_executable_tool(
-            scripts / "always_fails.sh",
-            envelope_tool_body({}, status="fail")
-            .replace('"status":"fail","data":{}',
-                     '"status":"fail","data":{},"error":{"code":"X","message":"always fails"}'),
-        )
+        proj.mkdir(parents=True)
+        install_skill_stub(proj, "always_fail_skill")
+        patch_camc(monkeypatch, {
+            "n": envelope({}, status="fail",
+                          error={"code": "X", "message": "always fails"}),
+        })
 
         wf = {
             "workflow": "exhaust", "version": "1.0",
@@ -1037,7 +1106,7 @@ fi
                 "id": "n",
                 "goal": "always fail",
                 "steps": ["try"],
-                "run": {"tool": "scripts/always_fails.sh"},
+                "run": {"skill": "always_fail_skill"},
                 "retry": 2,
             }],
         }
@@ -1050,21 +1119,17 @@ fi
         assert any(e["event"] == "workflow_halted" for e in events)
 
     # ── test 6: request_human halts immediately, skipping retry ────────
-    def test_request_human_halts(self, tmp_path):
+    def test_request_human_halts(self, tmp_path, monkeypatch):
         proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        # Tool requesting human help
-        make_executable_tool(
-            scripts / "needs_help.sh",
-            (
-                'cat <<EOF\n'
-                '{"status":"fail","data":{},'
-                '"error":{"code":"NEED_HUMAN","message":"unclear input"},'
-                '"feedback":null,"request_human":true}\n'
-                'EOF\n'
+        proj.mkdir(parents=True)
+        install_skill_stub(proj, "human_skill")
+        patch_camc(monkeypatch, {
+            "n": envelope(
+                {}, status="fail",
+                error={"code": "NEED_HUMAN", "message": "unclear input"},
+                request_human=True,
             ),
-        )
+        })
 
         wf = {
             "workflow": "human", "version": "1.0",
@@ -1072,7 +1137,7 @@ fi
                 "id": "n",
                 "goal": "ask human",
                 "steps": ["check"],
-                "run": {"tool": "scripts/needs_help.sh"},
+                "run": {"skill": "human_skill"},
                 "retry": 5,    # plenty of retries, but request_human bypasses
             }],
         }
@@ -1083,28 +1148,25 @@ fi
         attempts = list((rd / "nodes" / "n").iterdir())
         assert len(attempts) == 1
 
-    def test_explicit_oracle_halt_skips_node_retry(self, tmp_path):
+    def test_explicit_oracle_halt_skips_node_retry(self, tmp_path,
+                                                   monkeypatch):
         """An explicit replan/halt envelope is not an ordinary failure.
 
         Even with retry budget available, it must reach workflow halt so
         manual or opt-in auto-replan can create a new DAG revision.
         """
         proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        make_executable_tool(
-            scripts / "submit.sh",
-            (
-                'cat <<EOF\n'
-                '{"status":"fail",'
-                '"data":{"halt":true,"replan_required":true},'
-                '"error":{"code":"ORACLE_HALT",'
-                '"message":"controlled first-submit halt"},'
-                '"feedback":"replan at dag_revision >= 2",'
-                '"request_human":false}\n'
-                'EOF\n'
+        proj.mkdir(parents=True)
+        install_skill_stub(proj, "submit_skill")
+        patch_camc(monkeypatch, {
+            "submit": envelope(
+                {"halt": True, "replan_required": True},
+                status="fail",
+                error={"code": "ORACLE_HALT",
+                       "message": "controlled first-submit halt"},
+                feedback="replan at dag_revision >= 2",
             ),
-        )
+        })
 
         wf = {
             "workflow": "oracle_halt", "version": "1.1",
@@ -1112,7 +1174,7 @@ fi
                 "id": "submit",
                 "goal": "submit path",
                 "steps": ["submit"],
-                "run": {"tool": "scripts/submit.sh"},
+                "run": {"skill": "submit_skill"},
                 "retry": 3,
             }],
         }
@@ -1130,33 +1192,31 @@ fi
         assert halt["halted_node"] == "submit"
         assert halt["envelope"]["error"]["code"] == "ORACLE_HALT"
 
-    def test_recoverable_phrase_hint_uses_retry_previous(self, tmp_path):
+    def test_recoverable_phrase_hint_uses_retry_previous(self, tmp_path,
+                                                          monkeypatch):
         """Non-halt oracle feedback still uses normal bounded retry.
 
         Attempt 1 returns a phrase_hint. Attempt 2 reads it from
         input.previous.data.phrase_hint and succeeds.
         """
         proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        make_executable_tool(
-            scripts / "submit.sh",
-            r'''
-input_json=$(cat)
-phrase=$(INPUT_JSON="$input_json" python3 -c 'import json, os
-d = json.loads(os.environ["INPUT_JSON"])
-print(((d.get("previous") or {}).get("data") or {}).get("phrase_hint", ""))')
-if [ "$phrase" = "CAMFLOW-OPEN" ]; then
-  cat <<EOF
-{"status":"success","data":{"solved":true,"phrase":"$phrase"},"error":null,"feedback":null,"request_human":false}
-EOF
-else
-  cat <<EOF
-{"status":"fail","data":{"phrase_hint":"CAMFLOW-OPEN"},"error":{"code":"PHRASE_REQUIRED","message":"need phrase"},"feedback":"Use phrase_hint","request_human":false}
-EOF
-fi
-''',
-        )
+        proj.mkdir(parents=True)
+        install_skill_stub(proj, "submit_skill")
+
+        def submit_dispatch(inp):
+            prev = ((inp.get("previous") or {}).get("data") or {})
+            phrase = prev.get("phrase_hint", "")
+            if phrase == "CAMFLOW-OPEN":
+                return envelope({"solved": True, "phrase": phrase})
+            return envelope(
+                {"phrase_hint": "CAMFLOW-OPEN"},
+                status="fail",
+                error={"code": "PHRASE_REQUIRED",
+                       "message": "need phrase"},
+                feedback="Use phrase_hint",
+            )
+
+        patch_camc(monkeypatch, {"submit": submit_dispatch})
 
         wf = {
             "workflow": "phrase_retry", "version": "1.1",
@@ -1164,7 +1224,7 @@ fi
                 "id": "submit",
                 "goal": "submit path with optional phrase",
                 "steps": ["submit"],
-                "run": {"tool": "scripts/submit.sh"},
+                "run": {"skill": "submit_skill"},
                 "output_schema": {"solved": "boolean", "phrase": "string"},
                 "verify": {"command": "true"},
                 "retry": 1,
@@ -1187,8 +1247,10 @@ class TestOracleMazeWrappers:
         repo = Path(__file__).resolve().parents[1]
         wrapper = repo / "examples" / "oracle-maze" / "scripts" / "maze_submit.sh"
         fake_bin = tmp_path / "bin"
-        make_executable_tool(
-            fake_bin / "curl",
+        fake_bin.mkdir(parents=True, exist_ok=True)
+        curl_path = fake_bin / "curl"
+        curl_path.write_text(
+            "#!/usr/bin/env bash\nset -e\n"
             r'''
 body=""
 while [ "$#" -gt 0 ]; do
@@ -1218,8 +1280,9 @@ else:
         "feedback": "need phrase",
     }))
 PY
-''',
+'''
         )
+        curl_path.chmod(0o755)
         env = os.environ.copy()
         env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
         env["CAMFLOW_ORACLE_BASE_URL"] = "http://fake-oracle"
@@ -1254,15 +1317,18 @@ class TestStepping:
     `camflow resume` continues without resetting node state or bumping
     retry_max (since the node didn't actually fail)."""
 
-    def _setup_three_node_proj(self, tmp_path: Path) -> Path:
+    def _setup_three_node_proj(self, tmp_path: Path,
+                               monkeypatch=None) -> Path:
         proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        for i, name in enumerate(["a", "b", "c"], start=1):
-            make_executable_tool(
-                scripts / f"{name}.sh",
-                envelope_tool_body({"step": i}),
-            )
+        proj.mkdir(parents=True, exist_ok=True)
+        for name in ("a", "b", "c"):
+            install_skill_stub(proj, f"{name}_skill")
+        if monkeypatch is not None:
+            patch_camc(monkeypatch, {
+                "a": envelope({"step": 1}),
+                "b": envelope({"step": 2}),
+                "c": envelope({"step": 3}),
+            })
         return proj
 
     def _three_seq_workflow(self) -> dict:
@@ -1270,25 +1336,25 @@ class TestStepping:
             "workflow": "step_demo", "version": "1.0",
             "nodes": [
                 {"id": "a", "goal": "first", "steps": ["s"],
-                 "run": {"tool": "scripts/a.sh"},
+                 "run": {"skill": "a_skill"},
                  "output_schema": {"step": "integer"},
                  "verify": {"command": "true"}},
                 {"id": "b", "goal": "second", "steps": ["s"],
                  "needs": ["a"],
-                 "run": {"tool": "scripts/b.sh"},
+                 "run": {"skill": "b_skill"},
                  "output_schema": {"step": "integer"},
                  "verify": {"command": "true"}},
                 {"id": "c", "goal": "third", "steps": ["s"],
                  "needs": ["b"],
-                 "run": {"tool": "scripts/c.sh"},
+                 "run": {"skill": "c_skill"},
                  "output_schema": {"step": "integer"},
                  "verify": {"command": "true"}},
             ],
         }
 
-    def test_steps_halts_cleanly(self, tmp_path):
+    def test_steps_halts_cleanly(self, tmp_path, monkeypatch):
         from runner.runtime import run_workflow
-        proj = self._setup_three_node_proj(tmp_path)
+        proj = self._setup_three_node_proj(tmp_path, monkeypatch)
         wf = self._three_seq_workflow()
         rd = proj / ".camflow" / "run"
         result = run_workflow(wf, rd, max_attempts=1)
@@ -1304,10 +1370,10 @@ class TestStepping:
         assert not (rd / "nodes" / "b").exists()
         assert not (rd / "nodes" / "c").exists()
 
-    def test_steps_propagate_fail_false(self, tmp_path):
+    def test_steps_propagate_fail_false(self, tmp_path, monkeypatch):
         """Step halt must NOT mark downstream nodes as done+fail."""
         from runner.runtime import Workflow, run_workflow
-        proj = self._setup_three_node_proj(tmp_path)
+        proj = self._setup_three_node_proj(tmp_path, monkeypatch)
         wf_dict = self._three_seq_workflow()
         rd = proj / ".camflow" / "run"
         run_workflow(wf_dict, rd, max_attempts=1)
@@ -1321,7 +1387,7 @@ class TestStepping:
     def test_resume_after_step_halt_continues(self, tmp_path, monkeypatch):
         """After --steps halt, resume runs to completion."""
         from runner.runtime import run_workflow, _cmd_resume
-        proj = self._setup_three_node_proj(tmp_path)
+        proj = self._setup_three_node_proj(tmp_path, monkeypatch)
         wf = self._three_seq_workflow()
         rd = proj / ".camflow" / "run"
         run_workflow(wf, rd, max_attempts=1)
@@ -1334,10 +1400,10 @@ class TestStepping:
             assert (rd / "nodes" / nid / "attempt-1" / "output.json").exists()
         assert not (rd / "halt.json").exists()  # cleared
 
-    def test_resume_with_more_steps(self, tmp_path):
+    def test_resume_with_more_steps(self, tmp_path, monkeypatch):
         """Resume --steps 1 advances exactly 1 more node, then halts again."""
         from runner.runtime import run_workflow, _cmd_resume
-        proj = self._setup_three_node_proj(tmp_path)
+        proj = self._setup_three_node_proj(tmp_path, monkeypatch)
         wf = self._three_seq_workflow()
         rd = proj / ".camflow" / "run"
 
@@ -1354,24 +1420,21 @@ class TestStepping:
         assert rc == 0
         assert (rd / "nodes" / "c" / "attempt-1" / "output.json").exists()
 
-    def test_steps_count_includes_retries(self, tmp_path):
+    def test_steps_count_includes_retries(self, tmp_path, monkeypatch):
         """--steps counts attempts, not nodes — retries also tick the counter."""
         from runner.runtime import run_workflow
         proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        # Tool that always fails — will retry up to retry_max
-        make_executable_tool(
-            scripts / "flaky.sh",
-            'echo \'{"status":"fail","data":{},'
-            '"error":{"code":"E","message":"nope"},'
-            '"feedback":null,"request_human":false}\'\n',
-        )
+        proj.mkdir(parents=True)
+        install_skill_stub(proj, "flaky_skill")
+        patch_camc(monkeypatch, {
+            "x": envelope({}, status="fail",
+                          error={"code": "E", "message": "nope"}),
+        })
         wf = {
             "workflow": "retries", "version": "1.0",
             "nodes": [{
                 "id": "x", "goal": "g", "steps": ["s"],
-                "run": {"tool": "scripts/flaky.sh"},
+                "run": {"skill": "flaky_skill"},
                 "retry": 5,  # plenty of retry budget
             }],
         }
@@ -1394,15 +1457,18 @@ class TestRerun:
     """`rerun` re-executes a specific node + every downstream descendant.
     Upstream nodes stay as they were (their outputs are preserved)."""
 
-    def _setup_three_node_proj(self, tmp_path: Path) -> Path:
+    def _setup_three_node_proj(self, tmp_path: Path,
+                               monkeypatch=None) -> Path:
         proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        for i, name in enumerate(["a", "b", "c"], start=1):
-            make_executable_tool(
-                scripts / f"{name}.sh",
-                envelope_tool_body({"step": i}),
-            )
+        proj.mkdir(parents=True, exist_ok=True)
+        for name in ("a", "b", "c"):
+            install_skill_stub(proj, f"{name}_skill")
+        if monkeypatch is not None:
+            patch_camc(monkeypatch, {
+                "a": envelope({"step": 1}),
+                "b": envelope({"step": 2}),
+                "c": envelope({"step": 3}),
+            })
         return proj
 
     def _three_seq_workflow(self) -> dict:
@@ -1410,25 +1476,25 @@ class TestRerun:
             "workflow": "rerun_demo", "version": "1.0",
             "nodes": [
                 {"id": "a", "goal": "first", "steps": ["s"],
-                 "run": {"tool": "scripts/a.sh"},
+                 "run": {"skill": "a_skill"},
                  "output_schema": {"step": "integer"},
                  "verify": {"command": "true"}},
                 {"id": "b", "goal": "second", "steps": ["s"],
                  "needs": ["a"],
-                 "run": {"tool": "scripts/b.sh"},
+                 "run": {"skill": "b_skill"},
                  "output_schema": {"step": "integer"},
                  "verify": {"command": "true"}},
                 {"id": "c", "goal": "third", "steps": ["s"],
                  "needs": ["b"],
-                 "run": {"tool": "scripts/c.sh"},
+                 "run": {"skill": "c_skill"},
                  "output_schema": {"step": "integer"},
                  "verify": {"command": "true"}},
             ],
         }
 
-    def test_rerun_resets_target_and_downstream(self, tmp_path):
+    def test_rerun_resets_target_and_downstream(self, tmp_path, monkeypatch):
         from runner.runtime import run_workflow, _cmd_rerun
-        proj = self._setup_three_node_proj(tmp_path)
+        proj = self._setup_three_node_proj(tmp_path, monkeypatch)
         wf = self._three_seq_workflow()
         rd = proj / ".camflow" / "run"
         # First: full run completes
@@ -1445,9 +1511,10 @@ class TestRerun:
         assert (rd / "nodes" / "b" / "attempt-2" / "output.json").exists()
         assert (rd / "nodes" / "c" / "attempt-2" / "output.json").exists()
 
-    def test_rerun_target_only_when_no_downstream(self, tmp_path):
+    def test_rerun_target_only_when_no_downstream(self, tmp_path,
+                                                   monkeypatch):
         from runner.runtime import run_workflow, _cmd_rerun
-        proj = self._setup_three_node_proj(tmp_path)
+        proj = self._setup_three_node_proj(tmp_path, monkeypatch)
         wf = self._three_seq_workflow()
         rd = proj / ".camflow" / "run"
         run_workflow(wf, rd)
@@ -1458,9 +1525,9 @@ class TestRerun:
         assert sorted(p.name for p in (rd / "nodes" / "b").iterdir()) == ["attempt-1"]
         assert (rd / "nodes" / "c" / "attempt-2" / "output.json").exists()
 
-    def test_rerun_unknown_node_errors(self, tmp_path, capsys):
+    def test_rerun_unknown_node_errors(self, tmp_path, capsys, monkeypatch):
         from runner.runtime import run_workflow, _cmd_rerun
-        proj = self._setup_three_node_proj(tmp_path)
+        proj = self._setup_three_node_proj(tmp_path, monkeypatch)
         wf = self._three_seq_workflow()
         rd = proj / ".camflow" / "run"
         run_workflow(wf, rd)
@@ -1470,10 +1537,10 @@ class TestRerun:
         captured = capsys.readouterr()
         assert "not in workflow" in captured.err
 
-    def test_rerun_with_steps(self, tmp_path):
+    def test_rerun_with_steps(self, tmp_path, monkeypatch):
         """rerun + --steps halts cleanly mid-rerun."""
         from runner.runtime import run_workflow, _cmd_rerun
-        proj = self._setup_three_node_proj(tmp_path)
+        proj = self._setup_three_node_proj(tmp_path, monkeypatch)
         wf = self._three_seq_workflow()
         rd = proj / ".camflow" / "run"
         run_workflow(wf, rd)
@@ -1487,24 +1554,26 @@ class TestRerun:
         assert (rd / "nodes" / "b" / "attempt-2" / "output.json").exists()
         assert not (rd / "nodes" / "c" / "attempt-2").exists()
 
-    def test_rerun_clears_old_halt(self, tmp_path):
+    def test_rerun_clears_old_halt(self, tmp_path, monkeypatch):
         """Rerunning after a halt clears halt.json before re-executing."""
         from runner.runtime import run_workflow, _cmd_rerun
         proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        # Tool that always succeeds — we'll halt via --steps
-        make_executable_tool(scripts / "ok.sh", envelope_tool_body({"x": 1}))
+        proj.mkdir(parents=True)
+        install_skill_stub(proj, "ok_skill")
+        patch_camc(monkeypatch, {
+            "p": envelope({"x": 1}),
+            "q": envelope({"x": 1}),
+        })
         wf = {
             "workflow": "rh", "version": "1.0",
             "nodes": [
                 {"id": "p", "goal": "g", "steps": ["s"],
-                 "run": {"tool": "scripts/ok.sh"},
+                 "run": {"skill": "ok_skill"},
                  "output_schema": {"x": "integer"},
                  "verify": {"command": "true"}},
                 {"id": "q", "goal": "g", "steps": ["s"],
                  "needs": ["p"],
-                 "run": {"tool": "scripts/ok.sh"},
+                 "run": {"skill": "ok_skill"},
                  "output_schema": {"x": "integer"},
                  "verify": {"command": "true"}},
             ],
@@ -1531,15 +1600,16 @@ class TestReviewerFixes:
           budget remaining used to restore as done+fail on resume,
           so the scheduler wouldn't re-pick the node."""
 
-    def _setup_seq_proj(self, tmp_path):
+    def _setup_seq_proj(self, tmp_path, monkeypatch=None):
         proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        for i, name in enumerate(["a", "b"], start=1):
-            make_executable_tool(
-                scripts / (name + ".sh"),
-                envelope_tool_body({"step": i}),
-            )
+        proj.mkdir(parents=True, exist_ok=True)
+        for name in ("a", "b"):
+            install_skill_stub(proj, f"{name}_skill")
+        if monkeypatch is not None:
+            patch_camc(monkeypatch, {
+                "a": envelope({"step": 1}),
+                "b": envelope({"step": 2}),
+            })
         return proj
 
     def _seq_workflow(self):
@@ -1547,12 +1617,12 @@ class TestReviewerFixes:
             "workflow": "rev", "version": "1.0",
             "nodes": [
                 {"id": "a", "goal": "first", "steps": ["s"],
-                 "run": {"tool": "scripts/a.sh"},
+                 "run": {"skill": "a_skill"},
                  "output_schema": {"step": "integer"},
                  "verify": {"command": "true"}},
                 {"id": "b", "goal": "second", "steps": ["s"],
                  "needs": ["a"],
-                 "run": {"tool": "scripts/b.sh"},
+                 "run": {"skill": "b_skill"},
                  "output_schema": {"step": "integer"},
                  "verify": {"command": "true"}},
             ],
@@ -1562,7 +1632,7 @@ class TestReviewerFixes:
                                                     monkeypatch):
         """Reviewer fix #1."""
         from runner.runtime import _cmd_run
-        proj = self._setup_seq_proj(tmp_path)
+        proj = self._setup_seq_proj(tmp_path, monkeypatch)
         monkeypatch.chdir(proj)
         wf = self._seq_workflow()
 
@@ -1584,36 +1654,31 @@ class TestReviewerFixes:
         assert (rd / "nodes" / "a" / "attempt-1" / "output.json").exists()
         assert (rd / "nodes" / "a" / "attempt-2" / "output.json").exists()
 
-    def test_step_halt_during_retry_resume_continues(self, tmp_path):
+    def test_step_halt_during_retry_resume_continues(self, tmp_path,
+                                                      monkeypatch):
         """Reviewer fix #2."""
         from runner.runtime import _cmd_resume
         proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        sentinel = proj / ".n"
-        sentinel.write_text("0")
-        # Tool that fails on attempt 1, succeeds on attempt 2.
-        # Build the script body in Python to avoid heredoc-in-heredoc.
-        flaky_body = (
-            'n=$(cat ' + str(sentinel) + ')\n'
-            'n=$((n+1))\n'
-            'echo "$n" > ' + str(sentinel) + '\n'
-            'if [ "$n" -lt 2 ]; then\n'
-            '  echo \'{"status":"fail","data":{},'
-            '"error":{"code":"E","message":"first fails"},'
-            '"feedback":null,"request_human":false}\'\n'
-            'else\n'
-            '  echo \'{"status":"success","data":{"step":1},'
-            '"error":null,"feedback":null,"request_human":false}\'\n'
-            'fi\n'
-        )
-        make_executable_tool(scripts / "flaky.sh", flaky_body)
+        proj.mkdir(parents=True)
+        install_skill_stub(proj, "flaky_skill")
+
+        call_count = {"n": 0}
+
+        def flaky(inp):
+            call_count["n"] += 1
+            if call_count["n"] < 2:
+                return envelope({}, status="fail",
+                                error={"code": "E",
+                                       "message": "first fails"})
+            return envelope({"step": 1})
+
+        patch_camc(monkeypatch, {"x": flaky})
 
         wf = {
             "workflow": "rt", "version": "1.0",
             "nodes": [{
                 "id": "x", "goal": "g", "steps": ["s"],
-                "run": {"tool": "scripts/flaky.sh"},
+                "run": {"skill": "flaky_skill"},
                 "output_schema": {"step": "integer"},
                 "verify": {"command": "true"},
                 "retry": 3,
@@ -1650,101 +1715,10 @@ class TestReviewerFixes:
 #  TestCodexPhase1Fixes — findings 1, 2, 3 from code-review-codex-2026-05-04
 # ───────────────────────────────────────────────────────────────────────
 
-class TestToolTimeout:
-    """Finding 1 (BLOCKER): subprocess.TimeoutExpired in exec_tool must
-    NOT propagate; it must produce a TOOL_TIMEOUT fail envelope so the
-    scheduler runs the normal retry/halt flow."""
-
-    def test_timeout_returns_fail_envelope(self, tmp_path, monkeypatch):
-        import subprocess as _sp
-        from runner import runtime as rt
-
-        proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        # Put any executable on disk (we monkeypatch the actual run).
-        make_executable_tool(scripts / "slow.sh", "exit 0\n")
-
-        # Patch subprocess.run inside runtime to raise TimeoutExpired
-        # only for our tool — verify.command bash invocations pass through.
-        original_run = rt.subprocess.run
-
-        def fake_run(cmd, *args, **kw):
-            if isinstance(cmd, list) and cmd and "slow.sh" in cmd[0]:
-                raise _sp.TimeoutExpired(cmd=cmd,
-                                         timeout=kw.get("timeout", 1),
-                                         output="partial output\n")
-            return original_run(cmd, *args, **kw)
-
-        monkeypatch.setattr(rt.subprocess, "run", fake_run)
-
-        wf = {
-            "workflow": "to", "version": "1.0",
-            "nodes": [{
-                "id": "x", "goal": "g", "steps": ["s"],
-                "run": {"tool": "scripts/slow.sh"},
-            }],
-        }
-        rd = proj / ".camflow" / "run"
-        result = run_workflow(wf, rd)
-        assert result == "halted"  # retry: 1 default; halts after retry exhaust
-        out = json.loads(
-            (rd / "nodes" / "x" / "attempt-1" / "output.json").read_text()
-        )
-        assert out["status"] == "fail"
-        assert out["error"]["code"] == "TOOL_TIMEOUT"
-        # Whatever partial stdout existed should have been preserved.
-        partial_text = (rd / "nodes" / "x" / "attempt-1"
-                        / "raw_stdout.txt").read_text()
-        assert "partial" in partial_text
+# (TestToolTimeout removed in v1.2 — exec_tool deleted.)
 
 
-class TestToolPathContainment:
-    """Finding 2: tool resolution must enforce <project>/<rel>; reject
-    absolute paths, .. traversal, and symlink escapes."""
-
-    def test_absolute_path_rejected(self, tmp_path):
-        from runner.assets import _resolve_tool_path
-        outside = tmp_path / "outside.sh"
-        outside.write_text("#!/bin/sh\necho hi\n")
-        outside.chmod(0o755)
-        proj = tmp_path / "proj"
-        proj.mkdir()
-        # Absolute path → rejected, even though the file exists + is -x.
-        assert _resolve_tool_path(str(outside.resolve()), proj) is None
-
-    def test_dotdot_escape_rejected(self, tmp_path):
-        from runner.assets import _resolve_tool_path
-        outside = tmp_path / "outside.sh"
-        outside.write_text("#!/bin/sh\necho hi\n")
-        outside.chmod(0o755)
-        proj = tmp_path / "proj"
-        proj.mkdir()
-        assert _resolve_tool_path("../outside.sh", proj) is None
-
-    def test_symlink_escape_rejected(self, tmp_path):
-        from runner.assets import _resolve_tool_path
-        outside = tmp_path / "outside.sh"
-        outside.write_text("#!/bin/sh\necho hi\n")
-        outside.chmod(0o755)
-        proj = tmp_path / "proj"
-        proj.mkdir()
-        link = proj / "link.sh"
-        link.symlink_to(outside)
-        # Symlink resolves outside project_root → rejected.
-        assert _resolve_tool_path("link.sh", proj) is None
-
-    def test_legitimate_path_accepted(self, tmp_path):
-        from runner.assets import _resolve_tool_path
-        proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        ok = scripts / "ok.sh"
-        ok.write_text("#!/bin/sh\necho hi\n")
-        ok.chmod(0o755)
-        resolved = _resolve_tool_path("scripts/ok.sh", proj)
-        assert resolved is not None
-        assert resolved.name == "ok.sh"
+# (TestToolPathContainment removed in v1.2 — _resolve_tool_path deleted.)
 
 
 class TestExprStrictSubscript:
@@ -1767,69 +1741,7 @@ class TestExprStrictSubscript:
 #  TestCodexPhase2Fixes — findings 4, 6, 7 from code-review-codex-2026-05-04
 # ───────────────────────────────────────────────────────────────────────
 
-class TestToolAgentOutputPersist:
-    """Finding 4: every tool attempt writes attempt-N/agent_output.json
-    (the producer's literal stdout) alongside raw_stdout.txt and the
-    runtime-validated output.json."""
-
-    def test_tool_success_writes_agent_output_json(self, tmp_path):
-        proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        make_executable_tool(
-            scripts / "ok.sh",
-            envelope_tool_body({"x": 1}),
-        )
-        wf = {
-            "workflow": "p", "version": "1.0",
-            "nodes": [{
-                "id": "x", "goal": "g", "steps": ["s"],
-                "run": {"tool": "scripts/ok.sh"},
-                "output_schema": {"x": "integer"},
-                "verify": {"command": "true"},
-            }],
-        }
-        rd = proj / ".camflow" / "run"
-        result = run_workflow(wf, rd)
-        assert result == "done"
-        att = rd / "nodes" / "x" / "attempt-1"
-        assert (att / "agent_output.json").exists()
-        # Content should be parseable JSON matching what the tool emitted.
-        producer = json.loads((att / "agent_output.json").read_text())
-        assert producer["data"]["x"] == 1
-        # raw_stdout.txt also kept.
-        assert (att / "raw_stdout.txt").exists()
-        # output.json is the runtime-validated envelope.
-        assert (att / "output.json").exists()
-
-    def test_tool_bad_output_still_persists_agent_output(self, tmp_path):
-        """Even when the tool emits non-JSON, agent_output.json holds
-        the raw bytes — useful for debugging."""
-        proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        make_executable_tool(
-            scripts / "garbage.sh",
-            "echo not-json-at-all\n",
-        )
-        wf = {
-            "workflow": "p", "version": "1.0",
-            "nodes": [{
-                "id": "x", "goal": "g", "steps": ["s"],
-                "run": {"tool": "scripts/garbage.sh"},
-            }],
-        }
-        rd = proj / ".camflow" / "run"
-        result = run_workflow(wf, rd)
-        assert result == "halted"
-        att = rd / "nodes" / "x" / "attempt-1"
-        # agent_output.json holds the raw stdout (non-JSON).
-        agent_text = (att / "agent_output.json").read_text()
-        assert "not-json-at-all" in agent_text
-        # output.json is the BAD_TOOL_OUTPUT fail envelope.
-        out = json.loads((att / "output.json").read_text())
-        assert out["status"] == "fail"
-        assert out["error"]["code"] == "TOOL_BAD_OUTPUT"
+# (TestToolAgentOutputPersist removed in v1.2 — exec_tool deleted.)
 
 
 class TestValidateTightenings:
@@ -1840,7 +1752,7 @@ class TestValidateTightenings:
             "workflow": "v", "version": "1.0",
             "nodes": [{
                 "id": "n", "goal": "g", "steps": ["s"],
-                "run": {"tool": "x.sh"},
+                "run": {"skill": "analyzer"},
                 **node_overrides,
             }],
         }
@@ -1921,7 +1833,7 @@ class TestValidateTightenings:
             "nodes": [
                 "this should be a dict, not a string",
                 {"id": "ok", "goal": "g", "steps": ["s"],
-                 "run": {"tool": "x.sh"}},
+                 "run": {"skill": "analyzer"}},
             ],
         }
         # Must return errors, not raise AttributeError.
@@ -1942,11 +1854,10 @@ class TestValidateTightenings:
         assert any("run.skill: must be a non-empty string" in e
                    for e in errs)
 
-    def test_empty_run_tool_rejected(self):
+    def test_run_tool_rejected(self):
         wf = self._wf(**{"run": {"tool": ""}})
         errs = validate_workflow(wf)
-        assert any("run.tool: must be a non-empty string" in e
-                   for e in errs)
+        assert any("run.tool: unsupported" in e for e in errs)
 
     def test_non_string_verify_command_rejected(self):
         wf = self._wf(verify={"command": 42})
@@ -2017,8 +1928,7 @@ class TestValidateTightenings:
             }],
         }
         errs = validate_workflow(wf, project_root=tmp_path)
-        assert any("run.tool: must be a non-empty string" in e
-                   for e in errs)
+        assert any("run.tool: unsupported" in e for e in errs)
         assert not any("not found or not" in e and "7" in e for e in errs)
 
     def test_empty_run_skill_with_project_root_no_typeerror(
@@ -2766,114 +2676,7 @@ class TestStatus:
 #  TestToolDagRevisionInjection — Phase A oracle-maze plumbing
 # ───────────────────────────────────────────────────────────────────────
 
-class TestToolDagRevisionInjection:
-    """Tools that talk to external systems need to know which DAG
-    revision is active. Per codex-blind-maze-oracle Phase A, runtime
-    must surface dag_revision both as an env var (CAMFLOW_DAG_REVISION)
-    and as a JSON field in the tool's stdin (dag_revision)."""
-
-    def _make_proj_with_echo_tool(self, tmp_path: Path) -> Path:
-        proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        # Tool that echoes back what it sees. We capture the env var
-        # and the input dict's dag_revision into the data envelope.
-        body = (
-            r'''
-input_json=$(cat)
-ev="${CAMFLOW_DAG_REVISION:-MISSING}"
-rev=$(echo "$input_json" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('dag_revision','MISSING'))")
-cat <<EOF
-{"status":"success","data":{"env_rev":"$ev","input_rev":"$rev"},"error":null,"feedback":null,"request_human":false}
-EOF
-'''
-        )
-        make_executable_tool(scripts / "echo.sh", body)
-        return proj
-
-    def test_env_and_input_carry_dag_revision_on_fresh_run(self, tmp_path):
-        proj = self._make_proj_with_echo_tool(tmp_path)
-        wf = {
-            "workflow": "wf", "version": "1.1",
-            "goal": "Capture dag_revision in tool input.",
-            "nodes": [{
-                "id": "x", "goal": "g", "steps": ["echo"],
-                "run": {"tool": "scripts/echo.sh"},
-                "output_schema": {"env_rev": "string",
-                                  "input_rev": "string"},
-                "verify": {"command": "true"},
-            }],
-        }
-        rd = proj / ".camflow" / "run"
-        result = run_workflow(wf, rd)
-        assert result == "done"
-        out = json.loads(
-            (rd / "nodes" / "x" / "attempt-1" / "output.json").read_text()
-        )
-        # Both channels deliver the same revision number.
-        assert out["data"]["env_rev"] == "1", out
-        assert out["data"]["input_rev"] == "1", out
-
-    def test_workflow_init_exports_dag_revision_env(self, tmp_path,
-                                                     monkeypatch):
-        """Skill agents run inside camc-spawned tmux sessions and
-        inherit env from the runtime process. Workflow.__init__ must
-        export CAMFLOW_DAG_REVISION into os.environ so wrappers
-        invoked by skill agents (e.g. via Bash inside the agent's
-        tmux) see the active revision.
-
-        Live finding (codex-blind-maze-oracle): without this, skill
-        agents calling wrapper scripts always saw the wrapper's
-        fallback default of 1, so a replanned run kept submitting at
-        rev 1 to the oracle even when CamFlow was at rev 2/3."""
-        from runner.runtime import Workflow
-        monkeypatch.delenv("CAMFLOW_DAG_REVISION", raising=False)
-        rd = tmp_path / "proj" / ".camflow" / "run"
-        spec = {
-            "workflow": "wf", "version": "1.1",
-            "goal": "g.",
-            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
-                       "run": {"tool": "scripts/x.sh"}}],
-        }
-        Workflow(spec, rd)
-        assert os.environ.get("CAMFLOW_DAG_REVISION") == "1"
-
-    def test_workflow_init_planner_internal_does_not_export_env(
-            self, tmp_path, monkeypatch):
-        """Planner-internal workflows aren't the user-facing active
-        DAG; they shouldn't clobber the env var, which the user
-        workflow owns."""
-        from runner.runtime import Workflow
-        monkeypatch.setenv("CAMFLOW_DAG_REVISION", "42")
-        rd = tmp_path / "proj" / ".camflow" / "run" / "planner"
-        spec = {
-            "workflow": "planner", "version": "1.1",
-            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
-                       "run": {"tool": "scripts/x.sh"}}],
-        }
-        Workflow(spec, rd)
-        # Untouched — planner-internal init must not overwrite.
-        assert os.environ.get("CAMFLOW_DAG_REVISION") == "42"
-
-    def test_input_json_includes_dag_revision_field(self, tmp_path):
-        """Skill nodes don't get the env var (camc agents read input.json
-        from disk inside their tmux session) — but they DO see the
-        dag_revision field in input.json. Verify the field is written."""
-        proj = self._make_proj_with_echo_tool(tmp_path)
-        wf = {
-            "workflow": "wf", "version": "1.1",
-            "nodes": [{
-                "id": "x", "goal": "g", "steps": ["echo"],
-                "run": {"tool": "scripts/echo.sh"},
-                "verify": {"command": "true"},
-                "output_schema": {"env_rev": "string", "input_rev": "string"},
-            }],
-        }
-        rd = proj / ".camflow" / "run"
-        run_workflow(wf, rd)
-        inp = json.loads(
-            (rd / "nodes" / "x" / "attempt-1" / "input.json").read_text())
-        assert inp["dag_revision"] == 1
+# (TestToolDagRevisionInjection removed in v1.2 — exec_tool deleted.)
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -2890,14 +2693,9 @@ class TestReplan:
                           *, halt_kind: str = "halt") -> Path:
         """Synthesize a halted user run dir without touching Workflow."""
         proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        # A simple tool node that always succeeds — used by the
-        # replanned (rev 2) workflow.
-        make_executable_tool(
-            scripts / "ok.sh",
-            envelope_tool_body({"value": 42}),
-        )
+        proj.mkdir(parents=True, exist_ok=True)
+        # A simple skill stub used by the replanned (rev 2) workflow.
+        install_skill_stub(proj, "submit_skill")
 
         rd = proj / ".camflow" / "run"
         rd.mkdir(parents=True)
@@ -2910,7 +2708,7 @@ class TestReplan:
             "nodes": [{
                 "id": "submit", "goal": "submit path",
                 "steps": ["s"],
-                "run": {"tool": "scripts/ok.sh"},
+                "run": {"skill": "submit_skill"},
                 "output_schema": {"value": "integer"},
                 "verify": {"command": "true"},
             }],
@@ -3011,8 +2809,7 @@ class TestReplan:
         original_init = orig_workflow_cls.__init__
 
         def patched_init(self, spec, run_dir, *, resume=False,
-                         replan=False, project_root=None,
-                         package_root=None):
+                         replan=False, project_root=None):
             rd = Path(run_dir).resolve()
             if "planner-rev" in rd.name:
                 # Hand off to the stub by mutating self into a stub clone.
@@ -3022,8 +2819,7 @@ class TestReplan:
                 self.__dict__.update(stub.__dict__)
                 return
             original_init(self, spec, rd, resume=resume, replan=replan,
-                          project_root=project_root,
-                          package_root=package_root)
+                          project_root=project_root)
 
         monkeypatch.setattr(rt.Workflow, "__init__", patched_init)
 
@@ -3040,11 +2836,17 @@ class TestReplan:
             "  - id: submit\n"
             "    goal: \"submit at rev 2\"\n"
             "    steps: [\"s\"]\n"
-            "    run: {tool: scripts/ok.sh}\n"
+            "    run: {skill: analyzer}\n"
             "    output_schema: {value: integer}\n"
             "    verify: {command: \"true\"}\n"
         )
         self._stub_planner(monkeypatch, new_yaml)
+        from runner import runtime as rt
+        monkeypatch.setattr(
+            rt, "exec_skill",
+            lambda *a, **k: empty_envelope(
+                "success", data={"value": 42}),
+        )
         rc = _cmd_replan([str(rd)])
         assert rc == 0
 
@@ -3135,12 +2937,18 @@ class TestReplan:
             "  - id: submit\n"
             "    goal: g\n"
             "    steps: [s]\n"
-            "    run: {tool: scripts/ok.sh}\n"
+            "    run: {skill: analyzer}\n"
             "    output_schema: {value: integer}\n"
             "    verify: {command: \"true\"}\n"
         )
         captured: dict = {}
         self._stub_planner(monkeypatch, new_yaml, capture=captured)
+        from runner import runtime as rt
+        monkeypatch.setattr(
+            rt, "exec_skill",
+            lambda *a, **k: empty_envelope(
+                "success", data={"value": 42}),
+        )
         rc = _cmd_replan([str(rd)])
         assert rc == 0
         ctx = captured.get("context", "")
@@ -3250,23 +3058,11 @@ class TestPhaseBAutoReplan:
     # ── auto-replan execution (stubbed Planner) ───────────────────────
 
     def _stage_halting_project(self, tmp_path: Path) -> Path:
-        """Project with a tool node that always halts (verify always
-        fails). After auto-replan installs a different node, the new
-        node succeeds. The 'replan' is implemented by the stub
-        Planner returning a different YAML."""
+        """Project root for auto-replan tests. The 'replan' is implemented
+        by the stub Planner returning a different YAML; node execution
+        goes through monkeypatched exec_skill."""
         proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        # ok.sh always succeeds.
-        make_executable_tool(
-            scripts / "ok.sh",
-            envelope_tool_body({"value": 1}),
-        )
-        # bad.sh emits a successful envelope but verify=false (gate fails).
-        make_executable_tool(
-            scripts / "bad.sh",
-            envelope_tool_body({"value": 0}),
-        )
+        proj.mkdir(parents=True, exist_ok=True)
         return proj
 
     def _initial_spec(self) -> dict:
@@ -3277,7 +3073,7 @@ class TestPhaseBAutoReplan:
             "on_halt": "replan", "max_replans": 1,
             "nodes": [{
                 "id": "x", "goal": "g", "steps": ["s"],
-                "run": {"tool": "scripts/bad.sh"},
+                "run": {"skill": "analyzer"},
                 "output_schema": {"value": "integer"},
                 "verify": {"command": "false"},
                 "retry": 1,
@@ -3292,7 +3088,7 @@ class TestPhaseBAutoReplan:
             "on_halt": "replan", "max_replans": 1,
             "nodes": [{
                 "id": "x", "goal": "g", "steps": ["s"],
-                "run": {"tool": "scripts/ok.sh"},
+                "run": {"skill": "analyzer"},
                 "output_schema": {"value": "integer"},
                 "verify": {"command": "true"},
                 "retry": 1,
@@ -3334,8 +3130,7 @@ class TestPhaseBAutoReplan:
                 pass
 
         def patched_init(self, spec, run_dir, *, resume=False,
-                         replan=False, project_root=None,
-                         package_root=None):
+                         replan=False, project_root=None):
             rd = Path(run_dir).resolve()
             if "planner-rev" in rd.name:
                 stub = _StubWorkflow(spec, rd, project_root=project_root,
@@ -3344,8 +3139,7 @@ class TestPhaseBAutoReplan:
                 self.__dict__.update(stub.__dict__)
                 return
             orig_init(self, spec, rd, resume=resume, replan=replan,
-                      project_root=project_root,
-                      package_root=package_root)
+                      project_root=project_root)
 
         monkeypatch.setattr(rt.Workflow, "__init__", patched_init)
 
@@ -3365,6 +3159,12 @@ class TestPhaseBAutoReplan:
         # Stub the Planner so any inadvertent re-entry would be
         # observable (it shouldn't fire).
         self._stub_planner(monkeypatch, "should not be used")
+        from runner import runtime as rt
+        monkeypatch.setattr(
+            rt, "exec_skill",
+            lambda *a, **k: empty_envelope(
+                "success", data={"value": 0}),
+        )
         result = _execute_with_optional_auto_replan(spec, rd)
         assert result == "halted"
         # No dag_revisions/0002 was created — Phase A behavior preserved.
@@ -3380,6 +3180,12 @@ class TestPhaseBAutoReplan:
         replan_yaml_text = yaml.safe_dump(self._replan_spec(),
                                           sort_keys=False)
         self._stub_planner(monkeypatch, replan_yaml_text)
+        from runner import runtime as rt
+        monkeypatch.setattr(
+            rt, "exec_skill",
+            lambda *a, **k: empty_envelope(
+                "success", data={"value": 1}),
+        )
 
         result = _execute_with_optional_auto_replan(
             self._initial_spec(), rd)
@@ -3405,6 +3211,12 @@ class TestPhaseBAutoReplan:
         replan_yaml_text = yaml.safe_dump(self._initial_spec(),
                                           sort_keys=False)
         self._stub_planner(monkeypatch, replan_yaml_text)
+        from runner import runtime as rt
+        monkeypatch.setattr(
+            rt, "exec_skill",
+            lambda *a, **k: empty_envelope(
+                "success", data={"value": 0}),
+        )
 
         result = _execute_with_optional_auto_replan(
             self._initial_spec(), rd)
@@ -3426,6 +3238,12 @@ class TestPhaseBAutoReplan:
         rd.mkdir(parents=True)
         (rd / "prompt.txt").write_text("solve x")
         self._stub_planner(monkeypatch, "should not be used")
+        from runner import runtime as rt
+        monkeypatch.setattr(
+            rt, "exec_skill",
+            lambda *a, **k: empty_envelope(
+                "success", data={"value": 0}),
+        )
 
         # max_attempts=1 + retry: 1 + verify=false → hits the
         # `breakpoint` kind via execute_dag's max_attempts path.
@@ -3635,16 +3453,12 @@ class TestAgentNaming:
 
     # ── exec_skill + verify_with_agent integration ────────────────────
 
-    def _make_proj_with_echo_tool(self, tmp_path: Path):
-        """A tiny tool node that always succeeds — used as a stand-in
-        for skill nodes when we just need to capture the camc call."""
+    def _make_proj_with_skill(self, tmp_path: Path):
+        """Project root with a single skill stub — used as a stand-in
+        when we just need to capture the camc call."""
         proj = tmp_path / "proj"
-        scripts = proj / "scripts"
-        scripts.mkdir(parents=True)
-        make_executable_tool(
-            scripts / "ok.sh",
-            envelope_tool_body({"value": 1}),
-        )
+        proj.mkdir(parents=True, exist_ok=True)
+        install_skill_stub(proj, "ok_skill")
         return proj
 
     def test_exec_skill_calls_camc_with_managed_name(self, tmp_path,
@@ -3720,15 +3534,15 @@ class TestAgentNaming:
         assert captured["tag"] == "camflow:run-1234"
 
     def test_camc_tag_unchanged_in_full_run(self, tmp_path):
-        """Full tool-only run: every trace event still belongs to the
+        """Full skill-only run: every trace event still belongs to the
         same camflow:<run_id> tag; this proves the cleanup/filter key
         is preserved despite the agent-name change."""
         from runner.runtime import Workflow
-        proj = self._make_proj_with_echo_tool(tmp_path)
+        proj = self._make_proj_with_skill(tmp_path)
         spec = {
             "workflow": "demo", "version": "1.1",
             "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
-                       "run": {"tool": "scripts/ok.sh"},
+                       "run": {"skill": "ok_skill"},
                        "output_schema": {"value": "integer"},
                        "verify": {"command": "true"}}],
         }

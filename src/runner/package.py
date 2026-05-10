@@ -6,12 +6,13 @@ tar with a fixed `camflowpkg/` root containing the frozen
 workflow.yaml, manifest.yaml, lock.json, and bundled skills.
 
 P0 limitations (explicit):
-  * run.tool nodes are NOT supported in package create — the RFC's
-    rewrite-to-tools/ path is deferred. create_package raises
-    PackageError when the source workflow contains a run.tool node.
-  * skill_resolution.allow_host_skills (RFC §13) is not surfaced;
-    package skills are mandatory; the runtime resolves skills strictly
-    from the package's `skills/` dir at execution time.
+  * run.tool nodes are not part of the active workflow contract.
+    create_package raises PackageError when the source workflow contains
+    a run.tool node; commands belong inside skills or verify.command.
+  * skill_resolution.allow_host_skills (RFC §13) is rejected in P0;
+    package skills are mandatory. `camflow run --package` materializes
+    those skills into `<run_dir>/skills/`, and normal runtime execution
+    resolves from that run workspace.
   * No remote registry, no signing.
 
 Stdlib-only by design. The runtime never executes anything from a
@@ -64,7 +65,6 @@ _PATH_PATTERNS = [
     re.compile(r"^workflow\.yaml$"),
     re.compile(r"^skills/[a-z][a-z0-9_]{1,63}/SKILL\.md$"),
     re.compile(r"^tools/.+"),
-    re.compile(r"^prompts/nodes/[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}/(run|verify)\.md$"),
     re.compile(r"^preflight/checks\.yaml$"),
     re.compile(r"^examples/.+"),
     re.compile(r"^evidence/.+"),
@@ -150,7 +150,10 @@ _REQUIRED_MANIFEST_KEYS = {
 }
 _KNOWN_MANIFEST_KEYS = _REQUIRED_MANIFEST_KEYS | {
     "description", "authors", "tags", "parameters",
-    "environment", "tools", "prompt_snapshots",
+    "environment", "tools",
+    # RFC §6 expansions (post-tightening):
+    "skill_resolution", "host_tools", "external_resources",
+    "global_paths", "generated_artifacts", "forbidden_install_roots",
 }
 
 
@@ -194,6 +197,26 @@ def _validate_manifest(manifest: dict) -> list[str]:
     if rt.get("package_local_skills") is False:
         errors.append("runtime.package_local_skills must not be false "
                       "in P0 (host fallback isn't supported)")
+    # skill_resolution.allow_host_skills: false default; P0 rejects true
+    # (RFC §13 final paragraph). External skills are also future work in
+    # P0 because there is no digest-pinned resolver yet.
+    sr = manifest.get("skill_resolution") or {}
+    if not isinstance(sr, dict):
+        errors.append("skill_resolution must be a mapping")
+    else:
+        if sr.get("allow_host_skills") is True:
+            errors.append(
+                "skill_resolution.allow_host_skills must not be true in P0; "
+                "host skill fallback is deferred. Set false (or omit).")
+        external_skills = sr.get("external_skills")
+        if external_skills is not None:
+            if not isinstance(external_skills, list):
+                errors.append(
+                    "skill_resolution.external_skills must be a list")
+            elif external_skills:
+                errors.append(
+                    "skill_resolution.external_skills must be empty in P0; "
+                    "external skill resolution is deferred")
     skills = manifest.get("skills") or {}
     if not isinstance(skills, dict):
         errors.append("skills must be a mapping")
@@ -256,7 +279,7 @@ def _validate_workflow_shape(wf: dict, *,
     """Run the runtime's workflow validator without making package.py a
     top-level dependency of runtime.py.
 
-    With `project_root`, this also checks local skill/tool references and
+    With `project_root`, this also checks local skill references and
     verify.command dependency availability, matching the normal compile gate.
     Archive validation uses schema-only mode because package files are still
     in memory and package-local skills/tools are cross-checked below.
@@ -454,8 +477,8 @@ def validate_package(target: Path) -> list[str]:
         tl = run.get("tool")
         if tl:
             errors.append(
-                f"workflow node {n.get('id')!r} uses run.tool — P0 "
-                f"packages do not yet support tool nodes (RFC §15)")
+                f"workflow node {n.get('id')!r} uses run.tool — "
+                f"active workflows support run.skill only")
     return errors
 
 
@@ -567,7 +590,8 @@ def create_package(*, run_dir: Path, name: str, version: str,
     if not isinstance(wf_spec, dict):
         raise PackageError("run workflow.yaml top-level is not a dict")
 
-    # Forbid run.tool nodes (P0 limitation).
+    # Forbid run.tool nodes. Commands belong inside skills or
+    # verify.command; run.skill is the only active node executor.
     nodes = wf_spec.get("nodes") or []
     for n in nodes:
         if not isinstance(n, dict):
@@ -575,9 +599,9 @@ def create_package(*, run_dir: Path, name: str, version: str,
         run = n.get("run") or {}
         if isinstance(run, dict) and "tool" in run:
             raise PackageError(
-                f"node {n.get('id')!r} uses run.tool — P0 package "
-                f"create does not support tool nodes; rewrite or "
-                f"remove the tool node before packaging")
+                f"node {n.get('id')!r} uses run.tool — active "
+                f"workflows support run.skill only; wrap commands in "
+                f"a skill before packaging")
 
     workflow_errors = _validate_workflow_shape(
         wf_spec, project_root=project_root)
@@ -774,7 +798,100 @@ def install_package(archive: Path, *,
     }
     (target_dir / INSTALLED_METADATA).write_text(
         json.dumps(meta, indent=2, sort_keys=True) + "\n")
+
+    # Project-local install bookkeeping (RFC §9 tightening): aggregate
+    # package-lock + append install.log. Records live under the project
+    # root's `.camflow/`, NOT inside source trees.
+    if project_local:
+        cf_root = root.parent  # <project>/.camflow/
+        _update_project_package_lock(cf_root, name, version, digest,
+                                     archive_digest, installed_at,
+                                     str(archive))
+        _append_install_log(cf_root, "install", name, version, digest,
+                            installed_at, str(archive))
     return target_dir
+
+
+_PROJECT_PACKAGE_LOCK = "package-lock.json"
+_PROJECT_INSTALL_LOG = "install.log"
+
+
+def _update_project_package_lock(cf_root: Path, name: str, version: str,
+                                 content_digest: str,
+                                 archive_digest: str,
+                                 installed_at: str,
+                                 source: str) -> None:
+    """Maintain the project-wide `<project>/.camflow/package-lock.json`
+    listing every project-local installed package."""
+    cf_root.mkdir(parents=True, exist_ok=True)
+    lock_path = cf_root / _PROJECT_PACKAGE_LOCK
+    data: dict = {"package_lock_schema": "1", "packages": []}
+    if lock_path.exists():
+        try:
+            existing = json.loads(lock_path.read_text())
+            if isinstance(existing, dict) and isinstance(
+                    existing.get("packages"), list):
+                data = existing
+        except json.JSONDecodeError:
+            pass
+    pkgs = [p for p in data.get("packages") or []
+            if not (p.get("name") == name and p.get("version") == version)]
+    pkgs.append({
+        "name": name,
+        "version": version,
+        "content_digest": content_digest,
+        "archive_digest": archive_digest,
+        "installed_at": installed_at,
+        "source": source,
+    })
+    pkgs.sort(key=lambda p: (p.get("name", ""), p.get("version", "")))
+    data["packages"] = pkgs
+    lock_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def _append_install_log(cf_root: Path, action: str, name: str,
+                        version: str, content_digest: Optional[str],
+                        ts: str, source: Optional[str] = None) -> None:
+    """Append-only diagnostic record for project-local install ops."""
+    cf_root.mkdir(parents=True, exist_ok=True)
+    log_path = cf_root / _PROJECT_INSTALL_LOG
+    record = {
+        "ts": ts,
+        "action": action,
+        "name": name,
+        "version": version,
+    }
+    if content_digest:
+        record["content_digest"] = content_digest
+    if source:
+        record["source"] = source
+    with log_path.open("a") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _remove_from_project_package_lock(cf_root: Path, name: str,
+                                      version: str) -> None:
+    lock_path = cf_root / _PROJECT_PACKAGE_LOCK
+    if not lock_path.exists():
+        return
+    try:
+        data = json.loads(lock_path.read_text())
+    except json.JSONDecodeError:
+        return
+    if not isinstance(data, dict):
+        return
+    pkgs = [p for p in data.get("packages") or []
+            if not (p.get("name") == name and p.get("version") == version)]
+    data["packages"] = pkgs
+    if pkgs:
+        lock_path.write_text(json.dumps(data, indent=2,
+                                        sort_keys=True) + "\n")
+    else:
+        # Empty lock — leave the file in place but with empty list, so
+        # operators see "no packages installed" rather than
+        # "lock file disappeared".
+        lock_path.write_text(json.dumps(data, indent=2,
+                                        sort_keys=True) + "\n")
 
 
 def list_installed(*, project_local: bool = False,
@@ -813,6 +930,14 @@ def uninstall_package(name: str, version: str, *,
     target = root / name / version
     if not target.exists():
         return False
+    # Capture the digest before deletion (for the install.log entry).
+    digest = None
+    meta_path = target / INSTALLED_METADATA
+    if meta_path.exists():
+        try:
+            digest = json.loads(meta_path.read_text()).get("content_digest")
+        except json.JSONDecodeError:
+            pass
     shutil.rmtree(target)
     # Clean up empty parent.
     name_dir = root / name
@@ -821,6 +946,13 @@ def uninstall_package(name: str, version: str, *,
             name_dir.rmdir()
     except OSError:
         pass
+    if project_local:
+        cf_root = root.parent
+        _remove_from_project_package_lock(cf_root, name, version)
+        ts = _dt.datetime.now(_dt.timezone.utc).isoformat(
+            timespec="seconds").replace("+00:00", "Z")
+        _append_install_log(cf_root, "uninstall", name, version,
+                            digest, ts)
     return True
 
 

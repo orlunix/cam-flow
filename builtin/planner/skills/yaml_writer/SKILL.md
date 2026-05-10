@@ -41,7 +41,7 @@ nodes:
       - "step 2"
     needs: [<upstream_id>, ...]    # optional
     run:
-      skill: <skill_name>          # OR tool: <path>
+      skill: <skill_name>
     output_schema:                  # optional but recommended
       field: <type>
     verify:
@@ -69,10 +69,9 @@ nodes:
    actually put it on a node, which it should only do when the user's
    original prompt asked for review/approval. Don't add `verify: human`
    on your own; don't drop it if it was intentionally placed.
-8. **`run.tool:` is rare.** Carry it through ONLY if `design_dag`
-   placed it (which means design_dag judged the §10 5-criterion bar is
-   met). Don't change a `skill` to a `tool`. Don't change a `tool` to a
-   `skill`. The decision belongs to design_dag, not yaml_writer.
+8. **Only `run.skill` is valid.** Do not emit `run.tool`. If upstream
+   design text mentions commands or scripts, keep them in the node's
+   steps or `verify.command`, but write `run.skill`.
 
 9. **Portable `verify.command`.** Carry through only command gates that
    use POSIX shell builtins, common Linux/coreutils commands, `python3`
@@ -114,8 +113,8 @@ nodes:
 
 Read `previous.feedback`. Typical complaints:
 
-- "missing/wrong skill" → look at upstream `design_dag.data.dag` again,
-  pick a different skill, or change to `tool:`
+- "missing/wrong skill" → look at upstream `design_dag.data.dag` again
+  and pick a different existing skill. Do not switch to `tool:`.
 - "user wanted X but yaml does Y" → the user's complaint takes priority
   over the design_dag's choices; rewrite to match
 - "yaml doesn't parse" → fix syntax (indentation, quoting, etc.)

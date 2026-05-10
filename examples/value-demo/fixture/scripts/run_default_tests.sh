@@ -3,7 +3,7 @@
 running `pytest tests/` (excluding tests/invariants/) at the
 project root.
 
-Used by the `test_runner` tool node in workflow-reference.yaml.
+Used by the `test_runner` command_runner node in workflow-reference.yaml.
 Walks up from cwd to find SPEC.md (the project marker) so the script
 works whether invoked directly or by the runtime from inside an
 attempt-N/ subdir.

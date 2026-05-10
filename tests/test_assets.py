@@ -192,16 +192,13 @@ class TestBuiltinPlanner:
                "JSON envelope" in text
 
     def test_workflow_designer_has_audit_node_mandatory_check(self):
-        """workflow_designer must include the MUST rule for audit
-        nodes when deterministic_test_scripts is non-empty.
-        Per codex-planner-audit-nodes-minimal-fix."""
+        """workflow_designer must preserve deterministic audit evidence
+        without emitting legacy run.tool nodes."""
         text = _read(BUILTIN_PLANNER_SKILLS_DIR / "workflow_designer" /
                      "SKILL.md")
         assert "Audit-node mandatory check" in text
-        # The MUST rule itself, not just the heading.
-        assert "you MUST include one `run.tool` audit node" in text or \
-               "MUST include one run.tool audit node" in text or \
-               "MUST include one `run.tool`" in text
+        assert "command_runner" in text
+        assert "Do not emit `run.tool`" in text
         # Reference the structured signal (avoid silent skipping).
         assert "deterministic_test_scripts" in text
 
@@ -286,7 +283,8 @@ class TestBuiltinPlanner:
         text = _read(BUILTIN_PLANNER_SKILLS_DIR / "workflow_designer" /
                      "SKILL.md")
         assert "Available repo skills" in text
-        for skill_name in ("analyzer", "code_writer", "reviewer"):
+        for skill_name in ("analyzer", "code_writer", "command_runner",
+                           "reviewer"):
             assert f"`{skill_name}`" in text, (
                 f"workflow_designer SKILL.md must mention the {skill_name!r} "
                 f"skill so Planner reaches for it instead of inventing names."
@@ -324,7 +322,8 @@ class TestBuiltinPlanner:
         normalized = " ".join(text.split()).lower()
         assert "portable command rule" in normalized
         assert "command -v" in text
-        assert "run.tool" in text and "load time" in normalized
+        assert "run.skill" in text and "load time" in normalized
+        assert "Do not emit `run.tool`" in text
         assert "run.skill" in text
 
     def test_yaml_writer_teaches_portable_verify_command(self):

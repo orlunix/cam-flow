@@ -19,12 +19,14 @@ The package should include:
 
 - compiled `workflow.yaml`
 - all required `skills/<name>/SKILL.md`
-- optional relative tools/scripts used by `run.tool`
 - package manifest and lockfile
-- optional node prompt source snapshots for audit/reproducibility
-- optional verifier prompt source snapshots where applicable
 - parameter schema, environment/tool requirements, and preflight checks
 - benchmark/evidence metadata from the run that produced the package
+
+The package should not include Planner artifacts, node attempts as live
+state, generated source checkouts, build directories, simulator outputs,
+per-run virtual environments, large logs, credentials, tokens, or
+license files.
 
 The workflow inside the package can still target `version: "1.1"`.
 The new version boundary is the **package/install/runtime interface**,
@@ -33,8 +35,10 @@ not necessarily the workflow YAML grammar.
 P0 CLI principle: keep the existing `camflow run` contract stable. The
 only new run-time selector should be `camflow run --package
 <name>@<version>` (or an optional short `-p` alias after conflict
-check). All package creation, validation, inspection, and installation
-belongs under `camflow package ...`.
+check). Version support already exists in the package implementation, so
+P0 keeps it rather than deleting working behavior. All package creation,
+validation, inspection, and installation belongs under
+`camflow package ...`.
 
 ## 2. Current Version Position
 
@@ -65,8 +69,8 @@ product a real v1.2 feature.
 2. **Make tuned flows reusable.** A workflow tuned on one machine can be
    installed and run on another compatible machine.
 3. **Make runs reproducible.** Every run records the package content
-   digest, workflow digest, skill digests, prompt source digests when
-   present, runtime version, and environment preflight result.
+   digest, workflow digest, skill digests, runtime version, and
+   environment preflight result.
 4. **Keep replan.** A packaged workflow may still halt and replan. The
    replan should start from the frozen package baseline and record a new
    DAG revision.
@@ -75,16 +79,108 @@ product a real v1.2 feature.
    `builtin/`.
 6. **Preserve v1.1 strictness.** Missing skills/tools fail at load time.
    Unknown package fields are explicit validation errors until allowed.
+7. **Unify execution after materialization.** Once `workflow.yaml` and
+   its required skills/tools are materialized into `.camflow/run/`,
+   Runtime execution is identical.
 
 ## 4. Non-Goals
 
 - Do not replace Planner for ad hoc fresh prompts.
+- Do not package the builtin Planner inside ordinary user workflow
+  packages. Planner is a compiler workflow with a separate workspace.
 - Do not introduce a resident orchestrator.
 - Do not add skill multi-versioning inside the source tree.
 - Do not solve cross-company credential distribution.
 - Do not make packages self-modifying.
 - Do not carry over attempt outputs as valid future inputs unless a
   package explicitly declares fixtures/examples.
+
+## 4.1 Runtime Model And Package Boundary
+
+CamFlow has two workflow roles:
+
+```text
+Planner workflow: prompt + run evidence -> user workflow.yaml
+User workflow:    active workflow.yaml -> task result
+```
+
+The builtin Planner is a specialized compiler workflow. Its DAG,
+prompts, and skills live under `builtin/planner/`, and its artifacts
+live under `.camflow/run/planner/`. User workflow artifacts live under
+`.camflow/run/nodes/`. These workspaces should not be mixed.
+
+There are two fresh-run paths:
+
+```text
+camflow run "<prompt>"
+  -> execute builtin Planner
+  -> materialize Planner output into .camflow/run/
+  -> Runtime executes .camflow/run/
+
+camflow run --package <name>@<version>
+  -> resolve installed package
+  -> materialize package contents into .camflow/run/
+  -> Runtime executes .camflow/run/
+```
+
+There is no separate "package runtime" and no P0 `--workflow` option.
+`--package` is only a front-end acquisition/materialization selector for
+`camflow run`; it skips Planner and prepares the same run workspace that
+Planner mode would have prepared.
+
+Runtime never executes an installed package in place. It first copies
+the active workflow and required skills/tools into `.camflow/run/`, then
+runs from that workspace. After materialization, Runtime should not need
+to read `.camflow/packages/...` to execute normal nodes.
+
+Runtime must record the source of the active workflow:
+
+```json
+{
+  "workflow_source": {
+    "type": "planner",
+    "planner_invoked": true
+  }
+}
+```
+
+```json
+{
+  "workflow_source": {
+    "type": "package",
+    "planner_invoked": false,
+    "package": "name@version",
+    "content_digest": "sha256:..."
+  }
+}
+```
+
+Omit fields that do not apply. Do not store secrets, env values, or
+expanded credentials in `workflow_source`.
+
+A user workflow package freezes the part that Planner would otherwise
+regenerate:
+
+```text
+workflow.yaml
+skills/<skill>/SKILL.md
+manifest.yaml
+lock.json
+```
+
+It does not freeze the whole machine, the Planner run, generated prompts,
+prior node attempts, cloned source trees, build directories, venvs, large
+logs, simulator outputs, or reports. These are runtime evidence or replay
+outputs unless explicitly included under `examples/` or `evidence/`.
+
+Every path or resource used by a package should be one of:
+
+1. **Packaged**: frozen into `.camflowpkg`.
+2. **Declared host dependency**: required by replay, but not packaged.
+3. **Replay output**: regenerated by each `camflow run --package`.
+
+This keeps v1.2 packages re-executable rather than fully hermetic. Full
+hermetic snapshots can be a later feature.
 
 ## 5. Package Artifact
 
@@ -107,11 +203,6 @@ camflowpkg/
     analyzer/SKILL.md
     code_writer/SKILL.md
     reviewer/SKILL.md
-  tools/
-    ...
-  prompts/
-    nodes/<node_id>/run.md
-    nodes/<node_id>/verify.md
   preflight/
     checks.yaml
   examples/
@@ -170,7 +261,6 @@ skill referenced by the workflow.
 Optional directories:
 
 ```text
-camflowpkg/prompts/
 camflowpkg/tools/
 camflowpkg/preflight/
 camflowpkg/examples/
@@ -195,11 +285,6 @@ camflowpkg/
     <skill_name>/SKILL.md
   tools/
     <relative_tool_path>
-  prompts/
-    nodes/
-      <node_id>/
-        run.md
-        verify.md
   preflight/
     checks.yaml
   examples/
@@ -214,17 +299,10 @@ camflowpkg/
 Rules:
 
 - `skills/<skill_name>/SKILL.md` is required for every `run.skill`
-  referenced by `workflow.yaml`, unless the manifest explicitly declares
-  an external skill dependency.
-- `tools/` paths may only satisfy `run.tool` references declared in
-  `workflow.yaml`; they must remain relative to package root and must be
-  declared in `manifest.yaml`.
-- `prompts/` is optional audit data. Runtime may ignore it during normal
-  execution.
-- `prompts/nodes/<node_id>/run.md` SHOULD exist for every node when
-  `prompt_snapshots.enabled: true`.
-- `prompts/nodes/<node_id>/verify.md` SHOULD exist for every node with
-  agent verification when `prompt_snapshots.enabled: true`.
+  referenced by `workflow.yaml`. P0 has no external skill resolver.
+- Package creation rejects `run.tool` nodes because active workflows use
+  `run.skill` only. `tools/` contains passive support scripts that skills
+  may invoke; Runtime must not execute them as node executors.
 - `evidence/` is descriptive only; runtime must not treat it as node
   state.
 - `examples/` may contain sample parameter files, but not secrets.
@@ -243,8 +321,6 @@ lock.json
 workflow.yaml
 skills/<skill_name>/SKILL.md
 tools/<path>
-prompts/nodes/<node_id>/run.md
-prompts/nodes/<node_id>/verify.md
 preflight/checks.yaml
 examples/<path>
 evidence/<path>
@@ -315,15 +391,12 @@ camflowpkg/
 It is valid only if:
 
 - `workflow.yaml` references exactly the packaged skill(s)
-- if `prompt_snapshots.enabled: true`, every node in `workflow.yaml` has
-  a prompt snapshot or an explicit manifest reason for missing one
 - `lock.json` includes all files except itself
 - `content_digest` recomputes cleanly
 - no preflight requirement is unmet at run start
 
-Everything else (`prompts/`, `tools/`, `examples/`, `evidence/`,
-`docs/`) is optional and must be ignored by runtime unless explicitly
-declared by the manifest.
+Everything else (`tools/`, `examples/`, `evidence/`, `docs/`) is
+optional. In P0, runtime must not execute package `tools/`.
 
 ## 6. Manifest
 
@@ -355,6 +428,10 @@ runtime:
   replan_supported: true
   package_local_skills: true
 
+skill_resolution:
+  allow_host_skills: false
+  external_skills: []
+
 parameters:
   workspace_root:
     type: path
@@ -376,6 +453,33 @@ environment:
     - qsub
     - smake
 
+host_tools:
+  - name: vcs
+    path: /home/tools/vcs/2026.03-1/bin/vcs
+    required: true
+
+external_resources:
+  - name: source_tree
+    kind: p4
+    depot: "//hw/nvip/..."
+    required: true
+
+global_paths:
+  - path: /home/scratch.hren_gpu_1
+    kind: scratch_root
+    access: read_write
+
+generated_artifacts:
+  - path: outdir/
+    kind: build_output
+    may_be_deleted: true
+  - path: report.md
+    kind: report
+
+forbidden_install_roots:
+  - outdir/
+  - hw/nvip/
+
 skills:
   analyzer:
     path: skills/analyzer/SKILL.md
@@ -388,10 +492,6 @@ skills:
     digest: "sha256:..."
 
 tools: []
-
-prompt_snapshots:
-  enabled: true
-  path: prompts/nodes
 
 provenance:
   source_run_dir: "/path/to/.camflow/run"
@@ -425,7 +525,12 @@ tags: [string]
 parameters: {}
 environment: {}
 tools: []
-prompt_snapshots: {}
+skill_resolution: {}
+host_tools: []
+external_resources: []
+global_paths: []
+generated_artifacts: []
+forbidden_install_roots: []
 ```
 
 Unknown top-level fields should fail validation in v1.2. This is
@@ -442,14 +547,30 @@ Field constraints:
   package intended for direct execution.
 - `runtime.package_local_skills` defaults to `true`; P0 should reject
   `false`.
+- `skill_resolution.allow_host_skills` defaults to `false`; P0 should
+  reject `true`. Future versions may allow host skills only when each
+  dependency is declared by name and digest.
+- `skill_resolution.external_skills` must be absent or an empty list in
+  P0. External skill resolution is future work.
 - every `skills.<name>.path` must be `skills/<name>/SKILL.md`.
-- every declared tool path must live under `tools/`.
+- Packages do not support workflow `run.tool` nodes. Commands belong
+  inside skills or `verify.command`.
 - environment declarations may name required variables, but must not
   contain variable values.
-- if `prompt_snapshots.enabled` is `false`, `prompt_snapshots.reason`
-  must be present.
+- common Linux commands do not need `host_tools` entries; non-general
+  commands such as `vcs`, `p4`, `qsub`, `smake`, `jq`, `yq`, and custom
+  CLIs should be declared or replaced by package-local wrappers.
+- generated artifacts are replay outputs. They are not packaged unless
+  also listed under `examples/` or `evidence/`.
+- package installs, venvs, and caches must not be placed under
+  `forbidden_install_roots`.
+Parameter declarations are optional metadata in P0. They document values
+the package author expects, but Runtime does not inject parameter files or
+add run-time parameter flags yet. If a package needs a different value in
+P0, create a new package version with a different materialized
+`workflow.yaml`.
 
-Parameter field grammar for P0:
+Suggested metadata grammar:
 
 ```yaml
 parameters:
@@ -460,11 +581,9 @@ parameters:
     description: string     # optional
 ```
 
-P0 should support parameter declaration and validation, but not require
-all packages to use parameters. To keep `camflow run` stable, P0 should
-not add ad hoc `--param` flags. A later version can add one explicit
-input file, for example `camflow run --package foo@1.0.0 --input
-params.yaml`, after the package format proves useful.
+Do not add `--param`, `--input`, registry selectors, trust flags, or
+other run flags in P0. Keep `camflow run --package <name>@<version>` as
+the only package execution surface.
 
 ## 7. Lockfile
 
@@ -478,14 +597,12 @@ Example:
 {
   "package_schema": "1",
   "name": "peregrine_rv30_verification",
-  "version": "0.1.0",
   "content_digest": "sha256:...",
   "digest_algorithm": "camflow-tree-sha256-v1",
   "files": {
     "manifest.yaml": "sha256:...",
     "workflow.yaml": "sha256:...",
-    "skills/code_writer/SKILL.md": "sha256:...",
-    "prompts/nodes/sync_and_build_rn_fecs_simv/run.md": "sha256:..."
+    "skills/code_writer/SKILL.md": "sha256:..."
   },
   "created": {
     "camflow_version": "1.2.0",
@@ -546,56 +663,31 @@ Install validation order:
 6. verify every regular file appears in `files`
 7. verify every digest
 8. recompute `content_digest`
-9. validate workflow skill/tool references against manifest and package
+9. validate workflow skill references against manifest and package
 10. materialize install directory atomically
 
-## 8. Prompt Snapshots
+## 8. Runtime Prompt Generation
 
-CamFlow prompts are partially dynamic because upstream node outputs are
-injected at runtime. A package therefore should not claim that every
-future prompt byte is precomputed.
+Packages do not carry separate prompt snapshots. The package itself is
+the snapshot of Planner output: `workflow.yaml` plus required
+skills/tools and metadata.
 
-Prompt snapshots are optional audit data, not an execution dependency
-for normal package runs. Before halt/replan, runtime can execute from
-`workflow.yaml` plus package-local skills/tools; it only renders the
-current node prompt when that node is about to run.
+Runtime still builds the actual worker and verifier prompts at attempt
+time from:
 
-When present, v1.2 freezes **prompt source snapshots**:
+- the materialized skill text
+- `workflow.goal`
+- `workflow.context`
+- `node.goal`
+- `node.steps`
+- upstream outputs
+- retry feedback
+- the runtime envelope protocol
 
-- skill text as packaged
-- workflow context
-- node goal/steps/schema/verify config
-- runtime prompt template version
-- placeholder markers for dynamic upstream data
-
-Example prompt snapshot:
-
-```text
-# Skill: code_writer
-<packaged SKILL.md content>
-
-# Workflow Goal
-<packaged workflow.goal>
-
-# Workflow Context
-<packaged workflow.context>
-
-# Goal
-<node.goal>
-
-# Steps
-<node.steps>
-
-# Upstream Inputs
-{{ runtime-injected upstream outputs }}
-
-# Output
-<runtime envelope contract>
-```
-
-This gives reproducibility at the right layer: stable prompt recipe plus
-runtime trace of actual dynamic data. If snapshots are omitted, the run
-is still valid, but auditability is weaker.
+Every actual prompt sent to an agent is backed up under
+`.camflow/run/nodes/<node>/attempt-*/prompt.txt` or the corresponding
+`verify/prompt.txt`. That run backup is execution evidence, not package
+input.
 
 ## 9. Install Layout
 
@@ -611,6 +703,8 @@ Project-local install:
 
 ```text
 ./.camflow/packages/<name>/<version>/
+./.camflow/package-lock.json
+./.camflow/install.log
 ```
 
 Resolution order:
@@ -620,9 +714,9 @@ Resolution order:
 3. user installed package
 4. system/shared package directory, if configured
 
-The resolver must not silently pick a different version. If the user
-omits a version and more than one version is installed, fail with a
-clear list.
+The resolver maps one package name/version to one installed content
+digest. If a different digest is installed under the same name/version,
+the install command must require an explicit replace flag.
 
 `installed.json` is local install metadata, not part of the package
 content digest:
@@ -643,12 +737,23 @@ The install directory should be content-checked on every package run.
 If any installed file no longer matches `lock.json`, runtime should fail
 before starting node execution.
 
+For project-local installs, `.camflow/package-lock.json` records the
+installed package identity, content digest, archive digest, install path,
+and source archive. `.camflow/install.log` is append-only diagnostic
+history for install, replace, and uninstall operations. These files are
+not part of the package content digest.
+
+Install must write only CamFlow package state. It must not install
+packages, venvs, or caches under source trees or build output trees. For
+example, C906 package state belongs under `.camflow/`, not under
+`c906_repo/smart_run/work/` or `c906_repo/smart_run/logical/`.
+
 ## 10. CLI Surface
 
 P0 commands:
 
 ```bash
-camflow package create --from-run .camflow/run --out dist/foo.camflowpkg
+camflow package create --from-run .camflow/run --name foo --version 0.1.0 --out dist/foo.camflowpkg
 camflow package inspect dist/foo.camflowpkg
 camflow package validate dist/foo.camflowpkg
 camflow package install dist/foo.camflowpkg
@@ -665,9 +770,7 @@ camflow run --package <name>@<version>
 
 An optional short alias `-p` can be added only after checking there is no
 existing conflict. Do not add `--param`, `--trust-tools`, registry
-selectors, or other run flags in P0. If package inputs become necessary,
-add one future flag such as `--input params.yaml` rather than many small
-flags.
+selectors, `--input`, or other run flags in P0.
 
 The `camflow package` command is new and can have the management
 subcommands it needs. The existing `camflow run "<prompt>"` path remains
@@ -675,16 +778,23 @@ the Planner-first v1.1 behavior.
 
 ## 11. Runtime Semantics
 
+Runtime executes one materialized run workspace. Prompt mode and package
+mode differ only in how `.camflow/run/` is prepared.
+
 Fresh package run:
 
 1. Resolve installed package.
 2. Validate manifest and lockfile.
 3. Materialize run dir.
 4. Copy `workflow.yaml` into `.camflow/run/workflow.yaml`.
-5. Copy package metadata into `.camflow/run/package.json`.
-6. Resolve skills/tools from the package first.
-7. Run preflight checks.
-8. Execute node scheduling from the first normal node.
+5. Copy `skills/` into `.camflow/run/skills/`.
+6. Copy `tools/` into `.camflow/run/tools/`, when present, for future
+   compatibility. P0 workflows must not execute them.
+7. Copy package metadata into `.camflow/run/package.json`.
+8. Copy the package lock/install metadata into
+   `.camflow/run/package-lock.json`.
+9. Run preflight checks and write `.camflow/run/preflight.json`.
+10. Execute the normal Runtime run loop from node 1.
 
 Planner is not invoked.
 
@@ -698,13 +808,51 @@ Trace must include:
     "version": "0.1.0",
     "content_digest": "sha256:..."
   },
-  "planner_invoked": false
+  "planner_invoked": false,
+  "workflow_source": {
+    "type": "package",
+    "planner_invoked": false,
+    "package": "peregrine_rv30_verification@0.1.0",
+    "content_digest": "sha256:..."
+  }
 }
 ```
 
+The run loop is deterministic with respect to the active workflow and
+run state:
+
+```text
+load active workflow.yaml
+load run state
+for each ready node:
+  materialize missing prompt/spec from .camflow/run/ for this dag_revision
+  skip nodes already completed for this dag_revision
+  run worker attempt, verify, retry/halt/complete
+```
+
+Within one DAG revision, existing materialized prompt/spec files may be
+reused. Across revisions, v1.2 should conservatively materialize fresh
+nodes unless an explicit reuse rule is added later.
+
 ## 12. Replan Semantics
 
-Replan still works, but with package-aware context.
+Replan is a transition between the same two workflow roles:
+
+```text
+RUNNING user workflow
+  -> halt / replan requested
+  -> execute Planner workflow with run evidence
+  -> write revised user workflow.yaml
+  -> return to normal Runtime run loop
+```
+
+It is not a separate executor. Planner produces a new active user
+workflow revision; Runtime executes it.
+
+Replan must not mutate the installed package. For a package-origin run,
+the initial `workflow_source` remains the package identity, while the
+new DAG revision manifest records that the live workflow has diverged
+from that package.
 
 If a packaged workflow halts and `on_halt: replan` is enabled, runtime
 invokes Planner with:
@@ -724,6 +872,18 @@ dag_revisions/0002/
   workflow.yaml
   manifest.json
 ```
+
+Before a new active workflow is installed, the prior active
+`workflow.yaml`, live `nodes/`, and halt state should be archived under
+the previous DAG revision. For v1.2, conservative behavior is to
+materialize and run fresh nodes for the new revision. Reusing unchanged
+node outputs across revisions is a later optimization.
+
+The revised workflow may reference package-local skills or declared
+external dependencies only. If Planner emits a new undeclared skill
+reference during package-aware replan, Runtime should fail
+before node execution with a package policy error instead of silently
+falling back to the source tree.
 
 `manifest.json` should add:
 
@@ -748,21 +908,41 @@ dag rev:  2 (replanned from package)
 
 ## 13. Skill Resolution
 
-Package skill resolution must be explicit:
+Package skill resolution has two phases.
+
+During package validation and materialization, package skill resolution
+must be explicit:
 
 1. package-local `skills/<name>/SKILL.md`
-2. optional declared external skill dependency by digest
-3. fail
+2. fail
 
-Do not fall back to source-tree `skills/` unless the manifest explicitly
-declares:
+External skill dependencies by name/digest are future work. P0 should
+reject non-empty `skill_resolution.external_skills`.
+
+During Runtime execution, skills and tools must resolve from the
+materialized run workspace:
+
+```text
+.camflow/run/skills/<name>/SKILL.md
+.camflow/run/tools/<relative-tool>
+```
+
+Runtime must not read `.camflow/packages/...` to execute normal nodes
+after package materialization is complete.
+
+Future versions must not fall back to source-tree `skills/` unless the
+manifest explicitly declares:
 
 ```yaml
 skill_resolution:
   allow_host_skills: true
 ```
 
-Default should be `false` for reproducibility.
+Default is `false` for reproducibility.
+
+P0 should reject `allow_host_skills: true`. This keeps the first package
+release reproducible and avoids hidden source-tree dependencies. Host
+skill resolution can be added later with a digest-pinned policy.
 
 ## 14. Security And Trust
 
@@ -773,11 +953,11 @@ Installer must reject:
 - symlinks in v1.2
 - hardlinks, device files, FIFOs, sockets, and duplicate paths
 - files outside the allowed path families
-- executable tools unless explicitly allowed by manifest
+- executable support files unless explicitly allowed by manifest
 - missing lock entries
 - digest mismatch
 - unknown manifest fields
-- undeclared workflow skill/tool references
+- undeclared workflow skill references
 - packaged values that look like credentials or tokens
 
 Installer should print a trust summary:
@@ -801,7 +981,7 @@ are not.
 
 - run state is `success`, unless `--allow-halted` is explicit
 - `workflow.yaml` validates
-- every referenced skill/tool can be copied or resolved
+- every referenced skill can be copied or resolved
 - package has a name and version
 - all files fit path containment rules
 - no env var values or known token patterns are found in packaged files
@@ -810,7 +990,6 @@ The command should copy:
 
 - final live `workflow.yaml`
 - packaged skills and tools
-- prompt source snapshots for each node, when available
 - source run trace summary
 - benchmark/evidence file if supplied
 
@@ -831,8 +1010,9 @@ Minimum deterministic tests:
 4. Assert package-local skill is used even if source-tree skill differs.
 5. Assert missing package skill fails load.
 6. Assert package content digest appears in status and trace.
-7. Assert replan from packaged workflow creates `dag_revisions/0002`.
-8. Assert archive path traversal and symlink payloads are rejected.
+7. Assert `workflow_source.type == "package"` in trace/status metadata.
+8. Assert replan from packaged workflow creates `dag_revisions/0002`.
+9. Assert archive path traversal and symlink payloads are rejected.
 
 Live gate:
 
@@ -857,6 +1037,7 @@ Scope:
 - `camflow run --package <name>@<version>`
 - package-local skill resolution
 - package content digest in trace/status
+- package workflow source metadata in trace/status
 - no remote registry
 - no signatures
 - no ad hoc run parameter flags
@@ -870,6 +1051,8 @@ Scope:
 - deploy package to `/home/prgn_share/tools/camflow/packages`
 - install from local path on PDX
 - run package remotely with release artifact
+- project `package-lock.json` and `install.log`
+- run `package-lock.json` and `preflight.json`
 - update `docs/release.md`
 
 ### P2: Package-Aware Replan
@@ -889,17 +1072,16 @@ Scope:
 - provenance attestation
 - package promotion flow
 
-## 18. Open Questions
+## 18. Non-Blocking Open Questions
+
+These questions should not block P0. P0 can choose the conservative
+answer and tighten later.
 
 1. Should package-local tools be executable by default, or require an
    explicit `--trust-tools` install flag?
-2. Should package versions be semantic versions only, or allow content
-   digests as the primary selector?
-3. Should prompt snapshots include complete runtime templates, or only
-   hashes of the runtime template version?
-4. How much source-run evidence is safe to package by default?
-5. When parameters become necessary, should the only new run flag be
-   `--input params.yaml`?
+2. How much source-run evidence is safe to package by default?
+3. What is the smallest future parameter story that does not destabilize
+   `camflow run`?
 
 ## 19. Recommendation
 
@@ -910,15 +1092,19 @@ existing workflow contract, make packages immutable and installable, and
 run them directly through the existing Runtime. Keep Planner for fresh
 prompt compilation and package-aware replan.
 
-This gives CamFlow a clear second mode:
+This gives CamFlow one run command with one extra acquisition selector:
 
 ```text
 camflow run "<new ambiguous task>"
-  -> Planner compiles, then Runtime executes
+  -> Planner workflow compiles user workflow.yaml
+  -> materialize .camflow/run/
+  -> Runtime executes .camflow/run/
 
 camflow run --package <proven-flow>@<version>
-  -> Runtime executes frozen DAG immediately
+  -> materialize .camflow/run/ from the package
+  -> Runtime executes .camflow/run/
 ```
 
-That separation is the simplest path to reproducibility, reuse, remote
-install, and benchmarkable production workflows.
+That separation keeps Planner specialized while making Runtime
+deterministic. It is the simplest path to reproducibility, reuse, remote
+install, package replay, and benchmarkable production workflows.

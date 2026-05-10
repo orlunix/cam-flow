@@ -51,8 +51,13 @@ nodes:
     verify:
       command: |
         # Verify only succeeds when the oracle reports solved=true.
-        bash scripts/maze_status.sh \
-          | jq -e '.data.solved == true' >/dev/null
+        bash scripts/maze_status.sh > maze_status_verify.json
+        python3 - <<'PY'
+        import json
+        with open("maze_status_verify.json") as f:
+            env = json.load(f)
+        raise SystemExit(0 if env.get("data", {}).get("solved") is True else 1)
+        PY
     retry: 1
 
   - id: confirm
@@ -62,10 +67,16 @@ nodes:
       - "Run scripts/maze_status.sh from the project root."
       - "Emit envelope with data.solved, data.event_counts."
     run:
-      tool: scripts/maze_status.sh
+      skill: command_runner
     output_schema:
       ok: boolean
       solved: boolean
     verify:
-      command: 'test "$(jq -r .data.solved agent_output.json)" = "true"'
+      command: |
+        python3 - <<'PY'
+        import json
+        with open("agent_output.json") as f:
+            env = json.load(f)
+        raise SystemExit(0 if env.get("data", {}).get("solved") is True else 1)
+        PY
     retry: 1

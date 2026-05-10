@@ -2,7 +2,7 @@
 """run_invariants — emit a v1.1 envelope JSON to stdout after
 running `pytest tests/invariants/` at the project root.
 
-Used by the `invariant_checker` tool node in workflow-reference.yaml.
+Used by the `invariant_checker` command_runner node in workflow-reference.yaml.
 """
 import json
 import re

@@ -10,25 +10,25 @@ What this test exercises end-to-end (no real LLM):
      input.
   4. On attempt 2 the implementer (here, our fake) writes the real
      csvparser.py to the project; verify.command passes; downstream
-     tool nodes (test_runner, invariant_checker) actually run pytest
-     and observe data.passed=true.
-  5. Per-attempt artifacts (output.json, prompt.txt for skill, raw
-     stdout / agent_output.json for tools) are persisted at the spec'd
-     paths.
+     command_runner audit nodes (test_runner, invariant_checker)
+     actually run pytest and observe data.passed=true.
+  5. Per-attempt artifacts (output.json, prompt.txt, agent_output.json)
+     are persisted at the spec'd paths.
   6. Workflow ends in lifecycle "done".
 
 Skill nodes (analyzer, implementer, reviewer) and the default
 agent-verify subagent are served by a single fake `camc.run_and_collect`
 that disambiguates by the `name` kwarg (`-attempt-` vs `-verify-`).
 
-Tool nodes (test_runner, invariant_checker) and the implementer's
-verify.command are *real* subprocess invocations — that's the part of
-the runtime worth exercising for real here.
+The command_runner audit nodes (test_runner, invariant_checker) and the
+implementer's verify.command are *real* subprocess invocations — that's
+the part of the runtime worth exercising for real here.
 """
 from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -182,6 +182,22 @@ def _make_fake_camc(project_root: Path):
                 "error": None, "feedback": None, "request_human": False,
             }, "rev-aid")
 
+        if node_id in {"test_runner", "invariant_checker"}:
+            script = ("run_default_tests.sh" if node_id == "test_runner"
+                      else "run_invariants.sh")
+            cp = subprocess.run(
+                ["python3", str(project_root / "scripts" / script)],
+                cwd=workspace,
+                text=True,
+                capture_output=True,
+                timeout=60,
+            )
+            Path(workspace, "raw_stdout.txt").write_text(cp.stdout)
+            if cp.returncode != 0:
+                raise AssertionError(
+                    f"{script} failed: stdout={cp.stdout} stderr={cp.stderr}")
+            return _emit(json.loads(cp.stdout), f"{node_id}-aid")
+
         raise AssertionError(f"unexpected fake-camc call: name={name!r}")
 
     return fake, calls
@@ -194,9 +210,6 @@ def _trace_events(run_dir: Path) -> list[dict]:
     return [json.loads(line) for line in p.read_text().splitlines() if line]
 
 
-@pytest.mark.skipif(shutil.which("jq") is None,
-                    reason="workflow-reference.yaml uses jq in verify.command "
-                           "for tool nodes; install jq to run this E2E.")
 def test_workflow_reference_e2e(tmp_path, monkeypatch):
     from runner import runtime as rt
     from runner.runtime import run_workflow, parse_workflow_yaml
@@ -264,7 +277,7 @@ def test_workflow_reference_e2e(tmp_path, monkeypatch):
         f"{[e.get('event') for e in events]}"
     )
 
-    # 9. Tool nodes ran for real and passed.
+    # 9. command_runner audit nodes ran real scripts and passed.
     tr = json.loads(
         (run_dir / "nodes" / "test_runner" / "attempt-1" / "output.json").read_text()
     )
@@ -543,4 +556,5 @@ def test_workflow_reference_validates_under_repo_skills():
     spec = parse_workflow_yaml(WF_PATH.read_text(), project_root=FIXTURE)
     skills_used = {n["run"]["skill"]
                    for n in spec["nodes"] if "skill" in (n.get("run") or {})}
-    assert skills_used == {"analyzer", "code_writer", "reviewer"}
+    assert skills_used == {"analyzer", "code_writer", "command_runner",
+                           "reviewer"}

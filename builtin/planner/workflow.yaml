@@ -9,7 +9,7 @@ goal: |
 
 context: |
   You are the camflow Planner — a self-hosted compiler that turns a
-  natural-language user task into a deterministic DAG of skill/tool
+  natural-language user task into a deterministic DAG of skill
   nodes, each with explicit goals, steps, dependencies, and
   verification.
 
@@ -44,11 +44,11 @@ nodes:
     retry: 2
 
   - id: design_dag
-    goal: "Design a DAG of skill/tool nodes that accomplishes the task"
+    goal: "Design a DAG of skill nodes that accomplishes the task"
     needs: [understand]
     steps:
       - "Read the upstream understand envelope (auto-injected as upstream.understand)"
-      - "Pick existing skills (or tools) that map to natural decomposition steps"
+      - "Pick existing skills that map to natural decomposition steps"
       - "Order the nodes by dependency via `needs`"
       - "Decide retry/verify for each — default 1, bump for high-stakes generative work"
       - "Identify run-constants that should go in workflow.context"
@@ -58,7 +58,7 @@ nodes:
       dag: array
       context: string
     verify:
-      criterion: "DAG covers the task statement; needs are consistent (no orphan, no cycle); each node references a real skill or tool; AND if upstream.understand.data.deterministic_test_scripts is non-empty (envelope-emitting test runners exist), the DAG MUST include one run.tool audit node per such script after the implementer-class node, with each audit node feeding into the reviewer's needs — implementer.verify.command is a quality gate, NOT a substitute for independent audit envelopes"
+      criterion: "DAG covers the task statement; needs are consistent (no orphan, no cycle); each node references a real skill; no node uses run.tool; deterministic test scripts from upstream.understand.data.deterministic_test_scripts are used as verify.command gates or command_runner/existing skill-backed audit steps, not as tool nodes"
     retry: 3
 
   - id: render_yaml

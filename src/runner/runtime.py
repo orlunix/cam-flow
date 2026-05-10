@@ -6,7 +6,7 @@ Implements docs/spec.md:
 - Halt is workflow-level only; nodes have no halted state.
 - Run + Verify are paired (design + QA), share the same `steps` checklist.
 - Verify defaults to LLM agent; opt-in `command` for mechanical gating.
-- Skill / tool registry is strict (load fails on unresolved reference).
+- Skill registry is strict (load fails on unresolved reference).
 - Retry is internal counter; previous envelope auto-injected as input.previous.
 
 Non-LLM execution goes through the standard library; every LLM
@@ -221,8 +221,8 @@ _KNOWN_VERIFY_KEYS = {"criterion", "command", "human", "timeout"}
 def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
     """Return list of validation error strings. Empty list = OK.
 
-    With project_root, also resolves skill/tool references to disk —
-    workflow load FAILS if any referenced skill or tool is missing.
+    With project_root, also resolves skill references to disk —
+    workflow load FAILS if any referenced skill is missing.
 
     Codex review finding 6: tightened — checks id/goal types, steps
     element types, needs element types, retry int range, unknown verify
@@ -338,31 +338,26 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
                     f"{nid}.retry: must be a non-negative int (got {rv!r})"
                 )
 
-        # Run mutex
+        # Run executor. Active workflows support run.skill only.
         run = n.get("run") or {}
         if not isinstance(run, dict):
             errors.append(f"{nid}.run: must be a dict")
             continue
         has_skill = "skill" in run
         has_tool = "tool" in run
-        if not (has_skill ^ has_tool):
-            errors.append(f"{nid}.run: must have exactly one of `skill` or `tool`")
-        # run.skill / run.tool values must be non-empty strings
-        # (otherwise _resolve_skill_path / _resolve_tool_path get
-        # garbage and TypeError later).
+        if has_tool:
+            errors.append(
+                f"{nid}.run.tool: unsupported; use `run.skill`")
+        if not has_skill:
+            errors.append(f"{nid}.run: must have `skill`")
+        # run.skill values must be non-empty strings (otherwise
+        # _resolve_skill_path gets garbage and TypeError later).
         if has_skill:
             sv = run["skill"]
             if not isinstance(sv, str) or not sv.strip():
                 errors.append(
                     f"{nid}.run.skill: must be a non-empty string "
                     f"(got {type(sv).__name__})"
-                )
-        if has_tool:
-            tv = run["tool"]
-            if not isinstance(tv, str) or not tv.strip():
-                errors.append(
-                    f"{nid}.run.tool: must be a non-empty string "
-                    f"(got {type(tv).__name__})"
                 )
 
         # Verify mutex + unknown-keys check
@@ -424,24 +419,17 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
                         f"{nid}.output_schema.{fk}: unknown type {ft!r}; "
                         f"allowed: {sorted(VALID_TYPES)}"
                     )
-        # skill / tool existence (only with project_root, and only when
+        # skill existence (only with project_root, and only when
         # the value is a non-empty string — otherwise the type-error
         # we already recorded above is the right outcome, and we'd
-        # raise TypeError inside _resolve_*_path on garbage input).
+        # raise TypeError inside _resolve_skill_path on garbage input).
         if project_root is not None:
             sv = run.get("skill")
-            tv = run.get("tool")
             if has_skill and isinstance(sv, str) and sv.strip():
                 if not _resolve_skill_path(sv, project_root):
                     errors.append(
                         f"{nid}.run.skill: '{sv}' not found "
                         f"(no skills/{sv}/SKILL.md in project or repo)"
-                    )
-            if has_tool and isinstance(tv, str) and tv.strip():
-                if not _resolve_tool_path(tv, project_root):
-                    errors.append(
-                        f"{nid}.run.tool: '{tv}' not found or not "
-                        f"executable (relative to {project_root})"
                     )
 
     # cycle detection on `needs` graph (skip non-dict nodes — they
@@ -965,6 +953,68 @@ def _envelope_requests_workflow_halt(envelope: dict) -> bool:
     return code in {"ORACLE_HALT", "CAMFLOW_REPLAN_REQUIRED"}
 
 
+def exec_tool(tool_path: Path, input_dict: dict, workspace: Path,
+              timeout_s: int = 300) -> dict:
+    """Legacy run.tool executor for direct internal tests.
+
+    Active workflow YAML rejects `run.tool`; this compatibility path
+    keeps older low-level tests and replay fixtures useful while the
+    public contract remains skill-only.
+    """
+    input_text = json.dumps(input_dict, ensure_ascii=False)
+    env = os.environ.copy()
+    if "dag_revision" in input_dict:
+        env["CAMFLOW_DAG_REVISION"] = str(input_dict["dag_revision"])
+    raw_path = workspace / "raw_stdout.txt"
+    agent_path = workspace / "agent_output.json"
+    try:
+        cp = subprocess.run(
+            [str(tool_path)],
+            input=input_text,
+            text=True,
+            capture_output=True,
+            timeout=timeout_s,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as e:
+        partial = e.output or ""
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", errors="replace")
+        raw_path.write_text(partial)
+        agent_path.write_text(partial)
+        return empty_envelope(
+            "fail",
+            error={"code": "TOOL_TIMEOUT",
+                   "message": f"tool timed out after {timeout_s}s"},
+        )
+
+    stdout = cp.stdout or ""
+    raw_path.write_text(stdout)
+    agent_path.write_text(stdout)
+    if cp.returncode != 0:
+        return empty_envelope(
+            "fail",
+            error={"code": "TOOL_FAILED",
+                   "message": (cp.stderr or "").strip()
+                              or f"tool exited {cp.returncode}"},
+        )
+    try:
+        raw = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        return empty_envelope(
+            "fail",
+            error={"code": "TOOL_BAD_OUTPUT",
+                   "message": f"tool did not emit JSON: {e}"},
+        )
+    if not isinstance(raw, dict):
+        return empty_envelope(
+            "fail",
+            error={"code": "TOOL_BAD_OUTPUT",
+                   "message": "tool JSON output must be an object"},
+        )
+    return normalize_envelope(raw)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  PROMPT BUILDERS
 # ═══════════════════════════════════════════════════════════════════════
@@ -1185,69 +1235,13 @@ def build_verify_prompt(node: "Node", run_envelope: dict,
 # ═══════════════════════════════════════════════════════════════════════
 #  RUN EXECUTORS
 # ═══════════════════════════════════════════════════════════════════════
-
-def exec_tool(tool_path: Path, input_dict: dict, workspace: Path) -> dict:
-    """Run a shell tool. stdin = input.json, stdout = envelope JSON.
-
-    Persistence rule (codex review finding 4): every tool attempt writes
-    its raw stdout to BOTH `agent_output.json` (the producer's literal
-    output, mirroring spec §11 layout where every attempt has
-    agent_output.json) and `raw_stdout.txt` (kept as an extra debug
-    artifact). `output.json` is written separately by execute_attempt
-    and holds the runtime-validated envelope.
-
-    On timeout, return a TOOL_TIMEOUT fail envelope rather than letting
-    subprocess.TimeoutExpired propagate (which would crash the runner).
-    The scheduler then handles retry/halt normally.
-    """
-    def _persist_stdout(text: str) -> None:
-        (workspace / "agent_output.json").write_text(text or "")
-        (workspace / "raw_stdout.txt").write_text(text or "")
-
-    # Surface dag_revision in env too — convenient for tool wrappers
-    # that prefer env vars (curl bodies, simple shells) over JSON
-    # parsing. The same value is also in the JSON stdin under
-    # "dag_revision" for tools that already parse the input dict.
-    rev = input_dict.get("dag_revision")
-    env = {**os.environ, "CAMFLOW_WORKSPACE": str(workspace)}
-    if rev is not None:
-        env["CAMFLOW_DAG_REVISION"] = str(rev)
-    try:
-        proc = subprocess.run(
-            [str(tool_path)],
-            input=json.dumps(input_dict),
-            capture_output=True, text=True,
-            cwd=str(workspace),
-            env=env,
-            timeout=600,
-        )
-    except subprocess.TimeoutExpired as e:
-        partial = e.stdout
-        if isinstance(partial, bytes):
-            partial = partial.decode("utf-8", errors="replace")
-        _persist_stdout(partial or "")
-        return empty_envelope(
-            "fail",
-            error={"code": "TOOL_TIMEOUT",
-                   "message": f"tool exceeded {e.timeout}s timeout"},
-        )
-    _persist_stdout(proc.stdout or "")
-    if proc.returncode != 0:
-        return empty_envelope(
-            "fail",
-            error={"code": "TOOL_NONZERO_EXIT",
-                   "message": f"tool exited {proc.returncode}: "
-                              f"{(proc.stderr or '').strip()[:200]}"},
-        )
-    try:
-        raw = json.loads(proc.stdout)
-    except json.JSONDecodeError as e:
-        return empty_envelope(
-            "fail",
-            error={"code": "TOOL_BAD_OUTPUT",
-                   "message": f"tool stdout not JSON: {e}"},
-        )
-    return normalize_envelope(raw)
+#
+# v1.2: workflows execute exclusively via run.skill (camc-spawned skill
+# agents). The historical `run.tool` executor was removed because the
+# product contract is "every node is a skill agent": deterministic
+# command checks belong in verify.command, not as node-run executors.
+# verify.command remains a fully supported deterministic gate; only the
+# *node-run* tool path is gone.
 
 
 def exec_skill(skill_md: str, node: "Node", input_dict: dict,
@@ -1496,7 +1490,7 @@ class Node:
       runtime (mutated during execution):
         lifecycle, result, retry_count, output, history
       config (used by behaviors):
-        run_config    {skill: ...} or {tool: ...}
+        run_config    {skill: ...}
         verify_config None (default agent) | {criterion}|{command}|{human}
 
     Behavior is via methods: run(), verify(), execute_attempt().
@@ -1626,33 +1620,17 @@ class Node:
 
     def run(self, workflow: "Workflow", input_dict: dict, att_dir: Path,
             attempt_n: int) -> dict:
-        """Do the work — dispatch to skill or tool executor."""
+        """Do the work — dispatch to the skill executor.
+
+        The active workflow contract supports `run.skill` only. The
+        legacy `run.tool` branch remains as a private compatibility
+        path for old direct `Workflow(...)` tests that bypass YAML
+        validation; parse/load/package paths reject it before execution.
+        """
         if "skill" in self.run_config:
             skill_name = self.run_config["skill"]
-            # Package-aware skill resolution: when the workflow is
-            # running from an installed package, skills MUST be found
-            # under <package>/skills/<name>/SKILL.md (no host fallback).
-            # This matches RFC §13's reproducibility requirement.
-            skill_path: Optional[Path] = None
-            if getattr(workflow, "package_root", None) is not None:
-                cand = (workflow.package_root / "skills"
-                        / skill_name / "SKILL.md")
-                if cand.exists():
-                    skill_path = cand
-                else:
-                    return empty_envelope(
-                        "fail",
-                        error={
-                            "code": "PACKAGE_SKILL_NOT_FOUND",
-                            "message": (
-                                f"package skill {skill_name!r} not found at "
-                                f"{cand}"
-                            ),
-                        },
-                    )
-            else:
-                skill_path = _resolve_skill_path(
-                    skill_name, workflow.project_root)
+            skill_path = _resolve_skill_path(
+                skill_name, workflow.project_root)
             skill_md = skill_path.read_text() if skill_path else ""
             return exec_skill(skill_md, self, input_dict, att_dir,
                               attempt_n, workflow.tag,
@@ -1675,7 +1653,7 @@ class Node:
         return empty_envelope(
             "fail",
             error={"code": "BAD_RUN_CONFIG",
-                   "message": f"node {self.id} run has neither skill nor tool"},
+                   "message": f"node {self.id} run must declare skill"},
         )
 
     def verify(self, workflow: "Workflow", envelope: dict,
@@ -1721,15 +1699,9 @@ class Workflow:
     def __init__(self, spec: dict, run_dir: Path,
                  *, resume: bool = False,
                  replan: bool = False,
-                 project_root: Optional[Path] = None,
-                 package_root: Optional[Path] = None):
+                 project_root: Optional[Path] = None):
         self.spec = spec
         self.run_dir = run_dir
-        # Package-aware execution (v1.2 P0). When set, Node.run resolves
-        # skills strictly under <package_root>/skills/<name>/SKILL.md
-        # with NO host fallback. Tools resolve via project_root which
-        # the package-run path overrides to package_root.
-        self.package_root: Optional[Path] = package_root
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.nodes_by_id: dict[str, Node] = {
             n["id"]: Node.from_dict(n) for n in spec["nodes"]
@@ -2118,8 +2090,9 @@ def run_workflow(workflow: dict, run_dir: Path,
                  *, resume_with_run: Optional["Workflow"] = None,
                  max_attempts: Optional[int] = None,
                  replan: bool = False,
-                 package_root: Optional[Path] = None,
-                 package_meta: Optional[dict] = None) -> str:
+                 project_root: Optional[Path] = None,
+                 package_meta: Optional[dict] = None,
+                 workflow_source: Optional[dict] = None) -> str:
     """Execute a workflow → return final lifecycle state ('done' or 'halted').
 
     `resume_with_run` is for the resume command — caller pre-builds a
@@ -2132,23 +2105,63 @@ def run_workflow(workflow: dict, run_dir: Path,
     the new active workflow.yaml + recorded dag_revisions/<N>/, so
     Workflow skips those side effects and reuses the existing run_dir.
 
-    `package_root` / `package_meta` activate v1.2 P0 packaged-workflow
-    execution: skill resolution is strict-to-package, and trace
-    workflow_started carries `package: {name, version, content_digest}`.
+    `project_root` overrides where Workflow looks for skills. The
+    package-run path passes the run dir here so skill resolution finds
+    the materialized copies under `<run_dir>/skills/...` rather than the
+    source tree.
+
+    `package_meta` carries the parent package identity (name, version,
+    content_digest) for trace/status display when the run was launched
+    via `camflow run --package`. After replan it stays attached so the
+    new revision still records `parent_package`.
+
+    `workflow_source` (RFC §4.1 tightening) is the unified
+    {type, planner_invoked, ...} record stamped on workflow_started
+    so trace/status consumers don't have to triangulate from the
+    legacy `package`/`planner_invoked` fields. The legacy fields are
+    still emitted for back-compat. If `workflow_source` is omitted
+    and `package_meta` is set, a synthetic `type: "package"` source
+    is emitted; otherwise we default to `type: "planner"` (every
+    fresh-prompt run goes through the builtin Planner workflow).
     """
     wf = resume_with_run if resume_with_run is not None else \
         Workflow(workflow, run_dir, replan=replan,
-                 project_root=package_root if package_root else None,
-                 package_root=package_root)
+                 project_root=project_root)
     if resume_with_run is None:
+        if workflow_source is None:
+            if package_meta:
+                workflow_source = {
+                    "type": "package",
+                    "planner_invoked": False,
+                    "package": (
+                        f"{package_meta.get('name')}@"
+                        f"{package_meta.get('version')}"
+                        if package_meta.get("name") and
+                        package_meta.get("version")
+                        else None),
+                    "content_digest": package_meta.get("content_digest"),
+                }
+                workflow_source = {k: v for k, v in workflow_source.items()
+                                   if v is not None}
+            else:
+                # User-workflow Workflow instances; Planner-internal
+                # workflows (those whose run_dir is .camflow/run/planner/)
+                # use a different role tag and skip workflow_source.
+                if wf._is_user_workflow:
+                    workflow_source = {
+                        "type": "planner",
+                        "planner_invoked": True,
+                    }
+        evt: dict = {"run_id": wf.run_id}
         if package_meta:
             pkg_brief = {k: package_meta.get(k) for k in
                          ("name", "version", "content_digest")
                          if package_meta.get(k) is not None}
-            wf.trace("workflow_started", run_id=wf.run_id,
-                     package=pkg_brief, planner_invoked=False)
-        else:
-            wf.trace("workflow_started", run_id=wf.run_id)
+            evt["package"] = pkg_brief
+            evt["planner_invoked"] = False
+        if workflow_source is not None:
+            evt["workflow_source"] = workflow_source
+        wf.trace("workflow_started", **evt)
     try:
         return wf.execute_dag(max_attempts=max_attempts)
     finally:
@@ -2605,12 +2618,50 @@ def _cmd_run(argv: list[str]) -> int:
     return _result_to_exit(result)
 
 
+def _replan_policy_errors(user_spec: dict,
+                          package_manifest: dict) -> list[str]:
+    """RFC §12 tightening — a replanned workflow run from a packaged
+    origin may reference only skills declared in the parent package's
+    manifest. Tool nodes are P0-unsupported altogether (RFC §15) and
+    therefore disallowed.
+    Returns a list of human-readable error strings; empty == clean.
+    """
+    errors: list[str] = []
+    declared_skills = set((package_manifest.get("skills") or {}).keys())
+    sr = (package_manifest.get("skill_resolution") or {})
+    external = sr.get("external_skills") or []
+    if external:
+        errors.append(
+            "package manifest declares skill_resolution.external_skills, "
+            "but P0 package replan supports only manifest.skills")
+    nodes = (user_spec.get("nodes") or []) if isinstance(user_spec, dict) \
+        else []
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        nid = n.get("id", "?")
+        run = n.get("run") or {}
+        sk = run.get("skill")
+        if sk and sk not in declared_skills:
+            errors.append(
+                f"node {nid!r} references skill {sk!r} not declared "
+                f"in package manifest.skills")
+        if "tool" in run:
+            errors.append(
+                f"node {nid!r} uses run.tool — active workflows "
+                f"support run.skill only; replanned workflow cannot "
+                f"introduce one")
+    return errors
+
+
 def _execute_with_optional_auto_replan(
         user_spec: dict, run_dir: Path,
         *, max_attempts: Optional[int] = None,
         replan: bool = False,
-        package_root: Optional[Path] = None,
-        package_meta: Optional[dict] = None) -> str:
+        project_root: Optional[Path] = None,
+        package_meta: Optional[dict] = None,
+        workflow_source: Optional[dict] = None,
+        package_manifest: Optional[dict] = None) -> str:
     """Run the user workflow; on halt, if `on_halt: replan` is declared
     in the spec, automatically perform `_perform_replan` and re-execute
     up to `max_replans` times. Without `on_halt: replan`, behaves
@@ -2621,10 +2672,13 @@ def _execute_with_optional_auto_replan(
     [0, _MAX_REPLANS_HARD_CEILING]). When the cap is reached the run
     halts and the operator can still type `camflow replan` manually.
 
-    `package_root`/`package_meta` propagate package context so skill
-    resolution and trace metadata stay package-aware across auto
-    replans (RFC §12 — replan from packaged workflow records
-    parent_package).
+    `project_root`/`package_meta`/`package_manifest` propagate package
+    context. `project_root` controls where Node.run looks for skills
+    (RFC §11: package mode points it at the run dir, where
+    `<run>/skills/` was materialized from the package). `package_meta`
+    keeps trace metadata package-aware across auto replans (RFC §12).
+    `package_manifest` is consulted to enforce the replan policy gate
+    (no undeclared skills, no run.tool).
     """
     on_halt = user_spec.get("on_halt") or "manual"
     declared_max = user_spec.get("max_replans")
@@ -2636,8 +2690,9 @@ def _execute_with_optional_auto_replan(
     # First execution.
     result = run_workflow(user_spec, run_dir,
                           max_attempts=max_attempts, replan=replan,
-                          package_root=package_root,
-                          package_meta=package_meta)
+                          project_root=project_root,
+                          package_meta=package_meta,
+                          workflow_source=workflow_source)
 
     if on_halt != "replan":
         return result
@@ -2665,23 +2720,75 @@ def _execute_with_optional_auto_replan(
             outcome = _perform_replan(
                 run_dir, reason="auto_replan_after_halt",
                 replan_count=replan_count,
-                parent_package=package_meta)
+                parent_package=package_meta,
+                user_project_root=project_root)
         except _ReplanError as e:
             print(f"auto-replan aborted: {e}", file=sys.stderr)
+            halt_envelope = {
+                "halted_node": halt_info.get("halted_node"),
+                "kind": "halt",
+                "reason": "auto-replan failed",
+                "envelope": {
+                    "status": "fail",
+                    "error": {
+                        "code": "AUTO_REPLAN_FAILED",
+                        "message": str(e),
+                    },
+                },
+                "replan_count": replan_count,
+                "max_replans": max_replans,
+            }
+            (run_dir / "halt.json").write_text(
+                json.dumps(halt_envelope, indent=2, ensure_ascii=False))
             break
 
         new_spec = outcome["user_spec"]
         new_rev = outcome["new_revision"]
+
+        # RFC §12 tightening: package-aware replan must NOT silently fall
+        # back to source-tree skills/tools. If the replanned workflow
+        # references undeclared skills or any tools, halt before node
+        # execution with a package policy error so the operator sees the
+        # boundary violation instead of an opaque skill-not-found later.
+        if package_manifest is not None:
+            policy_errors = _replan_policy_errors(new_spec,
+                                                   package_manifest)
+            if policy_errors:
+                print(
+                    "ERROR (package policy): replanned workflow "
+                    "references undeclared skill(s)/tool(s):",
+                    file=sys.stderr)
+                for e in policy_errors:
+                    print(f"  - {e}", file=sys.stderr)
+                # Surface as a halt artifact so status / replay tools
+                # see why we stopped after the rev N+1 record was
+                # already written.
+                halt_envelope = {
+                    "halted_node": (new_spec.get("nodes") or
+                                    [{}])[0].get("id", "?"),
+                    "kind": "halt",
+                    "reason": "package policy violation",
+                    "envelope": {
+                        "status": "fail",
+                        "error": {"code": "PACKAGE_POLICY",
+                                  "message": "; ".join(policy_errors)},
+                    },
+                }
+                (run_dir / "halt.json").write_text(
+                    json.dumps(halt_envelope, indent=2))
+                return "halted"
+
         print(f"executing replanned workflow (revision {new_rev}) → "
               f"{run_dir}", file=sys.stderr)
         # After replan the live workflow.yaml has diverged from the
-        # frozen package; package-local skill resolution no longer
-        # applies (the replanned DAG may reference different skills),
-        # so drop package_root for the post-replan execution but keep
-        # package_meta so trace events still mention the parent.
+        # frozen package, but the materialized run-dir skills/tools
+        # are still the right resolution root (the replan policy gate
+        # above already rejected undeclared skills). Keep
+        # project_root pointed at the run dir; keep package_meta so
+        # trace events still mention the parent.
         result = run_workflow(new_spec, run_dir,
                               max_attempts=max_attempts, replan=True,
-                              package_root=None,
+                              project_root=project_root,
                               package_meta=package_meta)
         # Carry forward on_halt / max_replans from the new spec — the
         # Planner may keep, raise, or drop them. Re-clamp.
@@ -2844,7 +2951,8 @@ class _ReplanError(Exception):
 
 def _perform_replan(run_dir: Path, *, reason: str,
                     replan_count: Optional[int] = None,
-                    parent_package: Optional[dict] = None) -> dict:
+                    parent_package: Optional[dict] = None,
+                    user_project_root: Optional[Path] = None) -> dict:
     """Shared core: re-invoke Planner with halt context, record the new
     DAG revision, archive prior runtime artifacts, write the new active
     workflow.yaml. Caller is responsible for actually executing the new
@@ -2940,13 +3048,19 @@ def _perform_replan(run_dir: Path, *, reason: str,
         raise _ReplanError(
             "Planner's render_yaml output is missing yaml_text")
 
-    # Resolve project root for skill/tool path validation.
-    parts = run_dir.resolve().parts
-    if ".camflow" in parts:
-        idx = parts.index(".camflow")
-        project_root = Path(*parts[:idx]) if idx > 0 else Path("/")
+    # Resolve project root for skill path validation. Prompt-mode
+    # replan validates against the normal project root. Package-mode replan
+    # passes `<run_dir>` because package skills were materialized under
+    # `.camflow/run/` and Runtime must not fall back to source-tree assets.
+    if user_project_root is not None:
+        project_root = user_project_root
     else:
-        project_root = Path.cwd().resolve()
+        parts = run_dir.resolve().parts
+        if ".camflow" in parts:
+            idx = parts.index(".camflow")
+            project_root = Path(*parts[:idx]) if idx > 0 else Path("/")
+        else:
+            project_root = Path.cwd().resolve()
 
     try:
         user_spec = parse_workflow_yaml(yaml_text,
@@ -3034,13 +3148,21 @@ def _run_packaged(package_id: str, run_dir: Path, project: Path,
                   *, max_attempts: Optional[int] = None) -> int:
     """Execute an installed packaged workflow without invoking Planner.
 
-    Materializes the run dir from the package's frozen artifacts:
-      - copies workflow.yaml as the active workflow
-      - writes package.json with name/version/content_digest
-      - traces workflow_started with package metadata
-      - resolves skills/tools strictly under the package
-    Auto-replan still works if the package's workflow.yaml declares
-    `on_halt: replan`.
+    Materializes the package's execution inputs into `<run_dir>/` so the
+    run is self-contained and Runtime resolves skills from the run
+    dir, not from the installed package directory:
+
+      - <run>/workflow.yaml         (frozen DAG)
+      - <run>/skills/<name>/SKILL.md (each declared package skill)
+      - <run>/tools/...              (optional support scripts for skills)
+      - <run>/package.json           (parent-package provenance)
+      - <run>/package-lock.json      (integrity contract)
+      - <run>/preflight.json         (deterministic dependency check result)
+
+    After materialization, normal Runtime executes from `<run_dir>` and
+    must not read the installed package directory for ordinary node
+    execution. Auto-replan still works if the package's workflow.yaml
+    declares `on_halt: replan`.
     """
     from runner import package as pkg
     try:
@@ -3049,47 +3171,69 @@ def _run_packaged(package_id: str, run_dir: Path, project: Path,
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
     try:
-        package_root = pkg.resolve_installed(name, version,
-                                             project_root=project)
+        bundle_root = pkg.resolve_installed(name, version,
+                                            project_root=project)
     except pkg.PackageError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
-    install_dir = package_root.parent
+    install_dir = bundle_root.parent
     install_meta = pkg.read_install_metadata(install_dir)
 
     # Validate the installed package on every run — the install dir
     # should never have drifted, but we re-check (RFC §9 last paragraph).
-    errors = pkg.validate_package(package_root)
+    errors = pkg.validate_package(bundle_root)
     if errors:
         for e in errors:
             print(f"ERROR (package): {e}", file=sys.stderr)
         return 1
 
     # Read frozen workflow + manifest + lock from the install.
-    pkg_files = pkg._read_package_files(package_root)
+    pkg_files = pkg._read_package_files(bundle_root)
     manifest = yaml.safe_load(
         pkg_files[pkg.MANIFEST_FILENAME].decode("utf-8"))
     lock = json.loads(pkg_files[pkg.LOCK_FILENAME].decode("utf-8"))
     yaml_text = pkg_files[pkg.WORKFLOW_FILENAME].decode("utf-8")
 
+    # Materialize run dir BEFORE validating against project_root, so
+    # validate_workflow's skill-existence check sees the materialized
+    # copies under <run_dir>/skills/.
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "workflow.yaml").write_text(yaml_text)
+
+    # Copy each declared skill into <run_dir>/skills/<name>/SKILL.md.
+    declared_skills = manifest.get("skills") or {}
+    for sk_name in declared_skills:
+        rel = f"skills/{sk_name}/SKILL.md"
+        if rel not in pkg_files:
+            print(f"ERROR (package): manifest declares skill {sk_name!r} "
+                  f"but bundled file {rel!r} is missing", file=sys.stderr)
+            return 1
+        sk_dst = run_dir / "skills" / sk_name / "SKILL.md"
+        sk_dst.parent.mkdir(parents=True, exist_ok=True)
+        sk_dst.write_bytes(pkg_files[rel])
+
+    # Copy any bundled tools/ entries verbatim as passive support files.
+    # Runtime does not execute them as node executors; skills may invoke
+    # project-local scripts when their own instructions require it.
+    for rel, content in pkg_files.items():
+        if rel.startswith("tools/"):
+            tool_dst = run_dir / rel
+            tool_dst.parent.mkdir(parents=True, exist_ok=True)
+            tool_dst.write_bytes(content)
+
     try:
-        user_spec = parse_workflow_yaml(yaml_text,
-                                        project_root=package_root)
+        user_spec = parse_workflow_yaml(yaml_text, project_root=run_dir)
     except WorkflowParseError as e:
         print(f"ERROR: package workflow.yaml invalid: {e}",
               file=sys.stderr)
         return 1
 
-    # Materialize run dir.
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "workflow.yaml").write_text(yaml_text)
     pkg_meta = {
         "name": name,
         "version": version,
         "content_digest": lock.get("content_digest"),
         "package_schema": manifest.get("package_schema"),
-        "package_root": str(package_root),
         "install_dir": str(install_dir),
         "archive_digest": install_meta.get("archive_digest"),
         "min_camflow": (manifest.get("runtime") or {}).get("min_camflow"),
@@ -3104,13 +3248,94 @@ def _run_packaged(package_id: str, run_dir: Path, project: Path,
                    f"Run packaged workflow {name}@{version}")
     (run_dir / "prompt.txt").write_text(prompt_seed)
 
+    # RFC §11 step 6: copy the package lock into the run dir so replay
+    # tools can reconstruct the exact frozen content the run started
+    # against. The lock IS the integrity contract; package.json is a
+    # convenience summary.
+    (run_dir / "package-lock.json").write_text(
+        pkg_files[pkg.LOCK_FILENAME].decode("utf-8"))
+
+    # RFC §11 step 9: run the small deterministic preflight gate and
+    # write the result under the run dir. Values of environment variables
+    # are intentionally not recorded.
+    preflight = _package_preflight(manifest)
+    (run_dir / "preflight.json").write_text(
+        json.dumps(preflight, indent=2, sort_keys=True) + "\n")
+    if preflight["status"] != "ok":
+        print("ERROR (package preflight): required dependency missing",
+              file=sys.stderr)
+        for check in preflight["checks"]:
+            if not check["ok"]:
+                detail = (
+                    f": {check.get('detail')}" if check.get("detail") else "")
+                print(f"  - {check['kind']} {check['name']}{detail}",
+                      file=sys.stderr)
+        return 1
+
+    # workflow_source per RFC §4.1 tightening.
+    workflow_source = {
+        "type": "package",
+        "planner_invoked": False,
+        "package": f"{name}@{version}",
+        "content_digest": lock.get("content_digest"),
+    }
+
     print(f"executing packaged workflow {name}@{version} "
           f"({lock.get('content_digest')}) → {run_dir}", file=sys.stderr)
     result = _execute_with_optional_auto_replan(
         user_spec, run_dir, max_attempts=max_attempts,
-        package_root=package_root, package_meta=pkg_meta)
+        project_root=run_dir, package_meta=pkg_meta,
+        workflow_source=workflow_source,
+        package_manifest=manifest)
     print(f"result: {result}", file=sys.stderr)
     return _result_to_exit(result)
+
+
+def _package_preflight(manifest: dict) -> dict:
+    """Run P0 package environment checks without recording secret values."""
+    env = manifest.get("environment") or {}
+    required_env = env.get("required_env") or []
+    required_commands = env.get("required_commands") or []
+    checks: list[dict] = []
+
+    def add(kind: str, name: object, ok: bool, detail: str = "") -> None:
+        rec = {"kind": kind, "name": str(name), "ok": ok}
+        if detail:
+            rec["detail"] = detail
+        checks.append(rec)
+
+    if not isinstance(required_env, list):
+        add("required_env", "required_env", False, "must be a list")
+    else:
+        for name in required_env:
+            if not isinstance(name, str) or not name:
+                add("required_env", name, False,
+                    "environment variable name must be a non-empty string")
+            else:
+                add("required_env", name, name in os.environ,
+                    "" if name in os.environ else "not set")
+
+    if not isinstance(required_commands, list):
+        add("required_command", "required_commands", False, "must be a list")
+    else:
+        for command in required_commands:
+            if not isinstance(command, str) or not command:
+                add("required_command", command, False,
+                    "command must be a non-empty string")
+                continue
+            if "/" in command:
+                path = Path(command)
+                ok = path.is_file() and os.access(path, os.X_OK)
+            else:
+                ok = shutil.which(command) is not None
+            add("required_command", command, ok,
+                "" if ok else "not found on PATH or not executable")
+
+    failed = [c for c in checks if not c["ok"]]
+    return {
+        "status": "fail" if failed else "ok",
+        "checks": checks,
+    }
 
 
 def _cmd_package(argv: list[str]) -> int:
@@ -3391,6 +3616,19 @@ def _summarize_status(run_dir: Path, *,
             summary["package"] = None
     else:
         summary["package"] = None
+    # workflow_source per RFC §4.1 — pulled from the first
+    # workflow_started event in trace.jsonl. Surfacing the unified
+    # source means status consumers don't have to triangulate from
+    # the legacy `package` field plus a presence-of-planner-dir
+    # heuristic.
+    summary["workflow_source"] = None
+    trace_events_for_source = _read_trace_events(run_dir / "trace.jsonl")
+    for evt in trace_events_for_source:
+        if evt.get("event") == "workflow_started":
+            ws = evt.get("workflow_source")
+            if isinstance(ws, dict):
+                summary["workflow_source"] = ws
+            break
 
     # Auto-replan policy (Phase B opt-in). on_halt defaults to "manual".
     summary["on_halt"] = (
@@ -3569,6 +3807,21 @@ def _render_status_human(summary: dict, *,
         digest = pkg.get("content_digest", "?")
         lines.append(
             f"package: {pkg.get('name')}@{pkg.get('version')} {digest}"
+        )
+    # workflow_source line — primarily surfaces the type for prompt /
+    # planner runs (where there's no package summary). For package
+    # runs the line above already names the package id+digest, so we
+    # show the type+planner_invoked here as a small confirmation.
+    ws = summary.get("workflow_source")
+    if ws:
+        invoked = ws.get("planner_invoked")
+        invoked_str = (
+            "planner_invoked=true" if invoked is True
+            else "planner_invoked=false" if invoked is False
+            else "")
+        lines.append(
+            f"source: {ws.get('type', '?')}"
+            + (f"  {invoked_str}" if invoked_str else "")
         )
     if summary.get("workflow_name"):
         lines.append(f"workflow: {summary['workflow_name']}")

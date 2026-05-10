@@ -30,9 +30,9 @@ examples/value-demo/
 │   ├── tests/invariants/          # the hidden invariant tests (Req 2-4)
 │   │   ├── __init__.py
 │   │   └── test_invariants.py
-│   └── scripts/                   # tool/verify scripts referenced by workflow-reference
-│       ├── run_default_tests.sh   # tool node: pytest tests/, emits envelope JSON
-│       ├── run_invariants.sh      # tool node: pytest tests/invariants/, emits envelope JSON
+│   └── scripts/                   # command_runner / verify scripts referenced by workflow-reference
+│       ├── run_default_tests.sh   # audit script: pytest tests/, emits envelope JSON
+│       ├── run_invariants.sh      # audit script: pytest tests/invariants/, emits envelope JSON
 │       └── run_all_tests.sh       # implementer.verify.command: bash, exits non-zero on any fail
 └── scripts/                       # harness scripts (run from the camflow repo)
     ├── setup-fixture.sh           # cp -r fixture/ <fresh-dest> (refuses to overwrite)

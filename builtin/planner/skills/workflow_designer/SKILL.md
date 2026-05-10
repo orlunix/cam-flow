@@ -59,7 +59,7 @@ workflow-goal sentence. When in doubt, link the goal.
 ## Design rules
 
 1. **Decompose deliberately.** Each node should be one cohesive unit of
-   work — small enough that a single skill / tool can do it well, large
+   work — small enough that a single skill can do it well, large
    enough that the verify can meaningfully check it.
 2. **Dependency edges only via `needs`.** A node lists its upstream
    nodes by id; the runtime auto-injects upstream envelopes into its
@@ -77,6 +77,8 @@ workflow-goal sentence. When in doubt, link the goal.
    - `code_writer` — implement or modify code to satisfy a stated
      requirement set; iterate until a deterministic test command
      passes.
+   - `command_runner` — run deterministic project-local scripts or
+     command-style audit/build steps and emit a structured envelope.
    - `reviewer` — independently confirm a diff covers a requirement
      list, citing concrete file:line evidence per requirement.
    - `evaluator` — the default agent-verify role (you don't reference
@@ -87,28 +89,12 @@ workflow-goal sentence. When in doubt, link the goal.
    step, that's a sign the step is itself a custom skill — but don't
    reference custom names unless you know they exist on disk.
 
-   **`run.tool:` is an escape hatch with hard criteria.** Default every
-   node to `run: { skill: <name> }`. Use `run: { tool: <path> }` only
-   when ALL FIVE of these hold for the node:
-
-   1. Known command, no judgment about *what* to run.
-   2. Inputs are fully determined by upstream + workflow.context.
-   3. The script writes a structured envelope itself (no LLM
-      interpretation of stdout/stderr needed).
-   4. Idempotent and side-effect-bounded.
-   5. Cost or speed actually matters here (in a loop, or hot path).
-
-   If ANY criterion fails → skill. If you're not sure → skill.
-
-   **Tool anti-patterns** (do NOT design these):
-   - tool that wraps a one-liner doing JSON post-processing of upstream
-   - tool that conditionally chooses among commands based on upstream
-   - tool that reads files and tries to interpret them
-   - chains of three+ tool nodes for what is really one pipeline
-
+   **`run.skill` is the only supported run executor.** Every node you
+   design must use `run: { skill: <name> }`. Do not emit `run.tool`.
    When the work is "compile / test / lint / format with a known CLI",
-   tool is correct. When the work is "look at the failing test and
-   propose a fix", that's skill.
+   place that command in the skill node's steps and/or enforce it with
+   `verify.command`. Missing skills are caught at workflow load time, so
+   reference only skills that exist on disk.
 4. **Verify everything non-trivial.** Default is `verify: agent` (steps
    as checklist). Use `verify.command` for things you can check with
    bash exit code.
@@ -139,17 +125,8 @@ workflow-goal sentence. When in doubt, link the goal.
      fail clearly when missing, or
    - replace the shell dependency with Python stdlib logic inside the
      `verify.command`, or
-   - move the behavior into an existing declared `run.tool` wrapper
-     script that lives in the project/package and emits a CamFlow
-     envelope, or
-   - use a `run.skill` node to perform the operation when the wrapper
-     does not already exist.
-
-   Do not reference a script as `run.tool` unless it exists at workflow
-   load time and is executable. The runtime validates `run.tool` paths
-   before the workflow starts; a script created later by another node
-   cannot satisfy that load-time check. For reusable packaged workflows,
-   put wrapper scripts under the package's declared tools directory.
+   - move the behavior into a `run.skill` node and have the skill call
+     the existing wrapper script or Python stdlib as needed.
 
    The Planner's own render_yaml verification runs a deterministic
    command-availability check on every non-general command head in the
@@ -286,81 +263,29 @@ output_schema:
   results: { id: string, n: int }  # nested schema not allowed
 ```
 
-This applies to every node you produce, including audit tool nodes
-and reviewer nodes — same five type names everywhere.
+This applies to every node you produce, including audit and reviewer
+nodes — same five type names everywhere.
 
 ## Audit-node mandatory check
 
-**If `upstream.understand.data.deterministic_test_scripts` is
-non-empty, you MUST include one `run.tool` audit node per script
-listed there.** Each entry has the shape
-`{path: <script_path>, envelope_data_fields: [<field>, ...]}` —
-use both fields when designing the audit node. Per audit node:
+If `upstream.understand.data.deterministic_test_scripts` is non-empty,
+use those paths as deterministic gates, not as `run.tool` nodes. Attach
+the relevant command(s) to the implementer-class node's `verify.command`
+when they can be run as a pass/fail check. Parse JSON with Python stdlib;
+do not assume optional tools such as `jq`.
 
-- `run: { tool: <script_path> }` (the `path` comes verbatim from
-  the analyzer's entry).
-- `needs: [<implementer-class-node>]`.
-- `output_schema` MUST match the script's **actual** envelope —
-  declare ONLY the fields listed in this script's
-  `envelope_data_fields` (mapped to the right v1.1 type:
-  `passed: boolean`, `tests_run: integer`, `output: string`,
-  `failed_tests: array`, etc.). **Two scripts with different
-  `envelope_data_fields` get different schemas — don't generate a
-  uniform schema across audit nodes.** The runtime accepts
-  envelopes with extra `data` fields; it REJECTS envelopes missing
-  declared fields, so under-declaring is safe and over-declaring
-  halts the node.
-  Minimum-viable audit schema if a script emits at least
-  `{passed, tests_run, output}`:
-  ```yaml
-  output_schema:
-    passed: boolean
-    tests_run: integer
-    output: string
-  ```
-  Add `failed_tests: array` ONLY for scripts whose
-  `envelope_data_fields` includes `"failed_tests"`. If the analyzer
-  surfaced a `path` but no `envelope_data_fields` summary (or just
-  a string path under an older shape), default to the minimum
-  schema.
-- `verify.command` should parse `agent_output.json` with Python stdlib,
-  not `jq` or other optional host tools. Use this portable pass/fail
-  gate:
-  ```yaml
-  verify:
-    command: 'python3 -c ''import json,sys; data=json.load(open("agent_output.json")).get("data", {}); sys.exit(0 if data.get("passed") is True else 1)'''
-  ```
-- Listed in the reviewer node's `needs` so the reviewer can cite the
-  envelopes as per-class evidence.
-
-**Why this is mandatory and not optional:** the implementer's
-`verify.command` is a node-local quality gate — it tells you "the
-implementer's attempt passed all tests" but it does NOT produce a
-structured envelope a downstream reviewer or operator can cite as
-independent evidence. Audit tool nodes produce
-`agent_output.json` envelopes that live in `nodes/<id>/attempt-N/`
-and become first-class citation targets. Skipping them when valid
-envelope-emitting scripts exist is a regression — you lose the
-per-class structured evidence trail and force the reviewer to do
-its citation work from prose-level inference.
-
-**If `deterministic_test_scripts` is empty** (the analyzer didn't
-find any envelope-emitting runners), do NOT invent invalid
-`run.tool` nodes. Two valid alternatives:
-
-1. **Skill-based audit node** — a node with `run: { skill: ... }` if
-   you have a registered skill that runs tests and emits the
-   envelope (none of the shipped repo skills do this directly today;
-   reach for project-specific custom skills if available).
-2. **Lean on implementer.verify.command** — it's still a real
-   deterministic gate, just without the structured per-class
-   evidence. Reviewer must then cite tests by name from prose
-   inference. Acceptable but weaker.
-
-Don't fabricate a `run.tool` node pointing at a script that emits
-raw test output (e.g. `pytest -q` returning to stdout). The runtime
-will reject the envelope as `TOOL_BAD_OUTPUT` and the audit node
-will halt instead of producing evidence.
+If the project has a registered skill that exists on disk and is meant
+to run test/audit scripts and emit a structured envelope, you may add a
+separate audit node with `run: { skill: <that_skill> }`. The shipped
+`command_runner` skill is the default choice for script-only audit nodes.
+Use each script's `envelope_data_fields` from prompt_analyzer when writing
+the audit node's `output_schema`; do not assume all scripts emit the same
+fields. A minimum viable audit schema is `passed`, `tests_run`, and
+`output`; add fields such as `failed_tests` only when the analyzer says the
+script emits them.
+Otherwise do not invent audit nodes just to preserve the old tool-node
+shape; the reviewer must cite `verify.command` evidence and artifacts
+from the implementer attempt.
 
 ## Common shape: implement code per spec
 
@@ -382,17 +307,12 @@ Go, Rust, JS, or anything else), the standard DAG shape is:
    `previous.feedback`, but do not design steps assuming retry will
    fire — retry is a recovery mechanism, not part of the happy path.
 
-3. **One audit tool node per test class.** When the project has
-   distinct test groupings (visible vs. invariant, unit vs.
-   integration), give each its own `run.tool` node that emits a
-   structured pass/fail envelope (`output_schema: passed: boolean,
-   tests_run: integer, failed_tests: array`). These are pure audit —
-   they make the passing evidence concrete in the trace, separate from
-   the implementer's self-report. Each should `needs: [implementer]`
-   and use `verify.command` to gate on the envelope's `data.passed`
-   field. **Do not skip these nodes** when the project has separable
-   test groups — they are the per-class evidence the reviewer cites.
-   `retry: 1` is correct here: if a deterministic audit fails
+3. **Deterministic test evidence.** When the project has distinct test
+   groupings (visible vs. invariant, unit vs. integration), encode them
+   in the implementer's `verify.command` or in `command_runner` /
+   existing skill-based audit nodes. Do not emit `run.tool`. `retry: 1`
+   is correct for deterministic
+   test gates: if a deterministic audit fails
    repeatedly, that's evidence the implementation is bad, not
    something to loop on.
 
@@ -456,7 +376,7 @@ markers and commands; the structure should stay the same.
     - "Capture pass/fail and a count of tests run."
     - "Emit envelope with data.passed and data.tests_run."
   run:
-    tool: scripts/<run_visible.sh>
+    skill: code_writer
   # Minimum-viable schema. If you've read the script and confirmed it
   # also emits failed_tests, add `failed_tests: array` here too —
   # otherwise omit (declared-but-missing fields halt the node).
@@ -476,7 +396,7 @@ markers and commands; the structure should stay the same.
     - "Capture pass/fail and any failed test names."
     - "Emit envelope with data.passed, data.tests_run, data.failed_tests."
   run:
-    tool: scripts/<run_invariants.sh>
+    skill: code_writer
   # This schema includes failed_tests because run_invariants.sh
   # explicitly emits it. Match each script's ACTUAL envelope —
   # don't assume both audit scripts share a shape.
