@@ -31,6 +31,7 @@ from runner.runtime import (
     Node,
     Workflow,
     WorkflowParseError,
+    _cmd_validate_compiled_workflow,
     auto_schema_check,
     build_run_prompt,
     build_verify_prompt,
@@ -43,6 +44,7 @@ from runner.runtime import (
     render_str,
     run_workflow,
     validate_workflow,
+    validate_verify_command_dependencies,
     verify_with_command,
     verify_with_human,
 )
@@ -224,6 +226,184 @@ class TestValidate:
         wf = self._wf(run={"tool": "scripts/noexec.sh"})
         errs = validate_workflow(wf, project_root=proj)
         assert any("not found or not executable" in e for e in errs)
+
+    def test_verify_command_dependencies_ignore_general_linux_commands(self):
+        wf = self._wf(verify={
+            "command": "pwd && ls . && test -f agent_output.json"
+        })
+        assert validate_verify_command_dependencies(wf) == []
+
+    def test_verify_command_dependencies_check_non_general_jq(self, monkeypatch):
+        seen = []
+
+        def fake_which(cmd):
+            seen.append(cmd)
+            return None
+
+        monkeypatch.setattr("runner.runtime.shutil.which", fake_which)
+        wf = self._wf(verify={
+            "command": "test \"$(jq -r .data.passed agent_output.json)\" = true"
+        })
+        errs = validate_verify_command_dependencies(wf)
+        assert seen == ["jq"]
+        assert any("jq" in e and "not available" in e for e in errs)
+
+    def test_verify_command_dependencies_check_every_non_general_command(
+            self, monkeypatch):
+        seen = []
+
+        def fake_which(cmd):
+            seen.append(cmd)
+            return None
+
+        monkeypatch.setattr("runner.runtime.shutil.which", fake_which)
+        wf = self._wf(verify={
+            "command": "qsub job.sh && smake target && p4 opened"
+        })
+        errs = validate_verify_command_dependencies(wf)
+        assert seen == ["qsub", "smake", "p4"]
+        for cmd in seen:
+            assert any(cmd in e and "not available" in e for e in errs)
+
+    def test_verify_command_dependencies_allow_available_non_general_command(
+            self, monkeypatch):
+        monkeypatch.setattr(
+            "runner.runtime.shutil.which",
+            lambda cmd: f"/usr/bin/{cmd}" if cmd == "qsub" else None,
+        )
+        wf = self._wf(verify={"command": "qsub job.sh"})
+        assert validate_verify_command_dependencies(wf) == []
+
+    def test_verify_command_dependencies_check_path_invocation(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        wf = self._wf(verify={"command": "./scripts/missing.sh"})
+        errs = validate_verify_command_dependencies(wf, project_root=proj)
+        assert any("./scripts/missing.sh" in e
+                   and "not an executable file" in e for e in errs)
+
+    def test_verify_command_dependencies_check_wrapper_script_arg(
+            self, tmp_path):
+        proj = tmp_path / "proj"
+        (proj / "scripts").mkdir(parents=True)
+        wf = self._wf(verify={"command": "bash scripts/missing.sh"})
+        errs = validate_verify_command_dependencies(wf, project_root=proj)
+        assert any("scripts/missing.sh" in e
+                   and "wrapper script" in e for e in errs)
+
+    def test_verify_command_dependencies_allow_existing_wrapper_script(
+            self, tmp_path):
+        proj = tmp_path / "proj"
+        scripts = proj / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "ok.sh").write_text("echo ok\n")
+        wf = self._wf(verify={"command": "bash scripts/ok.sh"})
+        assert validate_verify_command_dependencies(wf, project_root=proj) == []
+
+    def test_verify_command_dependencies_check_background_separator(
+            self, monkeypatch):
+        seen = []
+
+        def fake_which(cmd):
+            seen.append(cmd)
+            return None
+
+        monkeypatch.setattr("runner.runtime.shutil.which", fake_which)
+        wf = self._wf(verify={"command": "jq . & qsub job.sh"})
+        errs = validate_verify_command_dependencies(wf)
+        assert seen == ["jq", "qsub"]
+        for cmd in seen:
+            assert any(cmd in e and "not available" in e for e in errs)
+
+    def test_verify_command_dependencies_check_backtick_substitution(
+            self, monkeypatch):
+        seen = []
+
+        def fake_which(cmd):
+            seen.append(cmd)
+            return None
+
+        monkeypatch.setattr("runner.runtime.shutil.which", fake_which)
+        wf = self._wf(verify={"command": "echo `qsub -V`"})
+        errs = validate_verify_command_dependencies(wf)
+        assert seen == ["qsub"]
+        assert any("qsub" in e and "not available" in e for e in errs)
+
+    def test_verify_command_dependencies_allow_python_stdlib(self):
+        wf = self._wf(verify={
+            "command": (
+                "python3 -c 'import json,sys; "
+                "data=json.load(open(\"agent_output.json\")).get(\"data\", {}); "
+                "sys.exit(0 if data.get(\"passed\") is True else 1)'"
+            )
+        })
+        assert validate_verify_command_dependencies(wf) == []
+
+    def test_validate_compiled_workflow_cli_rejects_missing_command(
+            self, tmp_path, capsys):
+        proj = tmp_path / "proj"
+        (proj / "skills" / "analyzer").mkdir(parents=True)
+        (proj / "skills" / "analyzer" / "SKILL.md").write_text("skill\n")
+        envelope = {
+            "status": "success",
+            "data": {
+                "yaml_text": (
+                    "workflow: t\n"
+                    "version: '1.1'\n"
+                    "nodes:\n"
+                    "  - id: n\n"
+                    "    goal: x\n"
+                    "    steps: [s]\n"
+                    "    run: {skill: analyzer}\n"
+                    "    verify: {command: 'missing_camflow_cmd_zzzz'}\n"
+                )
+            },
+            "error": None,
+            "feedback": None,
+            "request_human": False,
+        }
+        env_path = tmp_path / "agent_output.json"
+        env_path.write_text(json.dumps(envelope))
+
+        rc = _cmd_validate_compiled_workflow(
+            [str(env_path), "--project-root", str(proj)])
+
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "missing_camflow_cmd_zzzz" in captured.err
+
+    def test_validate_compiled_workflow_cli_accepts_good_yaml(
+            self, tmp_path, capsys):
+        proj = tmp_path / "proj"
+        (proj / "skills" / "analyzer").mkdir(parents=True)
+        (proj / "skills" / "analyzer" / "SKILL.md").write_text("skill\n")
+        envelope = {
+            "status": "success",
+            "data": {
+                "yaml_text": (
+                    "workflow: t\n"
+                    "version: '1.1'\n"
+                    "nodes:\n"
+                    "  - id: n\n"
+                    "    goal: x\n"
+                    "    steps: [s]\n"
+                    "    run: {skill: analyzer}\n"
+                    "    verify: {command: 'python3 -c \"import sys; sys.exit(0)\"'}\n"
+                )
+            },
+            "error": None,
+            "feedback": None,
+            "request_human": False,
+        }
+        env_path = tmp_path / "agent_output.json"
+        env_path.write_text(json.dumps(envelope))
+
+        rc = _cmd_validate_compiled_workflow(
+            [str(env_path), "--project-root", str(proj)])
+
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert captured.err == ""
 
     def test_parse_yaml_strips_fences(self):
         text = "```yaml\nworkflow: t\nversion: '1.0'\nnodes:\n  - id: n\n    goal: x\n    steps: [a]\n    run: {tool: x.sh}\n```"
@@ -2831,7 +3011,8 @@ class TestReplan:
         original_init = orig_workflow_cls.__init__
 
         def patched_init(self, spec, run_dir, *, resume=False,
-                         replan=False, project_root=None):
+                         replan=False, project_root=None,
+                         package_root=None):
             rd = Path(run_dir).resolve()
             if "planner-rev" in rd.name:
                 # Hand off to the stub by mutating self into a stub clone.
@@ -2841,7 +3022,8 @@ class TestReplan:
                 self.__dict__.update(stub.__dict__)
                 return
             original_init(self, spec, rd, resume=resume, replan=replan,
-                          project_root=project_root)
+                          project_root=project_root,
+                          package_root=package_root)
 
         monkeypatch.setattr(rt.Workflow, "__init__", patched_init)
 
@@ -3152,7 +3334,8 @@ class TestPhaseBAutoReplan:
                 pass
 
         def patched_init(self, spec, run_dir, *, resume=False,
-                         replan=False, project_root=None):
+                         replan=False, project_root=None,
+                         package_root=None):
             rd = Path(run_dir).resolve()
             if "planner-rev" in rd.name:
                 stub = _StubWorkflow(spec, rd, project_root=project_root,
@@ -3161,7 +3344,8 @@ class TestPhaseBAutoReplan:
                 self.__dict__.update(stub.__dict__)
                 return
             orig_init(self, spec, rd, resume=resume, replan=replan,
-                      project_root=project_root)
+                      project_root=project_root,
+                      package_root=package_root)
 
         monkeypatch.setattr(rt.Workflow, "__init__", patched_init)
 

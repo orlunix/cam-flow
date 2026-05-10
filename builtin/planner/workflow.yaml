@@ -75,5 +75,5 @@ nodes:
     output_schema:
       yaml_text: string
     verify:
-      criterion: "yaml_text parses as YAML and matches the camflow schema (no inputs:/state:/run.input; nodes have id+goal+steps+run)"
+      command: '${CAMFLOW_PYTHON:-python3} -m runner.runtime _validate-compiled-workflow agent_output.json'
     retry: 3

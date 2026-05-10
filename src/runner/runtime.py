@@ -23,6 +23,8 @@ import json
 import os
 import re
 import secrets
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -472,6 +474,308 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
 
 
 # Skill / tool resolution lives in `assets.py`, imported above.
+
+
+_SHELL_BUILTINS_AND_KEYWORDS = {
+    "!", ".", ":", "[", "[[", "]]", "{", "}",
+    "alias", "bg", "break", "case", "cd", "command", "continue",
+    "declare", "do", "done", "echo", "elif", "else", "enable", "esac",
+    "eval", "exec", "exit", "export", "false", "fg", "fi", "for",
+    "function", "getopts", "hash", "help", "history", "if", "jobs",
+    "let", "local", "mapfile", "popd", "printf", "pushd", "pwd", "read",
+    "readarray", "readonly", "return", "select", "set", "shift", "source",
+    "test", "then", "time", "times", "trap", "true", "type", "typeset",
+    "ulimit", "umask", "unalias", "unset", "until", "wait", "while",
+}
+
+_GENERAL_LINUX_COMMANDS = {
+    # POSIX/coreutils-ish tools that are safe to assume on the Linux hosts
+    # CamFlow targets, plus python3 because CamFlow itself requires Python.
+    "awk", "basename", "bash", "cat", "chmod", "cmp", "cp", "cut",
+    "date", "dirname", "env", "expr", "find", "grep", "head", "ln",
+    "ls", "mkdir", "mktemp", "mv", "python3", "readlink", "realpath",
+    "rm", "rmdir", "sed", "sh", "sleep", "sort", "stat", "tail",
+    "tee", "touch", "tr", "uniq", "wc", "xargs",
+}
+
+_SHELL_SEPARATORS = {";", "&", "&&", "||", "|", "|&", "(", ")"}
+_SHELL_REDIRECTS = {
+    "<", ">", ">>", "<<", "<<<", "<&", ">&", "&>", "&>>", "<>",
+}
+
+
+def _looks_like_shell_assignment(token: str) -> bool:
+    return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*", token))
+
+
+def _shell_command_invocations(command: str) -> list[tuple[str, list[str]]]:
+    """Best-effort extraction of command invocations from a shell snippet.
+
+    This is intentionally conservative. It is not a shell interpreter; it
+    catches missing non-general command dependencies without executing user
+    code. The real verify.command still runs later.
+    """
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        # Syntax errors are reported by bash when verify.command runs; don't
+        # hide them behind this availability check.
+        return []
+
+    invocations: list[tuple[str, list[str]]] = []
+    expect_command = True
+    skip_next_after_redirect = False
+    current_head: str | None = None
+    current_args: list[str] = []
+
+    def finish_current() -> None:
+        nonlocal current_head, current_args
+        if current_head is not None:
+            invocations.append((current_head, current_args))
+            current_head = None
+            current_args = []
+
+    for token in tokens:
+        if skip_next_after_redirect:
+            skip_next_after_redirect = False
+            continue
+        if token in _SHELL_REDIRECTS:
+            skip_next_after_redirect = True
+            continue
+        if token in _SHELL_SEPARATORS:
+            finish_current()
+            expect_command = True
+            continue
+
+        if not expect_command:
+            if current_head is not None:
+                current_args.append(token)
+            continue
+
+        if _looks_like_shell_assignment(token):
+            continue
+        if token in {"if", "while", "until", "then", "do", "else", "elif",
+                     "time", "!"}:
+            expect_command = True
+            continue
+        if token in {"fi", "done", "esac"}:
+            expect_command = True
+            continue
+        if token.startswith("$") or token in {"-", "--"}:
+            expect_command = False
+            continue
+
+        current_head = token
+        current_args = []
+        expect_command = False
+
+    finish_current()
+    return invocations
+
+
+def _shell_command_heads(command: str) -> list[str]:
+    return [head for head, _args in _shell_command_invocations(command)]
+
+
+def _command_substitution_bodies(command: str) -> list[str]:
+    """Return simple `$(`...`)` and backtick command-substitution bodies."""
+    bodies: list[str] = []
+    i = 0
+    while i < len(command):
+        start = command.find("$(", i)
+        if start < 0:
+            break
+        j = start + 2
+        depth = 1
+        while j < len(command):
+            ch = command[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    bodies.append(command[start + 2:j])
+                    j += 1
+                    break
+            j += 1
+        i = j
+
+    bodies.extend(m.group(1) for m in re.finditer(r"`([^`]*)`", command))
+    return bodies
+
+
+def _all_shell_command_heads(command: str, *, depth: int = 0) -> list[str]:
+    heads = _shell_command_heads(command)
+    if depth >= 4:
+        return heads
+    for body in _command_substitution_bodies(command):
+        heads.extend(_all_shell_command_heads(body, depth=depth + 1))
+    return heads
+
+
+def _all_shell_invocations(command: str,
+                           *, depth: int = 0) -> list[tuple[str, list[str]]]:
+    invocations = _shell_command_invocations(command)
+    if depth >= 4:
+        return invocations
+    for body in _command_substitution_bodies(command):
+        invocations.extend(_all_shell_invocations(body, depth=depth + 1))
+    return invocations
+
+
+def _resolve_command_path(path_text: str,
+                          project_root: Path | None) -> Path:
+    path = Path(path_text)
+    if path.is_absolute():
+        return path
+    return (project_root / path) if project_root is not None else Path.cwd() / path
+
+
+def _wrapper_script_arg(head: str, args: list[str]) -> str | None:
+    """Return script path for wrapper-style calls like `bash foo.sh`.
+
+    `bash -c`, `sh -c`, and `python3 -m/-c` execute inline/module code, so
+    there is no script path to validate.
+    """
+    if head not in {"bash", "sh", "python3"}:
+        return None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            i += 1
+            continue
+        if head in {"bash", "sh"} and arg == "-c":
+            return None
+        if head == "python3" and arg in {"-c", "-m"}:
+            return None
+        if arg.startswith("-"):
+            i += 1
+            continue
+        return arg
+    return None
+
+
+def _project_root_from_run_dir(run_dir: Path) -> Path | None:
+    parts = run_dir.resolve().parts
+    if ".camflow" not in parts:
+        return None
+    idx = parts.index(".camflow")
+    return Path(*parts[:idx]) if idx > 0 else Path("/")
+
+
+def validate_verify_command_dependencies(
+    wf: dict, project_root: Path | None = None
+) -> list[str]:
+    """Validate generated verify.command snippets use available commands.
+
+    This is a Planner-facing quality gate. Common Linux/shell commands are
+    assumed. Every other command head must either be available on PATH or be
+    an executable path in the project/package.
+    """
+    errors: list[str] = []
+    nodes = wf.get("nodes") if isinstance(wf, dict) else None
+    if not isinstance(nodes, list):
+        return errors
+
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        nid = n.get("id", "<?>")
+        verify = n.get("verify") or {}
+        if not isinstance(verify, dict):
+            continue
+        command = verify.get("command")
+        if not isinstance(command, str) or not command.strip():
+            continue
+
+        for head, args in _all_shell_invocations(command):
+            clean = head.strip()
+            if not clean:
+                continue
+            if clean in _SHELL_BUILTINS_AND_KEYWORDS:
+                continue
+            if "/" in clean:
+                resolved = _resolve_command_path(clean, project_root)
+                if not resolved.is_file() or not os.access(resolved, os.X_OK):
+                    errors.append(
+                        f"{nid}.verify.command: command path {clean!r} "
+                        "is not an executable file"
+                    )
+                continue
+            if clean in _GENERAL_LINUX_COMMANDS:
+                script_arg = _wrapper_script_arg(clean, args)
+                if script_arg and not script_arg.startswith("$"):
+                    resolved = _resolve_command_path(script_arg, project_root)
+                    if not resolved.is_file():
+                        errors.append(
+                            f"{nid}.verify.command: wrapper script "
+                            f"{script_arg!r} is not a file"
+                        )
+                continue
+            if shutil.which(clean) is None:
+                errors.append(
+                    f"{nid}.verify.command: command {clean!r} is not "
+                    "available on PATH; Planner must use common Linux/"
+                    "coreutils/python3, check/install that dependency, or "
+                    "use a declared project/package wrapper"
+                )
+    return errors
+
+
+def _compiled_workflow_errors(
+    wf: dict, project_root: Path | None = None
+) -> list[str]:
+    errors = validate_workflow(wf, project_root=project_root)
+    errors.extend(validate_verify_command_dependencies(
+        wf, project_root=project_root))
+    return errors
+
+
+def _cmd_validate_compiled_workflow(argv: list[str]) -> int:
+    """Hidden helper used by builtin Planner render_yaml.verify.command."""
+    p = argparse.ArgumentParser(prog="camflow _validate-compiled-workflow")
+    p.add_argument("agent_output_json", nargs="?", default=OUTPUT_FILENAME)
+    p.add_argument("--project-root")
+    args = p.parse_args(argv)
+
+    try:
+        envelope = json.loads(Path(args.agent_output_json).read_text())
+    except Exception as e:
+        print(f"ERROR: cannot read planner envelope: {e}", file=sys.stderr)
+        return 1
+
+    yaml_text = (envelope.get("data") or {}).get("yaml_text")
+    if not isinstance(yaml_text, str) or not yaml_text.strip():
+        print("ERROR: planner envelope missing data.yaml_text",
+              file=sys.stderr)
+        return 1
+
+    try:
+        spec = parse_workflow_yaml(yaml_text)
+    except WorkflowParseError as e:
+        print(f"ERROR: compiled workflow YAML invalid: {e}",
+              file=sys.stderr)
+        return 1
+
+    project_root: Path | None = None
+    if args.project_root:
+        project_root = Path(args.project_root).resolve()
+    elif os.environ.get("CAMFLOW_RUN_DIR"):
+        project_root = _project_root_from_run_dir(
+            Path(os.environ["CAMFLOW_RUN_DIR"]))
+    elif os.environ.get("CAMFLOW_PROJECT_ROOT"):
+        project_root = Path(os.environ["CAMFLOW_PROJECT_ROOT"]).resolve()
+
+    errors = _compiled_workflow_errors(spec, project_root=project_root)
+    if errors:
+        for e in errors:
+            print(f"ERROR: compiled workflow: {e}", file=sys.stderr)
+        return 1
+    return 0
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1030,11 +1334,18 @@ def verify_with_command(cmd_template: str, workflow: "Workflow", node: "Node",
     # Always write agent_output.json so cmds can read uniformly across
     # mock / tool / skill paths.
     (cwd / OUTPUT_FILENAME).write_text(json.dumps(envelope, indent=2))
+    env = {
+        **os.environ,
+        "CAMFLOW_PROJECT_ROOT": str(workflow.project_root),
+        "CAMFLOW_RUN_DIR": str(workflow.run_dir),
+        "CAMFLOW_PYTHON": sys.executable,
+    }
     try:
         proc = subprocess.run(
             ["bash", "-c", cmd],
             capture_output=True, text=True,
             timeout=timeout, cwd=str(cwd),
+            env=env,
         )
     except subprocess.TimeoutExpired:
         return False, f"verify command timed out after {timeout}s: {cmd[:80]}"
@@ -1318,7 +1629,30 @@ class Node:
         """Do the work — dispatch to skill or tool executor."""
         if "skill" in self.run_config:
             skill_name = self.run_config["skill"]
-            skill_path = _resolve_skill_path(skill_name, workflow.project_root)
+            # Package-aware skill resolution: when the workflow is
+            # running from an installed package, skills MUST be found
+            # under <package>/skills/<name>/SKILL.md (no host fallback).
+            # This matches RFC §13's reproducibility requirement.
+            skill_path: Optional[Path] = None
+            if getattr(workflow, "package_root", None) is not None:
+                cand = (workflow.package_root / "skills"
+                        / skill_name / "SKILL.md")
+                if cand.exists():
+                    skill_path = cand
+                else:
+                    return empty_envelope(
+                        "fail",
+                        error={
+                            "code": "PACKAGE_SKILL_NOT_FOUND",
+                            "message": (
+                                f"package skill {skill_name!r} not found at "
+                                f"{cand}"
+                            ),
+                        },
+                    )
+            else:
+                skill_path = _resolve_skill_path(
+                    skill_name, workflow.project_root)
             skill_md = skill_path.read_text() if skill_path else ""
             return exec_skill(skill_md, self, input_dict, att_dir,
                               attempt_n, workflow.tag,
@@ -1387,9 +1721,15 @@ class Workflow:
     def __init__(self, spec: dict, run_dir: Path,
                  *, resume: bool = False,
                  replan: bool = False,
-                 project_root: Optional[Path] = None):
+                 project_root: Optional[Path] = None,
+                 package_root: Optional[Path] = None):
         self.spec = spec
         self.run_dir = run_dir
+        # Package-aware execution (v1.2 P0). When set, Node.run resolves
+        # skills strictly under <package_root>/skills/<name>/SKILL.md
+        # with NO host fallback. Tools resolve via project_root which
+        # the package-run path overrides to package_root.
+        self.package_root: Optional[Path] = package_root
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.nodes_by_id: dict[str, Node] = {
             n["id"]: Node.from_dict(n) for n in spec["nodes"]
@@ -1777,7 +2117,9 @@ class Workflow:
 def run_workflow(workflow: dict, run_dir: Path,
                  *, resume_with_run: Optional["Workflow"] = None,
                  max_attempts: Optional[int] = None,
-                 replan: bool = False) -> str:
+                 replan: bool = False,
+                 package_root: Optional[Path] = None,
+                 package_meta: Optional[dict] = None) -> str:
     """Execute a workflow → return final lifecycle state ('done' or 'halted').
 
     `resume_with_run` is for the resume command — caller pre-builds a
@@ -1789,11 +2131,24 @@ def run_workflow(workflow: dict, run_dir: Path,
     `replan` is for the replan command — caller has already written
     the new active workflow.yaml + recorded dag_revisions/<N>/, so
     Workflow skips those side effects and reuses the existing run_dir.
+
+    `package_root` / `package_meta` activate v1.2 P0 packaged-workflow
+    execution: skill resolution is strict-to-package, and trace
+    workflow_started carries `package: {name, version, content_digest}`.
     """
     wf = resume_with_run if resume_with_run is not None else \
-        Workflow(workflow, run_dir, replan=replan)
+        Workflow(workflow, run_dir, replan=replan,
+                 project_root=package_root if package_root else None,
+                 package_root=package_root)
     if resume_with_run is None:
-        wf.trace("workflow_started", run_id=wf.run_id)
+        if package_meta:
+            pkg_brief = {k: package_meta.get(k) for k in
+                         ("name", "version", "content_digest")
+                         if package_meta.get(k) is not None}
+            wf.trace("workflow_started", run_id=wf.run_id,
+                     package=pkg_brief, planner_invoked=False)
+        else:
+            wf.trace("workflow_started", run_id=wf.run_id)
     try:
         return wf.execute_dag(max_attempts=max_attempts)
     finally:
@@ -2087,32 +2442,54 @@ def _cmd_run(argv: list[str]) -> int:
                    help="(debug) halt cleanly after N node-attempts")
     p.add_argument("--run-dir", default=None,
                    help="run directory (default: ./.camflow/run/)")
+    p.add_argument("--package", default=None,
+                   help="execute an installed packaged workflow "
+                        "(NAME@VERSION); skips Planner")
     args = p.parse_args(argv)
     if args.steps is not None and args.steps < 1:
         print("ERROR: --steps must be >= 1", file=sys.stderr)
         return 1
 
     has_prompt = bool(args.prompt and args.prompt.strip())
-    if has_prompt and args.from_node:
-        print("ERROR: cannot combine a prompt with --from. "
-              "Either provide a prompt (fresh run) OR --from <node> "
-              "(rerun on existing run dir).", file=sys.stderr)
+    has_package = bool(args.package)
+    # --package is mutually exclusive with prompt and --from. The other
+    # checks below assume only the prompt/--from modes; layer the
+    # package check first so the error messages stay narrow.
+    if has_package and (has_prompt or args.from_node):
+        print("ERROR: --package cannot be combined with a prompt or "
+              "--from. Use one mode only.", file=sys.stderr)
         return 1
-    if not has_prompt and not args.from_node:
-        print("ERROR: camflow run needs either a prompt OR --from <node>.\n"
-              "Examples:\n"
-              "  camflow run \"<your task description>\"\n"
-              "  camflow run --from <node_id>",
-              file=sys.stderr)
-        return 1
-    if has_prompt and args.feedback:
+    if has_package and args.feedback:
         print("ERROR: --feedback only valid with --from (rerun mode).",
               file=sys.stderr)
         return 1
-    if not has_prompt and args.interactive:
+    if has_package and args.interactive:
         print("ERROR: -i / --interactive only valid with a prompt "
-              "(fresh-run mode).", file=sys.stderr)
+              "(fresh-run mode); not with --package.", file=sys.stderr)
         return 1
+    if not has_package:
+        if has_prompt and args.from_node:
+            print("ERROR: cannot combine a prompt with --from. "
+                  "Either provide a prompt (fresh run) OR --from <node> "
+                  "(rerun on existing run dir).", file=sys.stderr)
+            return 1
+        if not has_prompt and not args.from_node:
+            print("ERROR: camflow run needs a prompt, --from <node>, "
+                  "or --package <name>@<version>.\n"
+                  "Examples:\n"
+                  "  camflow run \"<your task description>\"\n"
+                  "  camflow run --from <node_id>\n"
+                  "  camflow run --package my_flow@0.1.0",
+                  file=sys.stderr)
+            return 1
+        if has_prompt and args.feedback:
+            print("ERROR: --feedback only valid with --from (rerun mode).",
+                  file=sys.stderr)
+            return 1
+        if not has_prompt and args.interactive:
+            print("ERROR: -i / --interactive only valid with a prompt "
+                  "(fresh-run mode).", file=sys.stderr)
+            return 1
 
     project = Path.cwd().resolve()
     if args.run_dir:
@@ -2125,6 +2502,11 @@ def _cmd_run(argv: list[str]) -> int:
     else:
         # Fresh-run default: archive any prior run, get a clean dir.
         run_dir = default_run_dir(project)
+
+    # ── Package mode (v1.2 P0): no Planner, frozen workflow ───────────
+    if has_package:
+        return _run_packaged(args.package, run_dir, project,
+                             max_attempts=args.steps)
 
     # ── Rerun mode ─────────────────────────────────────────────────────
     if args.from_node:
@@ -2210,7 +2592,7 @@ def _cmd_run(argv: list[str]) -> int:
         print(f"ERROR: Planner produced invalid YAML: {e}", file=sys.stderr)
         return 1
 
-    errors = validate_workflow(user_spec, project_root=project)
+    errors = _compiled_workflow_errors(user_spec, project_root=project)
     if errors:
         for e in errors:
             print(f"ERROR (compiled workflow): {e}", file=sys.stderr)
@@ -2226,7 +2608,9 @@ def _cmd_run(argv: list[str]) -> int:
 def _execute_with_optional_auto_replan(
         user_spec: dict, run_dir: Path,
         *, max_attempts: Optional[int] = None,
-        replan: bool = False) -> str:
+        replan: bool = False,
+        package_root: Optional[Path] = None,
+        package_meta: Optional[dict] = None) -> str:
     """Run the user workflow; on halt, if `on_halt: replan` is declared
     in the spec, automatically perform `_perform_replan` and re-execute
     up to `max_replans` times. Without `on_halt: replan`, behaves
@@ -2236,6 +2620,11 @@ def _execute_with_optional_auto_replan(
     Phase B opt-in. Bounded by spec `max_replans` (clamped to
     [0, _MAX_REPLANS_HARD_CEILING]). When the cap is reached the run
     halts and the operator can still type `camflow replan` manually.
+
+    `package_root`/`package_meta` propagate package context so skill
+    resolution and trace metadata stay package-aware across auto
+    replans (RFC §12 — replan from packaged workflow records
+    parent_package).
     """
     on_halt = user_spec.get("on_halt") or "manual"
     declared_max = user_spec.get("max_replans")
@@ -2246,7 +2635,9 @@ def _execute_with_optional_auto_replan(
 
     # First execution.
     result = run_workflow(user_spec, run_dir,
-                          max_attempts=max_attempts, replan=replan)
+                          max_attempts=max_attempts, replan=replan,
+                          package_root=package_root,
+                          package_meta=package_meta)
 
     if on_halt != "replan":
         return result
@@ -2273,7 +2664,8 @@ def _execute_with_optional_auto_replan(
         try:
             outcome = _perform_replan(
                 run_dir, reason="auto_replan_after_halt",
-                replan_count=replan_count)
+                replan_count=replan_count,
+                parent_package=package_meta)
         except _ReplanError as e:
             print(f"auto-replan aborted: {e}", file=sys.stderr)
             break
@@ -2282,8 +2674,15 @@ def _execute_with_optional_auto_replan(
         new_rev = outcome["new_revision"]
         print(f"executing replanned workflow (revision {new_rev}) → "
               f"{run_dir}", file=sys.stderr)
+        # After replan the live workflow.yaml has diverged from the
+        # frozen package; package-local skill resolution no longer
+        # applies (the replanned DAG may reference different skills),
+        # so drop package_root for the post-replan execution but keep
+        # package_meta so trace events still mention the parent.
         result = run_workflow(new_spec, run_dir,
-                              max_attempts=max_attempts, replan=True)
+                              max_attempts=max_attempts, replan=True,
+                              package_root=None,
+                              package_meta=package_meta)
         # Carry forward on_halt / max_replans from the new spec — the
         # Planner may keep, raise, or drop them. Re-clamp.
         on_halt = new_spec.get("on_halt") or "manual"
@@ -2444,7 +2843,8 @@ class _ReplanError(Exception):
 
 
 def _perform_replan(run_dir: Path, *, reason: str,
-                    replan_count: Optional[int] = None) -> dict:
+                    replan_count: Optional[int] = None,
+                    parent_package: Optional[dict] = None) -> dict:
     """Shared core: re-invoke Planner with halt context, record the new
     DAG revision, archive prior runtime artifacts, write the new active
     workflow.yaml. Caller is responsible for actually executing the new
@@ -2554,6 +2954,14 @@ def _perform_replan(run_dir: Path, *, reason: str,
     except WorkflowParseError as e:
         raise _ReplanError(f"Planner produced invalid YAML on replan: {e}")
 
+    dependency_errors = validate_verify_command_dependencies(
+        user_spec, project_root=project_root)
+    if dependency_errors:
+        raise _ReplanError(
+            "Planner produced workflow with unavailable verify commands: "
+            + "; ".join(dependency_errors)
+        )
+
     # ── Phase 2: archive prior revision's runtime artifacts ─────────
     _archive_prior_revision_artifacts(run_dir, prior_revision)
 
@@ -2572,6 +2980,15 @@ def _perform_replan(run_dir: Path, *, reason: str,
     }
     if replan_count is not None:
         manifest["replan_count"] = replan_count
+    if parent_package:
+        # RFC §12: post-package replan records the package the live
+        # workflow descended from, so replay tools see "replanned from
+        # package".
+        manifest["parent_package"] = {
+            k: parent_package.get(k)
+            for k in ("name", "version", "content_digest")
+            if parent_package.get(k) is not None
+        }
     (new_rev_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False)
     )
@@ -2607,6 +3024,221 @@ def _cmd_replan(argv: list[str]) -> int:
                           max_attempts=args.steps, replan=True)
     print(f"result: {result}", file=sys.stderr)
     return _result_to_exit(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PACKAGE — v1.2 P0: install / run / validate / inspect / list / rm
+# ═══════════════════════════════════════════════════════════════════════
+
+def _run_packaged(package_id: str, run_dir: Path, project: Path,
+                  *, max_attempts: Optional[int] = None) -> int:
+    """Execute an installed packaged workflow without invoking Planner.
+
+    Materializes the run dir from the package's frozen artifacts:
+      - copies workflow.yaml as the active workflow
+      - writes package.json with name/version/content_digest
+      - traces workflow_started with package metadata
+      - resolves skills/tools strictly under the package
+    Auto-replan still works if the package's workflow.yaml declares
+    `on_halt: replan`.
+    """
+    from runner import package as pkg
+    try:
+        name, version = pkg.parse_package_id(package_id)
+    except pkg.PackageError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    try:
+        package_root = pkg.resolve_installed(name, version,
+                                             project_root=project)
+    except pkg.PackageError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+    install_dir = package_root.parent
+    install_meta = pkg.read_install_metadata(install_dir)
+
+    # Validate the installed package on every run — the install dir
+    # should never have drifted, but we re-check (RFC §9 last paragraph).
+    errors = pkg.validate_package(package_root)
+    if errors:
+        for e in errors:
+            print(f"ERROR (package): {e}", file=sys.stderr)
+        return 1
+
+    # Read frozen workflow + manifest + lock from the install.
+    pkg_files = pkg._read_package_files(package_root)
+    manifest = yaml.safe_load(
+        pkg_files[pkg.MANIFEST_FILENAME].decode("utf-8"))
+    lock = json.loads(pkg_files[pkg.LOCK_FILENAME].decode("utf-8"))
+    yaml_text = pkg_files[pkg.WORKFLOW_FILENAME].decode("utf-8")
+
+    try:
+        user_spec = parse_workflow_yaml(yaml_text,
+                                        project_root=package_root)
+    except WorkflowParseError as e:
+        print(f"ERROR: package workflow.yaml invalid: {e}",
+              file=sys.stderr)
+        return 1
+
+    # Materialize run dir.
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "workflow.yaml").write_text(yaml_text)
+    pkg_meta = {
+        "name": name,
+        "version": version,
+        "content_digest": lock.get("content_digest"),
+        "package_schema": manifest.get("package_schema"),
+        "package_root": str(package_root),
+        "install_dir": str(install_dir),
+        "archive_digest": install_meta.get("archive_digest"),
+        "min_camflow": (manifest.get("runtime") or {}).get("min_camflow"),
+    }
+    (run_dir / "package.json").write_text(
+        json.dumps(pkg_meta, indent=2, sort_keys=True) + "\n")
+
+    # Persist a "prompt.txt" placeholder so resume/replan paths that
+    # need an "original prompt" don't crash. Use the manifest description
+    # plus name@version as a stable seed.
+    prompt_seed = (manifest.get("description") or
+                   f"Run packaged workflow {name}@{version}")
+    (run_dir / "prompt.txt").write_text(prompt_seed)
+
+    print(f"executing packaged workflow {name}@{version} "
+          f"({lock.get('content_digest')}) → {run_dir}", file=sys.stderr)
+    result = _execute_with_optional_auto_replan(
+        user_spec, run_dir, max_attempts=max_attempts,
+        package_root=package_root, package_meta=pkg_meta)
+    print(f"result: {result}", file=sys.stderr)
+    return _result_to_exit(result)
+
+
+def _cmd_package(argv: list[str]) -> int:
+    """Dispatch `camflow package <verb> ...`."""
+    p = argparse.ArgumentParser(
+        prog="camflow package",
+        description="Manage CamFlow workflow packages (v1.2 P0).")
+    sub = p.add_subparsers(dest="verb", required=True)
+
+    sp_create = sub.add_parser("create",
+                               help="build a .camflowpkg from a finished run")
+    sp_create.add_argument("--from-run", required=True,
+                           dest="from_run", metavar="RUN_DIR")
+    sp_create.add_argument("--name", required=True)
+    sp_create.add_argument("--version", required=True)
+    sp_create.add_argument("--out", required=True, metavar="PATH")
+    sp_create.add_argument("--description", default=None)
+    sp_create.add_argument("--allow-halted", action="store_true",
+                           dest="allow_halted",
+                           help="package even if the source run halted")
+
+    sp_validate = sub.add_parser("validate",
+                                 help="validate a .camflowpkg or installed dir")
+    sp_validate.add_argument("target")
+
+    sp_inspect = sub.add_parser("inspect",
+                                help="print a summary of a package")
+    sp_inspect.add_argument("target")
+    sp_inspect.add_argument("--json", action="store_true",
+                            dest="as_json")
+
+    sp_install = sub.add_parser("install",
+                                help="install a .camflowpkg")
+    sp_install.add_argument("archive")
+    sp_install.add_argument("--project", action="store_true",
+                            help="install under ./.camflow/packages/ "
+                                 "instead of ~/.camflow/packages/")
+
+    sp_list = sub.add_parser("list", help="list installed packages")
+    sp_list.add_argument("--project", action="store_true",
+                         help="list project-local installs only")
+
+    sp_rm = sub.add_parser("uninstall",
+                           help="remove an installed package")
+    sp_rm.add_argument("package_id", metavar="NAME@VERSION")
+    sp_rm.add_argument("--project", action="store_true")
+
+    args = p.parse_args(argv)
+    from runner import package as pkg
+
+    try:
+        if args.verb == "create":
+            out = pkg.create_package(
+                run_dir=Path(args.from_run),
+                name=args.name,
+                version=args.version,
+                out=Path(args.out),
+                description=args.description,
+                allow_halted=args.allow_halted,
+            )
+            print(f"created {out}")
+            return 0
+
+        if args.verb == "validate":
+            errors = pkg.validate_package(Path(args.target))
+            if errors:
+                for e in errors:
+                    print(f"ERROR: {e}", file=sys.stderr)
+                return 1
+            print(f"OK: {args.target}")
+            return 0
+
+        if args.verb == "inspect":
+            summary = pkg.inspect_package(Path(args.target))
+            if args.as_json:
+                print(json.dumps(summary, indent=2, sort_keys=True))
+            else:
+                print(f"name:           {summary['name']}")
+                print(f"version:        {summary['version']}")
+                print(f"package_schema: {summary['package_schema']}")
+                print(f"workflow_spec:  {summary['workflow_spec']}")
+                print(f"content_digest: {summary['content_digest']}")
+                print(f"min_camflow:    {summary['min_camflow']}")
+                print(f"file_count:     {summary['file_count']}")
+                print(f"skills:         {', '.join(summary['skills']) or '(none)'}")
+                print(f"tools:          {', '.join(summary['tools']) or '(none)'}")
+                if summary.get("description"):
+                    print(f"description:    {summary['description']}")
+            return 0
+
+        if args.verb == "install":
+            target = pkg.install_package(Path(args.archive),
+                                          project_local=args.project)
+            print(f"installed at {target}")
+            return 0
+
+        if args.verb == "list":
+            entries = pkg.list_installed(project_local=args.project)
+            if not entries:
+                scope = "project" if args.project else "user"
+                print(f"(no packages installed in {scope} scope)")
+                return 0
+            for m in entries:
+                print(f"{m['name']}@{m['version']}  "
+                      f"{m.get('content_digest', '?')}  "
+                      f"{m.get('install_dir', '?')}")
+            return 0
+
+        if args.verb == "uninstall":
+            try:
+                name, version = pkg.parse_package_id(args.package_id)
+            except pkg.PackageError as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                return 1
+            removed = pkg.uninstall_package(name, version,
+                                             project_local=args.project)
+            if not removed:
+                print(f"not installed: {args.package_id}",
+                      file=sys.stderr)
+                return 1
+            print(f"removed {args.package_id}")
+            return 0
+
+    except pkg.PackageError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+    return 1
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2748,6 +3380,18 @@ def _summarize_status(run_dir: Path, *,
                                 else None)
     summary["workflow_goal"] = (wf.get("goal") if isinstance(wf, dict)
                                 else None)
+    # Package metadata (v1.2 P0). package.json present iff this run was
+    # launched via `camflow run --package`. Read but don't validate
+    # against disk — status is read-only.
+    pkg_meta_path = run_dir / "package.json"
+    if pkg_meta_path.exists():
+        try:
+            summary["package"] = json.loads(pkg_meta_path.read_text())
+        except json.JSONDecodeError:
+            summary["package"] = None
+    else:
+        summary["package"] = None
+
     # Auto-replan policy (Phase B opt-in). on_halt defaults to "manual".
     summary["on_halt"] = (
         (wf.get("on_halt") if isinstance(wf, dict) else None) or "manual")
@@ -2920,6 +3564,12 @@ def _render_status_human(summary: dict, *,
     lines.append(f"run:    {rd}")
     lines.append(f"state:  {state}{pid_label}")
 
+    pkg = summary.get("package")
+    if pkg:
+        digest = pkg.get("content_digest", "?")
+        lines.append(
+            f"package: {pkg.get('name')}@{pkg.get('version')} {digest}"
+        )
     if summary.get("workflow_name"):
         lines.append(f"workflow: {summary['workflow_name']}")
     if summary.get("workflow_goal"):
@@ -3088,6 +3738,13 @@ def main(argv: list[str] | None = None) -> int:
             "                                          DAG revision, and execute it (manual halt-time\n"
             "                                          replan; auto-replan is opt-in via workflow's\n"
             "                                          `on_halt: replan` + `max_replans: N`)\n"
+            "  camflow run --package NAME@VERSION    execute a frozen packaged workflow (no Planner)\n"
+            "  camflow package create --from-run RUN_DIR --name N --version V --out P.camflowpkg\n"
+            "  camflow package install PKG.camflowpkg [--project]\n"
+            "  camflow package list [--project]       (list installed packages)\n"
+            "  camflow package inspect TARGET         (target = .camflowpkg or installed dir)\n"
+            "  camflow package validate TARGET\n"
+            "  camflow package uninstall NAME@VERSION [--project]\n"
             "  camflow status                        read-only summary of ./.camflow/run/\n"
             "  camflow status --json                 machine-readable summary\n"
             "  camflow status --events N             include last N trace events\n"
@@ -3106,8 +3763,12 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_resume(argv[1:])
     if cmd == "replan":
         return _cmd_replan(argv[1:])
+    if cmd == "package":
+        return _cmd_package(argv[1:])
     if cmd == "status":
         return _cmd_status(argv[1:])
+    if cmd == "_validate-compiled-workflow":
+        return _cmd_validate_compiled_workflow(argv[1:])
     print(f"ERROR: unknown subcommand '{cmd}'. "
           f"Try `camflow --help`.", file=sys.stderr)
     return 1

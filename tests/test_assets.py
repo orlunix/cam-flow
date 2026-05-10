@@ -169,6 +169,16 @@ class TestBuiltinPlanner:
             "actually gated."
         )
 
+    def test_planner_render_yaml_uses_compiled_workflow_validator(self):
+        """Planner render_yaml must deterministically reject invalid or
+        non-portable compiled workflows so render_yaml retries with concrete
+        feedback before user workflow execution starts."""
+        spec = yaml.safe_load(_read(BUILTIN_PLANNER_YAML))
+        render = next(n for n in spec["nodes"] if n["id"] == "render_yaml")
+        command = (render.get("verify") or {}).get("command") or ""
+        assert "_validate-compiled-workflow" in command
+        assert "agent_output.json" in command
+
     def test_prompt_analyzer_declares_deterministic_test_scripts(self):
         """prompt_analyzer must declare the deterministic_test_scripts
         field with the envelope-emitting contract so it doesn't
@@ -293,6 +303,39 @@ class TestBuiltinPlanner:
             "deterministic test command is available."
         )
         assert "verify.command" in text
+
+    def test_workflow_designer_verify_examples_do_not_require_jq(self):
+        """Remote execution environments may not have jq installed. The
+        Planner's verify.command examples must use Python stdlib JSON
+        parsing so generated workflows do not fail with exit 127 before
+        the real verification condition is checked."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "workflow_designer" /
+                     "SKILL.md")
+        assert "Python stdlib" in text or "python stdlib" in text.lower()
+        assert "json.load(open(\"agent_output.json\"))" in text
+        assert "jq -r .data.passed agent_output.json" not in text
+        assert "test \"$(jq" not in text
+
+    def test_workflow_designer_teaches_portable_command_policy(self):
+        """Planner must teach command availability and wrapper fallback so
+        generated workflows do not depend on unavailable host tools."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "workflow_designer" /
+                     "SKILL.md")
+        normalized = " ".join(text.split()).lower()
+        assert "portable command rule" in normalized
+        assert "command -v" in text
+        assert "run.tool" in text and "load time" in normalized
+        assert "run.skill" in text
+
+    def test_yaml_writer_teaches_portable_verify_command(self):
+        """yaml_writer is the last chance to avoid non-portable command
+        gates before render_yaml verification runs."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "yaml_writer" /
+                     "SKILL.md")
+        normalized = " ".join(text.split()).lower()
+        assert "portable" in normalized and "verify.command" in normalized
+        assert "jq" in text and "python" in normalized
+        assert "missing/non-general command" in normalized
 
     def test_workflow_designer_warns_about_verify_cwd(self):
         """Lock the post-codex-review-planner-rerun-001 fix: Planner

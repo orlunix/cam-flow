@@ -1,19 +1,50 @@
 # Oracle Maze E2E Benchmark Report — CamFlow vs Single Agents
 
-Date: 2026-05-05
+**Date:** 2026-05-05  
+**Source:** local blind-maze oracle benchmark + CamFlow release validation  
+**Primary run dir:** `/tmp/oracle-maze-fix-20260505-044946/maze/.camflow/run`  
+**Decision:** fixed CamFlow auto-replan passes the release benchmark.
 
-## Purpose
+## Executive Summary
 
-This report records the blind-maze oracle benchmark used to decide whether
-CamFlow's multi-agent/runtime machinery is meaningfully better than a strong
-single-agent baseline.
+CamFlow now beats the best single-agent run on this benchmark because it solves
+the maze and preserves the operational evidence that matters for release work:
+halt classification, automatic Planner re-entry, DAG revision tracking,
+bounded retry, and replayable artifacts.
 
-Decision criterion:
+The key result is:
+
+- **Fixed CamFlow auto-replan:** 96 / 100
+- **Best single-agent baseline:** 87 / 100 (`Codex /goal`)
+- **Delta:** +9 points overall, or +17 points against the same Claude Opus 4.7
+  model family baseline.
+
+This is not a pure model-quality benchmark. It is a system benchmark: given a
+controlled failure that requires replan and retry, does the agent setup finish
+the job and leave enough evidence to trust the result?
+
+## Scoreboard
+
+| Rank | System | Score | Result | What It Proved |
+| ---: | --- | ---: | --- | --- |
+| 1 | Fixed CamFlow auto-replan | **96** | PASS | Solved with rev1 halt -> auto-replan -> rev2 retry -> replayable artifacts |
+| 2 | Codex `/goal` pure single-agent | 87 | PASS | Best direct single-agent solve; no CamFlow runtime artifacts |
+| 3 | Codex single-agent | 84 | PASS | Clean direct solve; manual revision handling |
+| 4 | Claude single-agent | 79 | PASS | Solved, but with extra operational noise |
+| 5 | CamFlow auto-replan before fix | 73 | FAIL final solve | Replanned correctly, but phrase-hint retry did not fire |
+
+## Why This Benchmark Exists
+
+The benchmark asks a narrow release question: is CamFlow's multi-agent/runtime
+machinery meaningfully better than asking one strong agent to solve the same
+task directly?
+
+The decision criteria are:
 
 - CamFlow must score higher than the best single-agent run.
-- The benchmark must prove the specific value of CamFlow: explicit halt
-  handling, automatic replan, DAG revision tracking, bounded retry, and
-  replayable artifacts.
+- CamFlow must demonstrate value that a single agent does not naturally
+  provide: explicit halt handling, automatic replan, DAG revision tracking,
+  bounded retry, and a replayable artifact trail.
 
 ## Benchmark Mechanism
 
@@ -30,21 +61,29 @@ Oracle tools:
 
 Required behavior:
 
-- The first correct submit at `dag_revision=1` deliberately returns an
-  `ORACLE_HALT` / replan signal.
-- A successful solve must happen at `dag_revision >= 2`.
-- At `dag_revision >= 2`, a correct path may return recoverable non-halt
-  feedback with `phrase_hint`.
-- The correct system behavior is:
-  1. infer path from probes;
-  2. submit at revision 1;
-  3. treat explicit halt as workflow-level halt, not ordinary retry;
-  4. auto-replan to revision 2 if `on_halt: replan`;
-  5. submit at revision 2;
-  6. use bounded retry for recoverable `phrase_hint`;
-  7. verify `maze_status.data.solved == true`.
+| Step | Expected Behavior |
+| ---: | --- |
+| 1 | Infer the hidden path from `maze_probe` responses. |
+| 2 | Submit the path at `dag_revision=1`. |
+| 3 | Treat the deliberate `ORACLE_HALT` as a workflow-level halt, not an ordinary retry. |
+| 4 | Auto-replan to revision 2 when `on_halt: replan` is set. |
+| 5 | Submit again at `dag_revision=2`. |
+| 6 | Use bounded retry for recoverable `phrase_hint` feedback. |
+| 7 | Verify `maze_status.data.solved == true`. |
 
-## Systems Compared
+Two constraints make this non-trivial:
+
+- The first correct submit at `dag_revision=1` deliberately returns a halt /
+  replan signal.
+- A successful solve must happen at `dag_revision >= 2`; single agents can
+  improvise that manually, but CamFlow must record and execute it as runtime
+  state.
+
+This shape is deliberately chosen to test the part of CamFlow that ordinary
+coding benchmarks often miss: can the runtime own recovery instead of relying
+on one long-running agent to improvise?
+
+## Test Matrix
 
 Previous benchmark prefix:
 
@@ -67,9 +106,65 @@ Fixed CamFlow rerun:
 - Session: `e1ae1f3235259488c7830f6b`
 - Run dir: `/tmp/oracle-maze-fix-20260505-044946/maze/.camflow/run`
 
+The fixed CamFlow run is the release-gating run. The earlier CamFlow run is
+kept in the report because it explains the defect that was fixed: CamFlow could
+replan, but it failed to use bounded retry for the rev2 phrase hint.
+
+## Model / Agent Configuration
+
+Model provenance was checked after the first report publication. The benchmark
+mixed agent frontends and model families, so the scores below should be read as
+system-plus-agent results, not as a strict same-model ablation.
+
+| System | Agent Frontend | Model / Effort Recorded |
+| --- | --- | --- |
+| CamFlow auto-replan before fix | CamFlow runtime via `camc` child agents | `claude-opus-4-7`; Claude Code `2.1.128` |
+| Fixed CamFlow auto-replan | CamFlow runtime via `camc` child agents | `claude-opus-4-7`; Claude Code `2.1.128` |
+| Claude single-agent | Claude Code CLI | Opus 4.7, 1M context; Claude Code `2.1.128` |
+| Codex single-agent | OpenAI Codex CLI | `gpt-5.5 xhigh fast`; Codex `v0.128.0` |
+| Codex `/goal` pure single-agent | OpenAI Codex CLI with `/goal` | `gpt-5.5 xhigh fast`; Codex `v0.128.0`; unstable `goals` feature enabled |
+| Codex `/goal` invalid run | OpenAI Codex CLI, then nested CamFlow | Not scored |
+
+Evidence checked:
+
+- CamFlow before fix: every archived child session under
+  `/tmp/oracle-maze-benchmark-20260505-034751/camflow-auto/.../.camflow/run`
+  has `agent.json.task.tool=claude` and `claude/session.jsonl`
+  `message.model=claude-opus-4-7`.
+- Fixed CamFlow: every archived child session under
+  `/tmp/oracle-maze-fix-20260505-044946/maze/.camflow/run` has
+  `agent.json.task.tool=claude` and `claude/session.jsonl`
+  `message.model=claude-opus-4-7`.
+- Claude single-agent transcript lines 3 and 12 show Claude Code `v2.1.128`
+  and `Opus 4.7 (1M context)`.
+- Codex single-agent transcript lines 20 and 22 show OpenAI Codex `v0.128.0`
+  and `model: gpt-5.5 xhigh fast`.
+- Codex `/goal` pure single-agent transcript lines 15 and 17 show Codex
+  `v0.128.0` and `model: gpt-5.5 xhigh fast`; the transcript also records
+  the under-development `goals` feature warning.
+- Codex `/goal` invalid run is excluded because it invoked CamFlow and
+  therefore was not a pure single-agent baseline.
+
+Implications:
+
+- Same-model comparison: fixed CamFlow (`claude-opus-4-7`) scored 96 versus
+  Claude single-agent (`Opus 4.7`) at 79, a +17 delta.
+- Best-baseline comparison: fixed CamFlow (`claude-opus-4-7`) scored 96 versus
+  the best Codex `/goal` single-agent (`gpt-5.5 xhigh fast`) at 87, a +9
+  cross-model/system delta.
+- The report does not claim a pure model-quality comparison. It measures the
+  operational system behavior available to each tested setup: runtime-owned
+  halt classification, auto-replan, revision artifacts, bounded retry, and
+  replayability.
+
 ## Scoring Method
 
 Total score: 100 points.
+
+The score is intentionally not just a `solved=true` check. A single agent can
+solve the maze by manually changing `CAMFLOW_DAG_REVISION`, but CamFlow is
+being judged on whether the runtime itself handles the failure mode and records
+the resulting state transitions.
 
 | Category | Points | What It Measures |
 | --- | ---: | --- |
@@ -84,7 +179,25 @@ Single-agent baselines can score high on solving, but lose points on
 CamFlow-specific replayability, DAG revision artifacts, and runtime-owned
 replan semantics.
 
-## Operations Per System
+## Evidence Map
+
+The release-gating CamFlow run produced the evidence we would want before
+shipping an automation feature:
+
+| Evidence | Location / Signal | Why It Matters |
+| --- | --- | --- |
+| Runtime status | `camflow status` on the fixed run dir | Shows final `success`, active DAG revision 2, and all nodes done |
+| Revision archive | `dag_revisions/0001` and `dag_revisions/0002` | Proves the runtime created a new DAG revision instead of mutating history |
+| Trace | `trace.jsonl` | Shows rev1 halt, auto-replan, rev2 retry, and final completion in order |
+| Node attempts | `nodes/*/attempt-*` | Preserves each agent attempt and retry boundary |
+| Oracle final state | `maze_status` from `confirm_solved` | Confirms `solved=true` and final submit at `dag_revision=2` |
+| Deterministic tests | `tests/test_runtime.py` and full `tests/` suite | Guards the Phase B behavior outside the live oracle run |
+
+## Detailed Run Notes
+
+The sections below keep the raw operational detail for auditability. The short
+version is in the scoreboard; this section explains what each system actually
+did.
 
 ### CamFlow Auto-Replan Before Fix
 
@@ -297,16 +410,6 @@ Reason:
 - Produced replayable artifacts: trace, node attempts, manifests, final status.
 - Minor deductions only for Planner latency/probe volume and some status-output
   roughness observed during mid-run transitions.
-
-## Final Scoreboard
-
-| Rank | System | Score | Result |
-| ---: | --- | ---: | --- |
-| 1 | Fixed CamFlow auto-replan | **96** | PASS |
-| 2 | Codex `/goal` pure single-agent | 87 | PASS |
-| 3 | Codex single-agent | 84 | PASS |
-| 4 | Claude single-agent | 79 | PASS |
-| 5 | CamFlow auto-replan before fix | 73 | FAIL final solve |
 
 ## Conclusion
 

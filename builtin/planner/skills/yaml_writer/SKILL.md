@@ -74,7 +74,17 @@ nodes:
    met). Don't change a `skill` to a `tool`. Don't change a `tool` to a
    `skill`. The decision belongs to design_dag, not yaml_writer.
 
-9. **`output_schema` types — strict allow-list of five names.** Every
+9. **Portable `verify.command`.** Carry through only command gates that
+   use POSIX shell builtins, common Linux/coreutils commands, `python3`
+   stdlib, or task-specific commands already known to exist. Do not
+   assume optional host-tool dependencies such as `jq`, `qsub`, `smake`,
+   `p4`, or custom CLIs. Use Python stdlib parsing for
+   `agent_output.json` when possible. If design_dag hands you a
+   missing/non-general command, rewrite it to a portable equivalent when
+   obvious; otherwise keep the node as skill/agent verification rather
+   than fabricating an unavailable shell dependency.
+
+10. **`output_schema` types — strict allow-list of five names.** Every
    value in any node's `output_schema` map MUST be exactly one of:
    `string`, `integer`, `number`, `boolean`, `array`. If `design_dag`
    handed you anything else (`bool`, `int`, `float`, `list`,

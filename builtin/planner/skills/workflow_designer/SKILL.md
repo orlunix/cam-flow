@@ -127,6 +127,37 @@ workflow-goal sentence. When in doubt, link the goal.
    deterministic gate is available is a regression — the agent can
    convince itself its own output is fine.
 
+   **Portable command rule.** `verify.command` must use only POSIX shell
+   builtins, common Linux/coreutils commands, `python3` (stdlib only), or
+   task-specific commands that are already known to exist in the target
+   environment. Do not assume optional host tools (for example `jq`,
+   `yq`, `qsub`, `smake`, `p4`, custom CLIs) exist just because they are
+   convenient. For JSON checks, prefer parsing `agent_output.json` with
+   Python stdlib. If a command is not common Linux/coreutils, either:
+
+   - make the workflow check it with `command -v <cmd>` before use and
+     fail clearly when missing, or
+   - replace the shell dependency with Python stdlib logic inside the
+     `verify.command`, or
+   - move the behavior into an existing declared `run.tool` wrapper
+     script that lives in the project/package and emits a CamFlow
+     envelope, or
+   - use a `run.skill` node to perform the operation when the wrapper
+     does not already exist.
+
+   Do not reference a script as `run.tool` unless it exists at workflow
+   load time and is executable. The runtime validates `run.tool` paths
+   before the workflow starts; a script created later by another node
+   cannot satisfy that load-time check. For reusable packaged workflows,
+   put wrapper scripts under the package's declared tools directory.
+
+   The Planner's own render_yaml verification runs a deterministic
+   command-availability check on every non-general command head in the
+   compiled workflow's `verify.command` snippets. If you emit `jq`,
+   `qsub`, `smake`, `p4`, a custom CLI, or any other non-general command
+   and it is not available on the target PATH, render_yaml will fail and
+   retry with that feedback.
+
    **`verify.command` runs from the node's attempt directory, NOT the
    project root.** Specifically the cwd is
    `<run-dir>/nodes/<id>/attempt-N/`, several levels deep under
@@ -292,8 +323,13 @@ use both fields when designing the audit node. Per audit node:
   surfaced a `path` but no `envelope_data_fields` summary (or just
   a string path under an older shape), default to the minimum
   schema.
-- `verify.command: 'test "$(jq -r .data.passed agent_output.json)"
-  = "true"'` (the audit's own pass/fail gate).
+- `verify.command` should parse `agent_output.json` with Python stdlib,
+  not `jq` or other optional host tools. Use this portable pass/fail
+  gate:
+  ```yaml
+  verify:
+    command: 'python3 -c ''import json,sys; data=json.load(open("agent_output.json")).get("data", {}); sys.exit(0 if data.get("passed") is True else 1)'''
+  ```
 - Listed in the reviewer node's `needs` so the reviewer can cite the
   envelopes as per-class evidence.
 
@@ -429,7 +465,7 @@ markers and commands; the structure should stay the same.
     tests_run: integer
     output: string
   verify:
-    command: 'test "$(jq -r .data.passed agent_output.json)" = "true"'
+    command: 'python3 -c ''import json,sys; data=json.load(open("agent_output.json")).get("data", {}); sys.exit(0 if data.get("passed") is True else 1)'''
   retry: 1
 
 - id: invariant_checker
@@ -450,7 +486,7 @@ markers and commands; the structure should stay the same.
     failed_tests: array
     output: string
   verify:
-    command: 'test "$(jq -r .data.passed agent_output.json)" = "true"'
+    command: 'python3 -c ''import json,sys; data=json.load(open("agent_output.json")).get("data", {}); sys.exit(0 if data.get("passed") is True else 1)'''
   retry: 1
 
 - id: reviewer
