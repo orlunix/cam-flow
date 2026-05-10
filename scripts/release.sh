@@ -171,7 +171,12 @@ while IFS=$'\t' read -r name host user port; do
     continue
   fi
 
-  if ! ssh "${SSH_OPTS[@]}" "$target" "mkdir -p ~/.cam" >/dev/null 2>&1; then
+  # Some machines have ~/.cam/camflow as a symlink to /home/prgn_share/bin.
+  # Remove the link before scp so the private canary smoke uses the freshly
+  # uploaded ~/.cam/camflow-release tree instead of the old shared install.
+  if ! ssh "${SSH_OPTS[@]}" "$target" \
+      "mkdir -p ~/.cam && rm -f ~/.cam/camflow ~/.cam/camflow.py ~/.cam/camflow-release.tar.gz" \
+      >/dev/null 2>&1; then
     err "   mkdir ~/.cam failed on $label"
     failed=$((failed + 1)); failures+=("$name:mkdir"); continue
   fi
