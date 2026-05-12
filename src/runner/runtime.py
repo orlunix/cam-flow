@@ -4136,6 +4136,7 @@ def main(argv: list[str] | None = None) -> int:
             "Usage:\n"
             "  camflow run \"<prompt>\"                compile + run (fire-and-forget)\n"
             "  camflow run -i \"<prompt>\"             compile + plan-approval gate, then run\n"
+            "  camflow run -n NAME \"<prompt>\"        set short flow name for agents/tags\n"
             "  camflow run --steps N \"<prompt>\"      (debug) halt after N node-attempts\n"
             "  camflow run --from <node_id>          re-execute a node + downstream\n"
             "                                          (operates on ./.camflow/run/ by default;\n"

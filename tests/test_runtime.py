@@ -3335,6 +3335,7 @@ class TestCLI:
         assert main(["--help"]) == 0
         captured = capsys.readouterr()
         assert "Usage:" in captured.err
+        assert "camflow run -n NAME" in captured.err
 
     def test_no_args_prints_usage_and_fails(self, capsys):
         from runner.runtime import main
