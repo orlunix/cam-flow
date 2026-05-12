@@ -193,12 +193,12 @@ class TestBuiltinPlanner:
 
     def test_workflow_designer_has_audit_node_mandatory_check(self):
         """workflow_designer must preserve deterministic audit evidence
-        without emitting legacy run.tool nodes."""
+        while keeping node execution skill-only."""
         text = _read(BUILTIN_PLANNER_SKILLS_DIR / "workflow_designer" /
                      "SKILL.md")
         assert "Audit-node mandatory check" in text
         assert "command_runner" in text
-        assert "Do not emit `run.tool`" in text
+        assert "run.skill" in text
         # Reference the structured signal (avoid silent skipping).
         assert "deterministic_test_scripts" in text
 
@@ -284,11 +284,26 @@ class TestBuiltinPlanner:
                      "SKILL.md")
         assert "Available repo skills" in text
         for skill_name in ("analyzer", "code_writer", "command_runner",
-                           "reviewer"):
+                           "nvbug_collector", "reviewer"):
             assert f"`{skill_name}`" in text, (
                 f"workflow_designer SKILL.md must mention the {skill_name!r} "
                 f"skill so Planner reaches for it instead of inventing names."
             )
+
+    def test_workflow_designer_uses_nvbug_collector_as_first_node(self):
+        """NVBugs/RISC-V triage must start from one normalized bug set.
+        Without this explicit recipe, Planner tends to start with generic
+        analyzer/path nodes and later searches drift or miss bracketed
+        synopsis matches."""
+        text = _read(BUILTIN_PLANNER_SKILLS_DIR / "workflow_designer" /
+                     "SKILL.md")
+        normalized = " ".join(text.split()).lower()
+        assert "nvbugs / risc-v debug triage" in normalized
+        assert "first user workflow node must be a collector node" in \
+            normalized
+        assert "id: collect_bugs" in text
+        assert "skill: nvbug_collector" in text
+        assert "do not put an analyzer" in normalized
 
     def test_workflow_designer_prefers_verify_command_for_deterministic_tests(self):
         """The retry-with-feedback gate only fires if generative nodes
@@ -323,7 +338,6 @@ class TestBuiltinPlanner:
         assert "portable command rule" in normalized
         assert "command -v" in text
         assert "run.skill" in text and "load time" in normalized
-        assert "Do not emit `run.tool`" in text
         assert "run.skill" in text
 
     def test_yaml_writer_teaches_portable_verify_command(self):
@@ -520,6 +534,17 @@ class TestShippedSkills:
             resolved = _resolve_skill_path(d.name, ROOT)
             assert resolved is not None, f"can't resolve skill {d.name!r}"
             assert resolved == d / "SKILL.md"
+
+    def test_nvbug_collector_skill_locks_known_search_fallbacks(self):
+        """The collector skill must encode the PDX findings that exact
+        bracket search and keyword-primary search are unreliable."""
+        text = _read(SHIPPED_SKILLS_DIR / "nvbug_collector" / "SKILL.md")
+        assert "nvbugs-cli search bugs --criteria" in text
+        assert "search by-synopsis" in text
+        assert "false negatives" in text
+        assert "Synopsis=*[rn102n][rn102n_mse][rs_riscv_top][*" in text
+        assert "Keywords=..." in text
+        assert "primary collection axis" in " ".join(text.split())
 
 
 # ─── prompt protocol contract ─────────────────────────────────────────

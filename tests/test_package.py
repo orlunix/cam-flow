@@ -9,7 +9,7 @@ Cover:
 - run --package executes without Planner; package metadata in trace
 - Status surfaces package info
 - Replan from a packaged run records parent_package
-- run.tool nodes fail package create
+- Direct-command nodes fail package create
 - Missing skill in archive fails validate
 """
 from __future__ import annotations
@@ -209,7 +209,8 @@ class TestPackageCreate:
             "verify": {"command": "true"},
         })
         (rd / "workflow.yaml").write_text(yaml.safe_dump(spec, sort_keys=False))
-        with pytest.raises(pkg.PackageError, match="run.tool"):
+        with pytest.raises(pkg.PackageError,
+                           match="unsupported run executor key 'tool'"):
             pkg.create_package(run_dir=rd, name="tiny", version="0.1.0",
                                 out=tmp_path / "x.camflowpkg")
 
@@ -1023,7 +1024,9 @@ class TestReplanFromPackage:
                 pass
 
         def patched_init(self, spec, run_dir, *, resume=False,
-                         replan=False, project_root=None):
+                         replan=False, project_root=None,
+                         camflow_name=None, agent_phase=None,
+                         run_id=None):
             rd = Path(run_dir).resolve()
             if "planner-rev" in rd.name:
                 stub = _StubWorkflow(spec, rd, project_root=project_root,
@@ -1032,7 +1035,10 @@ class TestReplanFromPackage:
                 self.__dict__.update(stub.__dict__)
                 return
             orig_init(self, spec, rd, resume=resume, replan=replan,
-                      project_root=project_root)
+                      project_root=project_root,
+                      camflow_name=camflow_name,
+                      agent_phase=agent_phase,
+                      run_id=run_id)
 
         monkeypatch.setattr(rt.Workflow, "__init__", patched_init)
 
@@ -1512,7 +1518,9 @@ class TestReplanPackagePolicy:
                 pass
 
         def patched_init(self, spec, run_dir, *, resume=False,
-                         replan=False, project_root=None):
+                         replan=False, project_root=None,
+                         camflow_name=None, agent_phase=None,
+                         run_id=None):
             rd = Path(run_dir).resolve()
             if "planner-rev" in rd.name:
                 stub = _StubWorkflow(spec, rd, project_root=project_root,
@@ -1521,7 +1529,10 @@ class TestReplanPackagePolicy:
                 self.__dict__.update(stub.__dict__)
                 return
             orig_init(self, spec, rd, resume=resume, replan=replan,
-                      project_root=project_root)
+                      project_root=project_root,
+                      camflow_name=camflow_name,
+                      agent_phase=agent_phase,
+                      run_id=run_id)
 
         monkeypatch.setattr(rt.Workflow, "__init__", patched_init)
 
@@ -1713,4 +1724,6 @@ class TestReplanPackagePolicy:
             package_manifest=pkg_manifest)
         assert result == "halted"
         halt = json.loads((rd / "halt.json").read_text())
-        assert "run.tool" in halt["envelope"]["error"]["message"]
+        msg = halt["envelope"]["error"]["message"]
+        assert "Planner produced invalid YAML on replan" in msg
+        assert "unsupported executor key 'tool'; use `run.skill`" in msg

@@ -58,7 +58,7 @@ nodes:
       dag: array
       context: string
     verify:
-      criterion: "DAG covers the task statement; needs are consistent (no orphan, no cycle); each node references a real skill; no node uses run.tool; deterministic test scripts from upstream.understand.data.deterministic_test_scripts are used as verify.command gates or command_runner/existing skill-backed audit steps, not as tool nodes"
+      criterion: "DAG covers the task statement; needs are consistent (no orphan, no cycle); each node references a real skill; every executable node uses run.skill; deterministic test scripts from upstream.understand.data.deterministic_test_scripts are used as verify.command gates or command_runner/existing skill-backed audit steps, not as direct runtime command nodes"
     retry: 3
 
   - id: render_yaml

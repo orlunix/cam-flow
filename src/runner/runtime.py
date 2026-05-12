@@ -347,7 +347,8 @@ def validate_workflow(wf: dict, project_root: Path | None = None) -> list[str]:
         has_tool = "tool" in run
         if has_tool:
             errors.append(
-                f"{nid}.run.tool: unsupported; use `run.skill`")
+                f"{nid}.run: unsupported executor key 'tool'; "
+                f"use `run.skill`")
         if not has_skill:
             errors.append(f"{nid}.run: must have `skill`")
         # run.skill values must be non-empty strings (otherwise
@@ -766,6 +767,47 @@ def _cmd_validate_compiled_workflow(argv: list[str]) -> int:
     return 0
 
 
+def _read_run_metadata(run_dir: Path) -> dict | None:
+    meta_path = run_dir / "run.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+            return meta if isinstance(meta, dict) else None
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def _read_run_camflow_name(run_dir: Path) -> str | None:
+    meta = _read_run_metadata(run_dir)
+    if meta is not None:
+        name = meta.get("camflow_name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    for evt in _read_trace_events(run_dir / "trace.jsonl"):
+        if evt.get("event") == "workflow_started":
+            name = evt.get("camflow_name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+            break
+    return None
+
+
+def _read_run_id(run_dir: Path) -> str | None:
+    meta = _read_run_metadata(run_dir)
+    if meta is not None:
+        run_id = meta.get("run_id")
+        if isinstance(run_id, str) and run_id.strip():
+            return run_id.strip()
+    for evt in _read_trace_events(run_dir / "trace.jsonl"):
+        if evt.get("event") == "workflow_started":
+            run_id = evt.get("run_id")
+            if isinstance(run_id, str) and run_id.strip():
+                return run_id.strip()
+            break
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  RUN DIR + ID
 # ═══════════════════════════════════════════════════════════════════════
@@ -789,22 +831,26 @@ def gen_run_id() -> str:
 # which agents are CamFlow-owned and which workflow/node they belong
 # to. Naming convention (per the user's spec):
 #
-#   work / skill agent : cf__{flow}_{node}_a{attempt}
-#   verifier agent     : cf__{flow}_{node}_v{attempt}
+#   work / skill agent : cf_{camflow_name}_{id4}_{phase}_{node}_a{attempt}
+#   verifier agent     : cf_{camflow_name}_{id4}_{phase}_{node}_v{attempt}
 #
 # Slug rules: lowercase a-z0-9 only, separators collapsed to "_",
-# leading/trailing "_" stripped. Caps: flow ~8 chars, node ~14 chars.
+# leading/trailing "_" stripped. Caps: name ~10 chars, node ~14 chars.
 # When truncation occurs, append a tiny stable hash so distinct
 # inputs that share a prefix don't collide on display.
 #
 # These names are for human readability ONLY. Camc identifies agents
-# by their hex `id`; the cleanup/filter source-of-truth remains the
-# `camflow:<run_id>` tag, which is unchanged.
+# by their hex `id`; the full immutable CamFlow run id stays in run.json
+# and trace events.
 
-_FLOW_SLUG_CAP = 8
+_CAMFLOW_NAME_SLUG_CAP = 10
 _NODE_SLUG_CAP = 14
 _AGENT_NAME_HASH_LEN = 4
 _SLUG_SEP_RE = re.compile(r"[^a-z0-9]+")
+_NODE_SLUG_ALIASES = {
+    "design_dag": "design",
+    "render_yaml": "render",
+}
 
 
 def _slug(text: str, *, cap: int) -> str:
@@ -834,22 +880,34 @@ def _short_hash(text: str, *, n: int = 4) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:n]
 
 
-def _make_agent_name(flow: Optional[str], node_id: str,
-                     attempt_n: int, *,
+def _run_id4(run_id: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]", "", (run_id or "").lower())
+    return cleaned[-4:] if len(cleaned) >= 4 else _short_hash(run_id, n=4)
+
+
+def _make_camc_tag(camflow_name: Optional[str], run_id: str,
+                   *, fallback_name: str = "") -> str:
+    name_input = camflow_name or fallback_name or "wf"
+    name_slug = _slug(name_input, cap=_CAMFLOW_NAME_SLUG_CAP)
+    return f"cf:{name_slug}:{_run_id4(run_id)}"
+
+
+def _make_agent_name(camflow_name: Optional[str], run_id: str,
+                     phase: str, node_id: str, attempt_n: int, *,
                      verifier: bool = False,
-                     fallback_flow: str = "") -> str:
+                     fallback_name: str = "") -> str:
     """Compose a CamFlow-managed agent display name.
 
-    `flow` is normally the workflow's top-level `workflow:` field;
-    `fallback_flow` (e.g. workflow.run_id) is used when `flow` is
-    missing or sanitizes to empty. The returned name is bounded
-    (~30 chars) and stable across runs.
+    `camflow_name` is the short run-level human name. The returned name
+    is bounded and stable for a given run id + node + attempt.
     """
-    flow_input = flow or fallback_flow or "wf"
-    flow_slug = _slug(flow_input, cap=_FLOW_SLUG_CAP)
+    name_input = camflow_name or fallback_name or "wf"
+    name_slug = _slug(name_input, cap=_CAMFLOW_NAME_SLUG_CAP)
+    phase_slug = "pl" if phase == "pl" else "run"
     node_slug = _slug(node_id or "n", cap=_NODE_SLUG_CAP)
+    node_slug = _NODE_SLUG_ALIASES.get(node_slug, node_slug)
     suffix = f"_v{attempt_n}" if verifier else f"_a{attempt_n}"
-    return f"cf__{flow_slug}_{node_slug}{suffix}"
+    return f"cf_{name_slug}_{_run_id4(run_id)}_{phase_slug}_{node_slug}{suffix}"
 
 
 def default_run_dir(project_root: Path) -> Path:
@@ -955,11 +1013,11 @@ def _envelope_requests_workflow_halt(envelope: dict) -> bool:
 
 def exec_tool(tool_path: Path, input_dict: dict, workspace: Path,
               timeout_s: int = 300) -> dict:
-    """Legacy run.tool executor for direct internal tests.
+    """Legacy direct-command executor for direct internal tests.
 
-    Active workflow YAML rejects `run.tool`; this compatibility path
-    keeps older low-level tests and replay fixtures useful while the
-    public contract remains skill-only.
+    Active workflow YAML rejects direct-command node executors; this
+    compatibility path keeps older low-level tests and replay fixtures
+    useful while the public contract remains skill-only.
     """
     input_text = json.dumps(input_dict, ensure_ascii=False)
     env = os.environ.copy()
@@ -1237,7 +1295,7 @@ def build_verify_prompt(node: "Node", run_envelope: dict,
 # ═══════════════════════════════════════════════════════════════════════
 #
 # v1.2: workflows execute exclusively via run.skill (camc-spawned skill
-# agents). The historical `run.tool` executor was removed because the
+# agents). The historical direct-command executor was removed because the
 # product contract is "every node is a skill agent": deterministic
 # command checks belong in verify.command, not as node-run executors.
 # verify.command remains a fully supported deterministic gate; only the
@@ -1248,20 +1306,22 @@ def exec_skill(skill_md: str, node: "Node", input_dict: dict,
                workspace: Path, attempt_n: int, run_id_tag: str,
                workflow_context: str | None = None,
                workflow_goal: str | None = None,
-               flow: str | None = None,
-               fallback_flow: str = "") -> dict:
+               camflow_name: str | None = None,
+               run_id: str = "",
+               agent_phase: str = "run",
+               fallback_name: str = "") -> dict:
     """Spawn a camc agent loaded with the skill template + run prompt.
 
-    `flow` is the source workflow's display name (top-level
-    `workflow:` field) used for human-readable agent names; falls
-    back to `fallback_flow` (e.g. run_id) when missing.
+    `camflow_name` is the short run-level human name used for
+    human-readable child-agent display names.
     """
     prompt = build_run_prompt(node, input_dict, skill_md=skill_md,
                               workflow_context=workflow_context,
                               workflow_goal=workflow_goal)
     (workspace / "prompt.txt").write_text(prompt)
-    agent_name = _make_agent_name(flow, node.id, attempt_n,
-                                  fallback_flow=fallback_flow)
+    agent_name = _make_agent_name(
+        camflow_name, run_id, agent_phase, node.id, attempt_n,
+        fallback_name=fallback_name)
     try:
         _aid, raw = camc.run_and_collect(
             prompt=prompt,
@@ -1393,8 +1453,13 @@ def verify_with_agent(node: "Node", workflow: "Workflow", envelope: dict,
     )
     (sub_dir / "prompt.txt").write_text(prompt)
     agent_name = _make_agent_name(
-        workflow.spec.get("workflow"), node.id, attempt_n,
-        verifier=True, fallback_flow=getattr(workflow, "run_id", ""))
+        getattr(workflow, "camflow_name", None),
+        getattr(workflow, "run_id", ""),
+        getattr(workflow, "agent_phase", "run"),
+        node.id,
+        attempt_n,
+        verifier=True,
+        fallback_name=(workflow.spec.get("workflow") or "wf"))
     try:
         _aid, raw = camc.run_and_collect(
             prompt=prompt,
@@ -1623,7 +1688,7 @@ class Node:
         """Do the work — dispatch to the skill executor.
 
         The active workflow contract supports `run.skill` only. The
-        legacy `run.tool` branch remains as a private compatibility
+        legacy direct-command branch remains as a private compatibility
         path for old direct `Workflow(...)` tests that bypass YAML
         validation; parse/load/package paths reject it before execution.
         """
@@ -1636,8 +1701,10 @@ class Node:
                               attempt_n, workflow.tag,
                               workflow_context=workflow.spec.get("context"),
                               workflow_goal=workflow.goal,
-                              flow=workflow.spec.get("workflow"),
-                              fallback_flow=workflow.run_id)
+                              camflow_name=workflow.camflow_name,
+                              run_id=workflow.run_id,
+                              agent_phase=workflow.agent_phase,
+                              fallback_name=workflow.spec.get("workflow") or "wf")
         if "tool" in self.run_config:
             tool_path = _resolve_tool_path(self.run_config["tool"],
                                            workflow.project_root)
@@ -1699,7 +1766,10 @@ class Workflow:
     def __init__(self, spec: dict, run_dir: Path,
                  *, resume: bool = False,
                  replan: bool = False,
-                 project_root: Optional[Path] = None):
+                 project_root: Optional[Path] = None,
+                 camflow_name: Optional[str] = None,
+                 agent_phase: Optional[str] = None,
+                 run_id: Optional[str] = None):
         self.spec = spec
         self.run_dir = run_dir
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -1708,8 +1778,21 @@ class Workflow:
         }
         self.lifecycle = "running"
         self.step_n = 0
-        self.run_id = gen_run_id()
-        self.tag = f"camflow:{self.run_id}"
+        existing_run_id = (
+            run_id or (_read_run_id(run_dir) if (resume or replan) else None)
+        )
+        self.run_id = existing_run_id or gen_run_id()
+        self.agent_phase = agent_phase or (
+            "run" if self._run_dir_is_user_workflow(run_dir) else "pl")
+        if camflow_name is None and (resume or replan):
+            camflow_name = _read_run_camflow_name(run_dir)
+        default_name = (
+            (spec.get("workflow") if isinstance(spec, dict) else None)
+            if self.agent_phase == "run" else "plan"
+        )
+        self.camflow_name = camflow_name or default_name or "wf"
+        self.tag = _make_camc_tag(self.camflow_name, self.run_id,
+                                  fallback_name=default_name or "wf")
 
         # Workflow.goal — the persistent objective for the run, per the
         # 2026-05-05 goal-driven supplement §3.1. Optional in v1.1; when
@@ -1777,6 +1860,7 @@ class Workflow:
             (run_dir / "workflow.yaml").write_text(
                 yaml.safe_dump(spec, sort_keys=False)
             )
+            self._write_run_metadata()
             # Record the active execution DAG before user nodes run, so a
             # future replay tool can reconstruct which plan was active for
             # each node attempt. Mechanical; no scheduling/retry/verify
@@ -1813,6 +1897,11 @@ class Workflow:
 
     # ─── DAG revision (per goal-driven supplement §3.6) ───────────────
 
+    @staticmethod
+    def _run_dir_is_user_workflow(run_dir: Path) -> bool:
+        parts = run_dir.resolve().parts
+        return not (".camflow" in parts and "planner" in parts)
+
     def _detect_user_workflow_role(self) -> bool:
         """True iff this Workflow is the user-facing active DAG.
 
@@ -1823,8 +1912,18 @@ class Workflow:
         ever names their project literally "planner"; that's accepted as
         an MVP simplification per the supplement's "keep it mechanical".
         """
-        parts = self.run_dir.resolve().parts
-        return not (".camflow" in parts and "planner" in parts)
+        return self._run_dir_is_user_workflow(self.run_dir)
+
+    def _write_run_metadata(self) -> None:
+        meta = {
+            "run_id": self.run_id,
+            "camflow_name": self.camflow_name,
+            "agent_phase": self.agent_phase,
+            "tag": self.tag,
+        }
+        (self.run_dir / "run.json").write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False)
+        )
 
     def _dag_revisions_dir(self) -> Path:
         return self.run_dir / "dag_revisions"
@@ -1859,6 +1958,7 @@ class Workflow:
             "parent_revision": parent_revision,
             "reason": reason,
             "workflow_goal": self.goal,  # may be None for legacy/synthetic
+            "camflow_name": self.camflow_name,
         }
         (rev_dir / "manifest.json").write_text(
             json.dumps(manifest, indent=2, ensure_ascii=False)
@@ -2092,7 +2192,10 @@ def run_workflow(workflow: dict, run_dir: Path,
                  replan: bool = False,
                  project_root: Optional[Path] = None,
                  package_meta: Optional[dict] = None,
-                 workflow_source: Optional[dict] = None) -> str:
+                 workflow_source: Optional[dict] = None,
+                 camflow_name: Optional[str] = None,
+                 agent_phase: str = "run",
+                 run_id: Optional[str] = None) -> str:
     """Execute a workflow → return final lifecycle state ('done' or 'halted').
 
     `resume_with_run` is for the resume command — caller pre-builds a
@@ -2126,7 +2229,10 @@ def run_workflow(workflow: dict, run_dir: Path,
     """
     wf = resume_with_run if resume_with_run is not None else \
         Workflow(workflow, run_dir, replan=replan,
-                 project_root=project_root)
+                 project_root=project_root,
+                 camflow_name=camflow_name,
+                 agent_phase=agent_phase,
+                 run_id=run_id)
     if resume_with_run is None:
         if workflow_source is None:
             if package_meta:
@@ -2152,7 +2258,7 @@ def run_workflow(workflow: dict, run_dir: Path,
                         "type": "planner",
                         "planner_invoked": True,
                     }
-        evt: dict = {"run_id": wf.run_id}
+        evt: dict = {"run_id": wf.run_id, "camflow_name": wf.camflow_name}
         if package_meta:
             pkg_brief = {k: package_meta.get(k) for k in
                          ("name", "version", "content_digest")
@@ -2340,7 +2446,8 @@ def _downstream_set(wf: "Workflow", root_id: str) -> set[str]:
 
 
 def _do_rerun(rd: Path, node_id: str, feedback: str,
-              steps: Optional[int]) -> int:
+              steps: Optional[int],
+              *, camflow_name: Optional[str] = None) -> int:
     """Body of rerun (factored from CLI parsing).
 
     Re-execute `node_id` plus all its downstream descendants in the
@@ -2354,7 +2461,7 @@ def _do_rerun(rd: Path, node_id: str, feedback: str,
         return 1
     workflow = yaml.safe_load(wf_path.read_text())
 
-    wf = Workflow(workflow, rd, resume=True)
+    wf = Workflow(workflow, rd, resume=True, camflow_name=camflow_name)
 
     # Replay history (same as resume).
     summary = _summarize_run(rd)
@@ -2455,10 +2562,13 @@ def _cmd_run(argv: list[str]) -> int:
                    help="(debug) halt cleanly after N node-attempts")
     p.add_argument("--run-dir", default=None,
                    help="run directory (default: ./.camflow/run/)")
+    p.add_argument("-n", "--name", default=None,
+                   help="short human CamFlow run name for spawned agents")
     p.add_argument("--package", default=None,
                    help="execute an installed packaged workflow "
                         "(NAME@VERSION); skips Planner")
     args = p.parse_args(argv)
+    run_name = args.name.strip() if args.name and args.name.strip() else None
     if args.steps is not None and args.steps < 1:
         print("ERROR: --steps must be >= 1", file=sys.stderr)
         return 1
@@ -2519,11 +2629,13 @@ def _cmd_run(argv: list[str]) -> int:
     # ── Package mode (v1.2 P0): no Planner, frozen workflow ───────────
     if has_package:
         return _run_packaged(args.package, run_dir, project,
-                             max_attempts=args.steps)
+                             max_attempts=args.steps,
+                             camflow_name=run_name)
 
     # ── Rerun mode ─────────────────────────────────────────────────────
     if args.from_node:
-        return _do_rerun(run_dir, args.from_node, args.feedback, args.steps)
+        return _do_rerun(run_dir, args.from_node, args.feedback, args.steps,
+                         camflow_name=run_name)
 
     # ── Fresh-run mode ─────────────────────────────────────────────────
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -2571,12 +2683,20 @@ def _cmd_run(argv: list[str]) -> int:
             print(f"ERROR (Planner): {e}", file=sys.stderr)
         return 1
 
+    flow_run_id = gen_run_id()
+    flow_name = run_name or "flow"
+
     planner_run_dir = run_dir / "planner"
     print(f"compiling prompt via Planner → {planner_run_dir}", file=sys.stderr)
     planner_wf = Workflow(planner_spec, planner_run_dir,
-                          project_root=planner_dir)
+                          project_root=planner_dir,
+                          camflow_name=flow_name,
+                          agent_phase="pl",
+                          run_id=flow_run_id)
     planner_wf.trace("workflow_started", run_id=planner_wf.run_id,
-                     role="planner")
+                     role="planner",
+                     camflow_name=getattr(planner_wf, "camflow_name",
+                                          flow_name))
     try:
         planner_result = planner_wf.execute_dag()
     finally:
@@ -2613,7 +2733,9 @@ def _cmd_run(argv: list[str]) -> int:
 
     print(f"executing compiled workflow → {run_dir}", file=sys.stderr)
     result = _execute_with_optional_auto_replan(
-        user_spec, run_dir, max_attempts=args.steps)
+        user_spec, run_dir, max_attempts=args.steps,
+        camflow_name=flow_name,
+        run_id=flow_run_id)
     print(f"result: {result}", file=sys.stderr)
     return _result_to_exit(result)
 
@@ -2648,9 +2770,9 @@ def _replan_policy_errors(user_spec: dict,
                 f"in package manifest.skills")
         if "tool" in run:
             errors.append(
-                f"node {nid!r} uses run.tool — active workflows "
-                f"support run.skill only; replanned workflow cannot "
-                f"introduce one")
+                f"node {nid!r} uses unsupported run executor key "
+                f"'tool'; active workflows support run.skill only; "
+                f"replanned workflow cannot introduce one")
     return errors
 
 
@@ -2661,7 +2783,9 @@ def _execute_with_optional_auto_replan(
         project_root: Optional[Path] = None,
         package_meta: Optional[dict] = None,
         workflow_source: Optional[dict] = None,
-        package_manifest: Optional[dict] = None) -> str:
+        package_manifest: Optional[dict] = None,
+        camflow_name: Optional[str] = None,
+        run_id: Optional[str] = None) -> str:
     """Run the user workflow; on halt, if `on_halt: replan` is declared
     in the spec, automatically perform `_perform_replan` and re-execute
     up to `max_replans` times. Without `on_halt: replan`, behaves
@@ -2678,7 +2802,7 @@ def _execute_with_optional_auto_replan(
     `<run>/skills/` was materialized from the package). `package_meta`
     keeps trace metadata package-aware across auto replans (RFC §12).
     `package_manifest` is consulted to enforce the replan policy gate
-    (no undeclared skills, no run.tool).
+    (no undeclared skills, no direct-command node executors).
     """
     on_halt = user_spec.get("on_halt") or "manual"
     declared_max = user_spec.get("max_replans")
@@ -2692,7 +2816,10 @@ def _execute_with_optional_auto_replan(
                           max_attempts=max_attempts, replan=replan,
                           project_root=project_root,
                           package_meta=package_meta,
-                          workflow_source=workflow_source)
+                          workflow_source=workflow_source,
+                          camflow_name=camflow_name,
+                          agent_phase="run",
+                          run_id=run_id)
 
     if on_halt != "replan":
         return result
@@ -2789,7 +2916,9 @@ def _execute_with_optional_auto_replan(
         result = run_workflow(new_spec, run_dir,
                               max_attempts=max_attempts, replan=True,
                               project_root=project_root,
-                              package_meta=package_meta)
+                              package_meta=package_meta,
+                              camflow_name=_read_run_camflow_name(run_dir),
+                              run_id=_read_run_id(run_dir))
         # Carry forward on_halt / max_replans from the new spec — the
         # Planner may keep, raise, or drop them. Re-clamp.
         on_halt = new_spec.get("on_halt") or "manual"
@@ -3020,14 +3149,21 @@ def _perform_replan(run_dir: Path, *, reason: str,
 
     planner_run_dir = run_dir / f"planner-rev{new_revision}"
     print(f"replanning via Planner → {planner_run_dir}", file=sys.stderr)
+    camflow_name = _read_run_camflow_name(run_dir)
+    flow_run_id = _read_run_id(run_dir)
     planner_wf = Workflow(planner_spec, planner_run_dir,
-                          project_root=planner_dir)
+                          project_root=planner_dir,
+                          camflow_name=camflow_name or "plan",
+                          agent_phase="pl",
+                          run_id=flow_run_id)
     extra_trace = {"role": "planner-replan",
                    "parent_revision": prior_revision,
                    "new_revision": new_revision}
     if replan_count is not None:
         extra_trace["replan_count"] = replan_count
     planner_wf.trace("workflow_started", run_id=planner_wf.run_id,
+                     camflow_name=getattr(planner_wf, "camflow_name",
+                                          camflow_name or "plan"),
                      **extra_trace)
     try:
         planner_result = planner_wf.execute_dag()
@@ -3135,7 +3271,9 @@ def _cmd_replan(argv: list[str]) -> int:
     print(f"executing replanned workflow (revision "
           f"{outcome['new_revision']}) → {run_dir}", file=sys.stderr)
     result = run_workflow(outcome["user_spec"], run_dir,
-                          max_attempts=args.steps, replan=True)
+                          max_attempts=args.steps, replan=True,
+                          camflow_name=_read_run_camflow_name(run_dir),
+                          run_id=_read_run_id(run_dir))
     print(f"result: {result}", file=sys.stderr)
     return _result_to_exit(result)
 
@@ -3145,7 +3283,8 @@ def _cmd_replan(argv: list[str]) -> int:
 # ═══════════════════════════════════════════════════════════════════════
 
 def _run_packaged(package_id: str, run_dir: Path, project: Path,
-                  *, max_attempts: Optional[int] = None) -> int:
+                  *, max_attempts: Optional[int] = None,
+                  camflow_name: Optional[str] = None) -> int:
     """Execute an installed packaged workflow without invoking Planner.
 
     Materializes the package's execution inputs into `<run_dir>/` so the
@@ -3286,7 +3425,8 @@ def _run_packaged(package_id: str, run_dir: Path, project: Path,
         user_spec, run_dir, max_attempts=max_attempts,
         project_root=run_dir, package_meta=pkg_meta,
         workflow_source=workflow_source,
-        package_manifest=manifest)
+        package_manifest=manifest,
+        camflow_name=camflow_name)
     print(f"result: {result}", file=sys.stderr)
     return _result_to_exit(result)
 
@@ -3605,6 +3745,14 @@ def _summarize_status(run_dir: Path, *,
                                 else None)
     summary["workflow_goal"] = (wf.get("goal") if isinstance(wf, dict)
                                 else None)
+    run_meta = _read_run_metadata(run_dir)
+    summary["run_metadata"] = run_meta
+    summary["run_id"] = (
+        run_meta.get("run_id")
+        if isinstance(run_meta, dict) else None)
+    summary["camflow_name"] = (
+        run_meta.get("camflow_name")
+        if isinstance(run_meta, dict) else None)
     # Package metadata (v1.2 P0). package.json present iff this run was
     # launched via `camflow run --package`. Read but don't validate
     # against disk — status is read-only.
@@ -3625,6 +3773,11 @@ def _summarize_status(run_dir: Path, *,
     trace_events_for_source = _read_trace_events(run_dir / "trace.jsonl")
     for evt in trace_events_for_source:
         if evt.get("event") == "workflow_started":
+            if summary["run_id"] is None and isinstance(evt.get("run_id"), str):
+                summary["run_id"] = evt["run_id"]
+            if summary["camflow_name"] is None and \
+                    isinstance(evt.get("camflow_name"), str):
+                summary["camflow_name"] = evt["camflow_name"]
             ws = evt.get("workflow_source")
             if isinstance(ws, dict):
                 summary["workflow_source"] = ws
@@ -3825,6 +3978,8 @@ def _render_status_human(summary: dict, *,
         )
     if summary.get("workflow_name"):
         lines.append(f"workflow: {summary['workflow_name']}")
+    if summary.get("camflow_name"):
+        lines.append(f"name:   {summary['camflow_name']}")
     if summary.get("workflow_goal"):
         goal = summary["workflow_goal"].strip()
         if len(goal) > 200:

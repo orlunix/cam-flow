@@ -261,9 +261,10 @@ Use `context` for prompt-shared facts — including the original user prompt, wh
 - **Verify phase**: at most one of `verify.criterion` / `verify.command` /
   `verify.human`. `verify.command` is the canonical deterministic gate.
 
-`run.tool` is not part of the active workflow contract. Mechanical
-commands belong either inside a skill's process or in `verify.command`
-when the command is purely a deterministic pass/fail gate.
+Mechanical commands belong either inside a skill's process or in
+`verify.command` when the command is purely a deterministic pass/fail
+gate. Workflow-load validation rejects any run executor shape other than
+`run: { skill: <name> }`.
 
 ### No `run.input` field
 
@@ -743,9 +744,10 @@ attempt, such as `pytest`, schema checks, file existence checks, or
 artifact digest checks. `verify.command` is the canonical place for
 mechanical validation.
 
-Do not emit `run.tool` in compiled workflows. If an existing script is a
-useful wrapper, reference it from the skill steps and have the skill call
-it, then write the required `agent_output.json` envelope.
+Compiled workflows must use `run: { skill: <name> }` for every node. If
+an existing script is a useful wrapper, reference it from the skill steps
+and have the skill call it, then write the required `agent_output.json`
+envelope.
 
 ---
 

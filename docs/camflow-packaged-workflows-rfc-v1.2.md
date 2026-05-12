@@ -300,9 +300,9 @@ Rules:
 
 - `skills/<skill_name>/SKILL.md` is required for every `run.skill`
   referenced by `workflow.yaml`. P0 has no external skill resolver.
-- Package creation rejects `run.tool` nodes because active workflows use
-  `run.skill` only. `tools/` contains passive support scripts that skills
-  may invoke; Runtime must not execute them as node executors.
+- Package creation accepts active workflows that use `run.skill` only.
+  `tools/` contains passive support scripts that skills may invoke;
+  Runtime must not execute them as node executors.
 - `evidence/` is descriptive only; runtime must not treat it as node
   state.
 - `examples/` may contain sample parameter files, but not secrets.
@@ -553,8 +553,8 @@ Field constraints:
 - `skill_resolution.external_skills` must be absent or an empty list in
   P0. External skill resolution is future work.
 - every `skills.<name>.path` must be `skills/<name>/SKILL.md`.
-- Packages do not support workflow `run.tool` nodes. Commands belong
-  inside skills or `verify.command`.
+- Package workflows execute nodes through skills. Commands belong inside
+  skills or `verify.command`.
 - environment declarations may name required variables, but must not
   contain variable values.
 - common Linux commands do not need `host_tools` entries; non-general

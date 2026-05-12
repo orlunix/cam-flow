@@ -38,7 +38,7 @@ User-facing CLI mirrors `camc run`: one mandatory prompt, two verbs
      decide retry/halt).
    - `Node` — atomic execution unit. Has `lifecycle ∈ {waiting,
      running, done}` and `result ∈ {success, fail}`. Methods: `run()`
-     (skill or tool), `verify()` (criterion / command / human),
+     (skill executor), `verify()` (criterion / command / human),
      `execute_attempt()` (run + verify + persist).
 
 3. **Every LLM invocation goes through `camc_lib.run_and_collect`.**
@@ -62,10 +62,8 @@ Highlights to keep top-of-mind:
   with the single namespace `{{nodes.<id>.output.X}}`.
 - **`workflow.context`** — shared prompt block injected into every
   node. Planner writes the user's original prompt + run-constants here.
-- **Skill is the default run executor.** `run.tool:` is allowed only
-  when **all five** §10 criteria hold (known command + fully-determined
-  inputs + script-structured output + idempotent + cost matters). When
-  in doubt, use skill.
+- **Skill is the only run executor.** Commands belong inside a skill or
+  in `verify.command` when they are purely deterministic pass/fail gates.
 - **`verify.command`** — bash exit code as the deterministic gate.
   Verify-side commands are unconstrained — use them freely for
   pass/fail checks.
@@ -237,7 +235,7 @@ is fully inspectable as just another camflow run.
   in-flow node-level). `camflow run "<prompt>"` should run end-to-end
   with zero pauses unless the user asked for one.
 - **Don't let user workflows kick off other workflows.** Nodes do
-  ONE camc spawn each (a skill agent or a tool), and they don't
+  ONE camc spawn each (a skill agent), and they don't
   recursively start `camflow run`. The **Planner builtin is the sole
   system-level exception** to this rule — `camflow run` itself is
   implemented by running the Planner workflow whose output (a
@@ -249,8 +247,8 @@ is fully inspectable as just another camflow run.
 - **Don't bypass camc.** Runtime starts agents via `camc run` only —
   never `claude -p`, never the Anthropic SDK. Reach for `cam` only
   when crossing machines.
-- **Don't loosen the `run.tool:` 5-criterion gate.** If you find
-  yourself wanting tool but not all 5 hold, it's a skill.
+- **Don't add another run executor shape.** If you want a direct command
+  node, wrap it in a skill or make it a `verify.command` gate.
 - **Don't push `--force` to remote** (origin has leftover Phase-A
   commits that need explicit user authorization to force-push).
 

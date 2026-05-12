@@ -61,10 +61,16 @@ workflow-goal sentence. When in doubt, link the goal.
 1. **Decompose deliberately.** Each node should be one cohesive unit of
    work — small enough that a single skill can do it well, large
    enough that the verify can meaningfully check it.
-2. **Dependency edges only via `needs`.** A node lists its upstream
+2. **Keep workflow and node identifiers short.** Use compact, stable
+   ids like `collect`, `audit`, `fix`, `report`, or `test_api`.
+   Detailed meaning belongs in `workflow_goal`, each node's `goal`,
+   and `steps` — not in long workflow names or node ids. CamFlow uses
+   these ids in child-agent display names, so avoid sentence-like ids
+   such as `collect_all_project_context_for_the_request`.
+3. **Dependency edges only via `needs`.** A node lists its upstream
    nodes by id; the runtime auto-injects upstream envelopes into its
    prompt. No `run.input` field — that doesn't exist.
-3. **Pick existing skills.** If you don't know a skill exists, don't
+4. **Pick existing skills.** If you don't know a skill exists, don't
    reference it. The runtime fails workflow load if a skill is missing.
 
    **Available repo skills** — the camflow shipped `skills/` directory
@@ -79,6 +85,10 @@ workflow-goal sentence. When in doubt, link the goal.
      passes.
    - `command_runner` — run deterministic project-local scripts or
      command-style audit/build steps and emit a structured envelope.
+   - `nvbug_collector` — collect and normalize NVIDIA NVBugs for
+     RISC-V / `rs_riscv_top` debug triage; use as the first node when
+     the workflow starts from NVBug keywords, bug IDs, RN102/RISC-V/
+     XRISCV keywords, or a bug-list collection request.
    - `reviewer` — independently confirm a diff covers a requirement
      list, citing concrete file:line evidence per requirement.
    - `evaluator` — the default agent-verify role (you don't reference
@@ -90,12 +100,12 @@ workflow-goal sentence. When in doubt, link the goal.
    reference custom names unless you know they exist on disk.
 
    **`run.skill` is the only supported run executor.** Every node you
-   design must use `run: { skill: <name> }`. Do not emit `run.tool`.
+   design must use `run: { skill: <name> }`.
    When the work is "compile / test / lint / format with a known CLI",
    place that command in the skill node's steps and/or enforce it with
    `verify.command`. Missing skills are caught at workflow load time, so
    reference only skills that exist on disk.
-4. **Verify everything non-trivial.** Default is `verify: agent` (steps
+5. **Verify everything non-trivial.** Default is `verify: agent` (steps
    as checklist). Use `verify.command` for things you can check with
    bash exit code.
 
@@ -269,10 +279,10 @@ nodes — same five type names everywhere.
 ## Audit-node mandatory check
 
 If `upstream.understand.data.deterministic_test_scripts` is non-empty,
-use those paths as deterministic gates, not as `run.tool` nodes. Attach
-the relevant command(s) to the implementer-class node's `verify.command`
-when they can be run as a pass/fail check. Parse JSON with Python stdlib;
-do not assume optional tools such as `jq`.
+use those paths as deterministic gates inside skills or `verify.command`.
+Attach the relevant command(s) to the implementer-class node's
+`verify.command` when they can be run as a pass/fail check. Parse JSON
+with Python stdlib; do not assume optional tools such as `jq`.
 
 If the project has a registered skill that exists on disk and is meant
 to run test/audit scripts and emit a structured envelope, you may add a
@@ -310,8 +320,7 @@ Go, Rust, JS, or anything else), the standard DAG shape is:
 3. **Deterministic test evidence.** When the project has distinct test
    groupings (visible vs. invariant, unit vs. integration), encode them
    in the implementer's `verify.command` or in `command_runner` /
-   existing skill-based audit nodes. Do not emit `run.tool`. `retry: 1`
-   is correct for deterministic
+   existing skill-based audit nodes. `retry: 1` is correct for deterministic
    test gates: if a deterministic audit fails
    repeatedly, that's evidence the implementation is bad, not
    something to loop on.
@@ -437,6 +446,38 @@ If the case has no test suite, drop the audit nodes and lean on
 `verify: agent` for the implementer (with the spec's requirements as
 explicit verify criteria). If the case is single-step (config tweak,
 trivial rename), a 2-node analyzer+implementer DAG is fine.
+
+## Common shape: NVBugs / RISC-V debug triage
+
+If the task mentions NVBugs, bug IDs, RN102/RISC-V/XRISCV keywords,
+`rs_riscv_top`, bug-list collection, or an RTL/debug triage flow, the
+first user workflow node MUST be a collector node:
+
+```yaml
+- id: collect_bugs
+  goal: "Collect the NVBugs that define the workflow_goal's RISC-V debug scope, with normalized metadata for downstream triage."
+  steps:
+    - "Extract explicit bug IDs and search keywords from the original task and workflow context."
+    - "Use nvbugs-cli wildcard criteria; treat bracketed synopsis fragments and rs_riscv_top/RN102/XRISCV tokens as the primary search scope."
+    - "Deduplicate by bug id and emit normalized bug metadata plus query notes."
+  run:
+    skill: nvbug_collector
+  output_schema:
+    bug_ids: array
+    bugs: array
+    count: integer
+    queries: array
+    collection_complete: boolean
+    notes: array
+  retry: 2
+```
+
+Do not put an analyzer, environment probe, path resolver, trace node,
+or debug node before `collect_bugs`. If environment discovery is needed,
+make it part of `collect_bugs` or a downstream node that depends on
+`collect_bugs`. All later debug nodes should depend directly or
+indirectly on this node so their scope is anchored to one collected bug
+set.
 
 ## On retry
 

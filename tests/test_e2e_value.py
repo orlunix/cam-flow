@@ -114,7 +114,7 @@ def _make_fake_camc(project_root: Path):
             )
             return (aid, envelope)
 
-        # CamFlow-managed names follow the cf__<flow>_<node>_a<n> /
+        # CamFlow-managed names follow the cf__<node>_<flow>_a<n> /
         # _v<n> convention; the workspace path is more reliable than
         # name parsing for dispatch (the runtime always lays out
         # nodes/<node_id>/attempt-N[/verify]). Use it.
@@ -313,18 +313,18 @@ def test_workflow_reference_e2e(tmp_path, monkeypatch):
             "raw_stdout.txt").is_file()
 
     # 12. Sanity on the call log. Names follow the CamFlow-managed
-    # convention cf__<flow>_<node>_a<n> / _v<n>. The reference
-    # workflow's `workflow: csvparser_implementation` field slugs
-    # (cap=8) to a truncated-with-hash stem.
-    from runner.runtime import _slug
-    flow_slug = _slug("csvparser_implementation", cap=8)
+    # convention cf_<camflow_name>_<id4>_run_<node>_a<n> / _v<n>.
+    from runner.runtime import _run_id4, _slug
+    flow_slug = _slug("csvparser_implementation", cap=10)
+    run_meta = json.loads((run_dir / "run.json").read_text())
+    id4 = _run_id4(run_meta["run_id"])
     names = [c["name"] for c in calls]
-    assert f"cf__{flow_slug}_analyzer_a1" in names
-    assert f"cf__{flow_slug}_analyzer_v1" in names
-    assert f"cf__{flow_slug}_implementer_a1" in names
-    assert f"cf__{flow_slug}_implementer_a2" in names
-    assert f"cf__{flow_slug}_reviewer_a1" in names
-    assert f"cf__{flow_slug}_reviewer_v1" in names
+    assert f"cf_{flow_slug}_{id4}_run_analyzer_a1" in names
+    assert f"cf_{flow_slug}_{id4}_run_analyzer_v1" in names
+    assert f"cf_{flow_slug}_{id4}_run_implementer_a1" in names
+    assert f"cf_{flow_slug}_{id4}_run_implementer_a2" in names
+    assert f"cf_{flow_slug}_{id4}_run_reviewer_a1" in names
+    assert f"cf_{flow_slug}_{id4}_run_reviewer_v1" in names
 
 
 def test_setup_fixture_script_refuses_existing(tmp_path):

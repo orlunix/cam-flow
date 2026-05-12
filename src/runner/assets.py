@@ -6,9 +6,9 @@ Centralizes the runtime's on-disk lookups:
   * _resolve_skill_path  — `run.skill: <name>` → SKILL.md on disk
   * _resolve_tool_path   — legacy compatibility helper for direct tests
 
-v1.2 dropped `run.tool` as a workflow executor — workflows are
-skill-only. Deterministic command paths live in `verify.command` and
-are validated through `_resolve_command_path` inside runtime.py.
+v1.2 workflows are skill-only. Deterministic command paths live in
+`verify.command` and are validated through `_resolve_command_path`
+inside runtime.py.
 """
 from __future__ import annotations
 
@@ -50,9 +50,10 @@ def _resolve_skill_path(name: str, project_root: Path) -> Optional[Path]:
 def _resolve_tool_path(rel: str, project_root: Path) -> Optional[Path]:
     """Legacy tool-path resolver kept for internal compatibility tests.
 
-    Active workflow YAML rejects `run.tool`; normal command execution
-    belongs inside skills or `verify.command`. This helper still enforces
-    containment for old direct runtime callers that bypass YAML validation.
+    Active workflow YAML rejects direct-command node executors; normal
+    command execution belongs inside skills or `verify.command`. This
+    helper still enforces containment for old direct runtime callers that
+    bypass YAML validation.
     """
     if Path(rel).is_absolute():
         return None

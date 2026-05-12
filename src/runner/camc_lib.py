@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import time
+import errno
 from pathlib import Path
 
 
@@ -38,26 +39,77 @@ from pathlib import Path
 # Env var values:
 #   CAMFLOW_SKILL_TIMEOUT=N (positive int)  → wait at most N seconds
 #   CAMFLOW_SKILL_TIMEOUT unset / "0" / "" → wait forever (default)
-def _parse_timeout_env(name: str) -> int | None:
+#   CAMFLOW_CAMC_RUN_TIMEOUT=N              → wait at most N seconds for
+#                                             `camc run` to print an agent id
+#   CAMFLOW_CAMC_RUN_TIMEOUT=0              → no spawn timeout
+def _parse_timeout_env(name: str, default_s: int | None = None) -> int | None:
     v = (os.environ.get(name) or "").strip()
     if not v or v == "0":
-        return None
+        return None if v == "0" else default_s
     try:
         n = int(v)
-        return n if n > 0 else None
+        return n if n > 0 else default_s
     except ValueError:
-        return None
+        return default_s
 
 DEFAULT_SKILL_TIMEOUT_S = _parse_timeout_env("CAMFLOW_SKILL_TIMEOUT")
+DEFAULT_CAMC_RUN_TIMEOUT_S = 180
+DEFAULT_CAMC_PROMPT_ARG_MAX_BYTES = 16_000
+DEFAULT_CAMC_PROMPT_FILE_SUBMIT_DELAY_S = 3.0
 POLL_INTERVAL_S = float(os.environ.get("CAMFLOW_SKILL_POLL_INTERVAL", "2"))
 
 
 def _agent_tool_env() -> str:
     return (os.environ.get("CAMFLOW_AGENT_TOOL") or "").strip()
 
+
+def _camc_run_timeout_s() -> int | None:
+    return _parse_timeout_env("CAMFLOW_CAMC_RUN_TIMEOUT",
+                              DEFAULT_CAMC_RUN_TIMEOUT_S)
+
+
+def _camc_prompt_arg_max_bytes() -> int:
+    return _parse_timeout_env("CAMFLOW_CAMC_PROMPT_ARG_MAX_BYTES",
+                              DEFAULT_CAMC_PROMPT_ARG_MAX_BYTES) or 0
+
+
+def _camc_prompt_file_submit_delay_s() -> float:
+    v = (os.environ.get("CAMFLOW_CAMC_PROMPT_FILE_SUBMIT_DELAY") or "").strip()
+    if not v:
+        return DEFAULT_CAMC_PROMPT_FILE_SUBMIT_DELAY_S
+    try:
+        return max(0.0, float(v))
+    except ValueError:
+        return DEFAULT_CAMC_PROMPT_FILE_SUBMIT_DELAY_S
+
 # camc's `run` prints "Starting <tool> agent <hex>"; we regex it out
 # until camc supports `run --json`.
 _AGENT_ID_RE = re.compile(r"^Starting [a-z]+ agent ([0-9a-f]{6,})", re.MULTILINE)
+
+
+def _prompt_arg(prompt: str, workspace: Path, *, force_file: bool = False
+                ) -> tuple[str, bool]:
+    """Return the short prompt to pass through argv.
+
+    camc currently accepts the task prompt only as a positional CLI argument.
+    Real CamFlow nodes can produce very large prompts (final reports include
+    upstream envelopes), and some PDX shells have a low effective ARG_MAX once
+    environment size is included. For large prompts, store the full prompt in
+    the attempt workspace and pass a short loader prompt to camc.
+    """
+    limit = _camc_prompt_arg_max_bytes()
+    prompt_bytes = len(prompt.encode("utf-8", errors="replace"))
+    if not force_file and (limit <= 0 or prompt_bytes <= limit):
+        return prompt, False
+
+    workspace.mkdir(parents=True, exist_ok=True)
+    prompt_file = workspace / ".camflow_camc_prompt.txt"
+    prompt_file.write_text(prompt, encoding="utf-8")
+    return (
+        "Read the full CamFlow task prompt from this file and follow it "
+        f"exactly: {prompt_file}",
+        True,
+    )
 
 
 # ─── Errors ────────────────────────────────────────────────────────────
@@ -74,20 +126,67 @@ class CamcTimeout(CamcError):
 
 def spawn(prompt: str, workspace: Path, name: str, tag: str) -> str:
     """`camc run` → return agent_id. Raises CamcError on any failure."""
-    cmd = ["camc", "run"]
-    agent_tool = _agent_tool_env()
-    if agent_tool:
-        cmd += ["--tool", agent_tool]
-    cmd += [
-        "--path", str(workspace),
-        "--name", name,
-        "--tag", tag,
-        prompt,
-    ]
-    proc = subprocess.run(
-        cmd,
-        capture_output=True, text=True, timeout=30,
-    )
+    def build_cmd(prompt_for_argv: str) -> list[str]:
+        cmd = ["camc", "run"]
+        agent_tool = _agent_tool_env()
+        if agent_tool:
+            cmd += ["--tool", agent_tool]
+        cmd += [
+            "--path", str(workspace),
+            "--name", name,
+            "--tag", tag,
+            prompt_for_argv,
+        ]
+        return cmd
+
+    def submit_prompt_file_loader(agent_id: str) -> None:
+        """Best-effort nudge for camc/Claude prompt-file loader prompts.
+
+        On some PDX Claude TUI sessions camc successfully pastes the short
+        loader prompt but the trailing Enter is lost, leaving the agent idle at
+        the input box. This nudge is limited to prompt-file launches so normal
+        short-prompt agents keep the existing behavior.
+        """
+        delay_s = _camc_prompt_file_submit_delay_s()
+        if delay_s > 0:
+            time.sleep(delay_s)
+        subprocess.run(
+            ["camc", "key", agent_id, "Enter"],
+            capture_output=True, text=True, timeout=10,
+        )
+
+    prompt_for_argv, prompt_from_file = _prompt_arg(prompt, workspace)
+    timeout_s = _camc_run_timeout_s()
+    try:
+        proc = subprocess.run(
+            build_cmd(prompt_for_argv),
+            capture_output=True, text=True, timeout=timeout_s,
+        )
+    except OSError as e:
+        if e.errno == errno.E2BIG and not prompt_from_file:
+            prompt_for_argv, _ = _prompt_arg(prompt, workspace,
+                                             force_file=True)
+            prompt_from_file = True
+            proc = subprocess.run(
+                build_cmd(prompt_for_argv),
+                capture_output=True, text=True, timeout=timeout_s,
+            )
+        else:
+            raise CamcError(f"failed to launch camc run: {e}") from e
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout or e.output or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
+        m = _AGENT_ID_RE.search(stdout)
+        if m:
+            agent_id = m.group(1)
+            if prompt_from_file:
+                submit_prompt_file_loader(agent_id)
+            return agent_id
+        timeout_label = "without timeout" if timeout_s is None else f"after {timeout_s}s"
+        raise CamcTimeout(
+            f"timed out waiting for camc run to report an agent id {timeout_label}"
+        ) from e
     if proc.returncode != 0:
         raise CamcError(
             f"camc run exited {proc.returncode}: {proc.stderr.strip()[:300]}"
@@ -97,7 +196,10 @@ def spawn(prompt: str, workspace: Path, name: str, tag: str) -> str:
         raise CamcError(
             f"could not parse agent ID from camc run output:\n{proc.stdout[:500]}"
         )
-    return m.group(1)
+    agent_id = m.group(1)
+    if prompt_from_file:
+        submit_prompt_file_loader(agent_id)
+    return agent_id
 
 
 def status(agent_id: str) -> dict:

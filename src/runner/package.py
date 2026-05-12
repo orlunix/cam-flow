@@ -6,9 +6,9 @@ tar with a fixed `camflowpkg/` root containing the frozen
 workflow.yaml, manifest.yaml, lock.json, and bundled skills.
 
 P0 limitations (explicit):
-  * run.tool nodes are not part of the active workflow contract.
+  * Direct-command nodes are not part of the active workflow contract.
     create_package raises PackageError when the source workflow contains
-    a run.tool node; commands belong inside skills or verify.command.
+    one; commands belong inside skills or verify.command.
   * skill_resolution.allow_host_skills (RFC §13) is rejected in P0;
     package skills are mandatory. `camflow run --package` materializes
     those skills into `<run_dir>/skills/`, and normal runtime execution
@@ -477,8 +477,9 @@ def validate_package(target: Path) -> list[str]:
         tl = run.get("tool")
         if tl:
             errors.append(
-                f"workflow node {n.get('id')!r} uses run.tool — "
-                f"active workflows support run.skill only")
+                f"workflow node {n.get('id')!r} uses unsupported "
+                f"run executor key 'tool'; active workflows support "
+                f"run.skill only")
     return errors
 
 
@@ -537,7 +538,8 @@ def create_package(*, run_dir: Path, name: str, version: str,
     """Build a .camflowpkg from a finished run dir.
 
     Returns the path to the written archive. Raises PackageError on any
-    soft failure (workflow halted, run.tool present, missing skill).
+    soft failure (workflow halted, unsupported run executor present,
+    missing skill).
     """
     run_dir = Path(run_dir).resolve()
     out = Path(out).resolve()
@@ -590,7 +592,7 @@ def create_package(*, run_dir: Path, name: str, version: str,
     if not isinstance(wf_spec, dict):
         raise PackageError("run workflow.yaml top-level is not a dict")
 
-    # Forbid run.tool nodes. Commands belong inside skills or
+    # Forbid direct-command nodes. Commands belong inside skills or
     # verify.command; run.skill is the only active node executor.
     nodes = wf_spec.get("nodes") or []
     for n in nodes:
@@ -599,9 +601,9 @@ def create_package(*, run_dir: Path, name: str, version: str,
         run = n.get("run") or {}
         if isinstance(run, dict) and "tool" in run:
             raise PackageError(
-                f"node {n.get('id')!r} uses run.tool — active "
-                f"workflows support run.skill only; wrap commands in "
-                f"a skill before packaging")
+                f"node {n.get('id')!r} uses unsupported run executor "
+                f"key 'tool'; active workflows support run.skill only; "
+                f"wrap commands in a skill before packaging")
 
     workflow_errors = _validate_workflow_shape(
         wf_spec, project_root=project_root)

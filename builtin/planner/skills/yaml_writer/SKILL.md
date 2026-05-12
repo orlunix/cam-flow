@@ -69,9 +69,9 @@ nodes:
    actually put it on a node, which it should only do when the user's
    original prompt asked for review/approval. Don't add `verify: human`
    on your own; don't drop it if it was intentionally placed.
-8. **Only `run.skill` is valid.** Do not emit `run.tool`. If upstream
-   design text mentions commands or scripts, keep them in the node's
-   steps or `verify.command`, but write `run.skill`.
+8. **Only `run.skill` is valid.** If upstream design text mentions
+   commands or scripts, keep them in the node's steps or
+   `verify.command`, but write `run.skill`.
 
 9. **Portable `verify.command`.** Carry through only command gates that
    use POSIX shell builtins, common Linux/coreutils commands, `python3`

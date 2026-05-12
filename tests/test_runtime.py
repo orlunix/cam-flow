@@ -274,7 +274,7 @@ class TestValidate:
     def test_run_tool_rejected_even_with_skill(self):
         wf = self._wf(run={"skill": "x", "tool": "y"})
         errs = validate_workflow(wf)
-        assert any("run.tool: unsupported" in e for e in errs)
+        assert any("unsupported executor key 'tool'" in e for e in errs)
 
     def test_verify_criterion_xor_command(self):
         wf = self._wf(verify={"criterion": "x", "command": "y"})
@@ -316,7 +316,7 @@ class TestValidate:
         proj.mkdir()
         wf = self._wf(run={"tool": "scripts/noexec.sh"})
         errs = validate_workflow(wf, project_root=proj)
-        assert any("run.tool: unsupported" in e for e in errs)
+        assert any("unsupported executor key 'tool'" in e for e in errs)
 
     def test_verify_command_dependencies_ignore_general_linux_commands(self):
         wf = self._wf(verify={
@@ -1857,7 +1857,7 @@ class TestValidateTightenings:
     def test_run_tool_rejected(self):
         wf = self._wf(**{"run": {"tool": ""}})
         errs = validate_workflow(wf)
-        assert any("run.tool: unsupported" in e for e in errs)
+        assert any("unsupported executor key 'tool'" in e for e in errs)
 
     def test_non_string_verify_command_rejected(self):
         wf = self._wf(verify={"command": 42})
@@ -1928,7 +1928,7 @@ class TestValidateTightenings:
             }],
         }
         errs = validate_workflow(wf, project_root=tmp_path)
-        assert any("run.tool: unsupported" in e for e in errs)
+        assert any("unsupported executor key 'tool'" in e for e in errs)
         assert not any("not found or not" in e and "7" in e for e in errs)
 
     def test_empty_run_skill_with_project_root_no_typeerror(
@@ -2809,7 +2809,9 @@ class TestReplan:
         original_init = orig_workflow_cls.__init__
 
         def patched_init(self, spec, run_dir, *, resume=False,
-                         replan=False, project_root=None):
+                         replan=False, project_root=None,
+                         camflow_name=None, agent_phase=None,
+                         run_id=None):
             rd = Path(run_dir).resolve()
             if "planner-rev" in rd.name:
                 # Hand off to the stub by mutating self into a stub clone.
@@ -2819,7 +2821,10 @@ class TestReplan:
                 self.__dict__.update(stub.__dict__)
                 return
             original_init(self, spec, rd, resume=resume, replan=replan,
-                          project_root=project_root)
+                          project_root=project_root,
+                          camflow_name=camflow_name,
+                          agent_phase=agent_phase,
+                          run_id=run_id)
 
         monkeypatch.setattr(rt.Workflow, "__init__", patched_init)
 
@@ -3130,7 +3135,9 @@ class TestPhaseBAutoReplan:
                 pass
 
         def patched_init(self, spec, run_dir, *, resume=False,
-                         replan=False, project_root=None):
+                         replan=False, project_root=None,
+                         camflow_name=None, agent_phase=None,
+                         run_id=None):
             rd = Path(run_dir).resolve()
             if "planner-rev" in rd.name:
                 stub = _StubWorkflow(spec, rd, project_root=project_root,
@@ -3139,7 +3146,10 @@ class TestPhaseBAutoReplan:
                 self.__dict__.update(stub.__dict__)
                 return
             orig_init(self, spec, rd, resume=resume, replan=replan,
-                      project_root=project_root)
+                      project_root=project_root,
+                      camflow_name=camflow_name,
+                      agent_phase=agent_phase,
+                      run_id=run_id)
 
         monkeypatch.setattr(rt.Workflow, "__init__", patched_init)
 
@@ -3340,10 +3350,11 @@ class TestCLI:
 
 class TestAgentNaming:
     """Per `camc list`-readability ask: every CamFlow-spawned camc
-    child agent gets a short managed name cf__{flow}_{node}_a{N} for
-    work agents and cf__{flow}_{node}_v{N} for verifiers. Names are
-    for human readability only — the camc run-id tag remains the
-    cleanup/filter source of truth."""
+    child agent gets a short managed name
+    cf_{camflow_name}_{id4}_{phase}_{node}_a{N} for work agents and
+    cf_{camflow_name}_{id4}_{phase}_{node}_v{N} for verifiers. Names
+    are for human readability only. The camc tag is also short and
+    human-readable; full immutable run_id remains in run metadata."""
 
     # ── slug primitives ───────────────────────────────────────────────
 
@@ -3395,61 +3406,73 @@ class TestAgentNaming:
 
     def test_work_agent_name_shape(self):
         from runner.runtime import _make_agent_name
-        assert (_make_agent_name("planner", "understand", 1)
-                == "cf__planner_understand_a1")
+        assert (_make_agent_name("rvdbg", "run-7f3a", "pl",
+                                 "understand", 1)
+                == "cf_rvdbg_7f3a_pl_understand_a1")
 
     def test_verifier_agent_name_shape(self):
         from runner.runtime import _make_agent_name
-        assert (_make_agent_name("planner", "understand", 1, verifier=True)
-                == "cf__planner_understand_v1")
+        assert (_make_agent_name("rvdbg", "run-7f3a", "run",
+                                 "report", 1, verifier=True)
+                == "cf_rvdbg_7f3a_run_report_v1")
 
     def test_attempt_number_in_suffix(self):
         from runner.runtime import _make_agent_name
-        assert (_make_agent_name("planner", "design_dag", 3)
-                == "cf__planner_design_dag_a3")
-        assert (_make_agent_name("planner", "design_dag", 2, verifier=True)
-                == "cf__planner_design_dag_v2")
+        assert (_make_agent_name("rvdbg", "run-7f3a", "pl",
+                                 "design_dag", 3)
+                == "cf_rvdbg_7f3a_pl_design_a3")
+        assert (_make_agent_name("rvdbg", "run-7f3a", "pl",
+                                 "design_dag", 2, verifier=True)
+                == "cf_rvdbg_7f3a_pl_design_v2")
 
-    def test_fallback_flow_when_workflow_name_absent(self):
+    def test_fallback_name_when_camflow_name_absent(self):
         from runner.runtime import _make_agent_name
-        # Empty / None flow → fallback_flow gets slugged instead.
-        out = _make_agent_name(None, "x", 1, fallback_flow="run-abc-12")
-        assert out.startswith("cf__")
-        # The fallback flow's slug shows up in slot 2.
-        head, _, _ = out.rpartition("_a1")
-        # head is "cf__<flow>_x"
-        assert "x" in head and head.startswith("cf__")
-        # And it's NOT the literal "wf" placeholder.
-        assert "_wf_" not in head
+        out = _make_agent_name(None, "run-7f3a", "run", "x", 1,
+                               fallback_name="workflow-name")
+        assert out == "cf_workf_310d_7f3a_run_x_a1"
 
     def test_default_flow_when_no_input_at_all(self):
         from runner.runtime import _make_agent_name
-        out = _make_agent_name(None, "x", 1, fallback_flow="")
+        out = _make_agent_name(None, "run-7f3a", "run", "x", 1,
+                               fallback_name="")
         # Last-ditch fallback is the literal "wf" placeholder.
-        assert out == "cf__wf_x_a1"
+        assert out == "cf_wf_7f3a_run_x_a1"
 
     def test_long_node_id_truncates_with_hash(self):
         from runner.runtime import _make_agent_name
         out = _make_agent_name(
-            "f", "this_is_a_very_long_node_identifier", 1)
+            "f", "run-7f3a", "run", "this_is_a_very_long_node_identifier", 1)
         # The node slot is bounded; total stays short.
-        assert out.startswith("cf__f_")
-        head_after_flow = out[len("cf__f_"):]
-        # node_slug + "_a1" suffix
-        assert head_after_flow.endswith("_a1")
-        node_slug = head_after_flow[:-3]
+        assert out.startswith("cf_f_7f3a_run_")
+        assert out.endswith("_a1")
+        node_slug = out[len("cf_f_7f3a_run_"):-len("_a1")]
         assert len(node_slug) <= 14
 
-    def test_planner_examples_from_spec(self):
-        """The four examples the user gave verbatim."""
+    def test_planner_examples_are_truncation_friendly(self):
+        """Planner examples keep the node discriminator near the front."""
         from runner.runtime import _make_agent_name
-        assert (_make_agent_name("planner", "understand", 1)
-                == "cf__planner_understand_a1")
-        assert (_make_agent_name("planner", "understand", 1, verifier=True)
-                == "cf__planner_understand_v1")
-        # "design_dag" survives without truncation (10 chars under cap=14).
-        assert (_make_agent_name("planner", "design_dag", 1)
-                == "cf__planner_design_dag_a1")
+        assert (_make_agent_name("rvdbg", "20260511-120000-7f3a",
+                                 "pl", "understand", 1)
+                == "cf_rvdbg_7f3a_pl_understand_a1")
+        assert (_make_agent_name("rvdbg", "20260511-120000-7f3a",
+                                 "pl", "understand", 1, verifier=True)
+                == "cf_rvdbg_7f3a_pl_understand_v1")
+        assert (_make_agent_name("rvdbg", "20260511-120000-7f3a",
+                                 "pl", "design_dag", 1)
+                == "cf_rvdbg_7f3a_pl_design_a1")
+
+    def test_planner_names_differ_in_truncated_camc_column(self):
+        from runner.runtime import _make_agent_name
+        names = [
+            _make_agent_name("rvdbg", "run-7f3a", "pl", "understand", 1),
+            _make_agent_name("rvdbg", "run-7f3a", "pl", "design_dag", 1),
+            _make_agent_name("rvdbg", "run-7f3a", "pl", "render_yaml", 1),
+        ]
+        assert names == [
+            "cf_rvdbg_7f3a_pl_understand_a1",
+            "cf_rvdbg_7f3a_pl_design_a1",
+            "cf_rvdbg_7f3a_pl_render_a1",
+        ]
 
     # ── exec_skill + verify_with_agent integration ────────────────────
 
@@ -3464,7 +3487,7 @@ class TestAgentNaming:
     def test_exec_skill_calls_camc_with_managed_name(self, tmp_path,
                                                       monkeypatch):
         """Real exec_skill should invoke camc.run_and_collect with the
-        new cf__ name and the existing camflow:<run_id> tag."""
+        new cf_ name and the short human CamFlow tag."""
         from runner import runtime as rt
         captured: dict = {}
 
@@ -3487,10 +3510,11 @@ class TestAgentNaming:
         ws = tmp_path / "ws"
         ws.mkdir()
         rt.exec_skill("# skill", node, {}, ws, attempt_n=1,
-                      run_id_tag="camflow:run-9999",
-                      flow="planner", fallback_flow="run-9999")
-        assert captured["name"] == "cf__planner_understand_a1"
-        assert captured["tag"] == "camflow:run-9999"
+                      run_id_tag="cf:rvdbg:9999",
+                      camflow_name="rvdbg", run_id="run-9999",
+                      agent_phase="pl")
+        assert captured["name"] == "cf_rvdbg_9999_pl_understand_a1"
+        assert captured["tag"] == "cf:rvdbg:9999"
 
     def test_verify_with_agent_uses_v_suffix(self, tmp_path, monkeypatch):
         """Verify-agent path uses the same cf__ stem with _v<n>."""
@@ -3522,21 +3546,22 @@ class TestAgentNaming:
         wf_stub = type("W", (), {
             "run_dir": tmp_path,
             "spec": {"workflow": "planner"},
-            "tag": "camflow:run-1234",
+            "tag": "cf:rvdbg:1234",
             "goal": None,
             "run_id": "run-1234",
+            "camflow_name": "rvdbg",
+            "agent_phase": "pl",
         })()
 
         ok, _ = rt.verify_with_agent(node, wf_stub,
                                       {"status": "success"}, attempt_n=2)
         assert ok is True
-        assert captured["name"] == "cf__planner_understand_v2"
-        assert captured["tag"] == "camflow:run-1234"
+        assert captured["name"] == "cf_rvdbg_1234_pl_understand_v2"
+        assert captured["tag"] == "cf:rvdbg:1234"
 
-    def test_camc_tag_unchanged_in_full_run(self, tmp_path):
-        """Full skill-only run: every trace event still belongs to the
-        same camflow:<run_id> tag; this proves the cleanup/filter key
-        is preserved despite the agent-name change."""
+    def test_camc_tag_is_short_but_run_id_is_persisted(self, tmp_path):
+        """Full skill-only run uses a short human camc tag while keeping
+        the immutable run_id in run metadata."""
         from runner.runtime import Workflow
         proj = self._make_proj_with_skill(tmp_path)
         spec = {
@@ -3546,9 +3571,50 @@ class TestAgentNaming:
                        "output_schema": {"value": "integer"},
                        "verify": {"command": "true"}}],
         }
-        wf = Workflow(spec, proj / ".camflow" / "run")
-        # The camc tag is constructed from run_id and starts with
-        # "camflow:". This is what camc filters on; unchanged by the
-        # agent-name work.
-        assert wf.tag.startswith("camflow:")
-        assert wf.run_id and wf.run_id in wf.tag
+        rd = proj / ".camflow" / "run"
+        wf = Workflow(spec, rd, camflow_name="rvdbg")
+        assert wf.tag.startswith("cf:rvdbg:")
+        assert wf.run_id and wf.run_id not in wf.tag
+        meta = json.loads((rd / "run.json").read_text())
+        assert meta["run_id"] == wf.run_id
+        assert meta["tag"] == wf.tag
+        wf.cleanup()
+
+    def test_planner_and_user_workflows_can_share_camflow_id(self, tmp_path):
+        from runner.runtime import Workflow
+        proj = self._make_proj_with_skill(tmp_path)
+        spec = {
+            "workflow": "demo", "version": "1.1",
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"skill": "ok_skill"},
+                       "verify": {"command": "true"}}],
+        }
+        run_id = "20260511-120000-7f3a"
+        planner = Workflow(spec, proj / ".camflow" / "run" / "planner",
+                           camflow_name="rvdbg", agent_phase="pl",
+                           run_id=run_id)
+        user = Workflow(spec, proj / ".camflow" / "run",
+                        camflow_name="rvdbg", agent_phase="run",
+                        run_id=run_id)
+        assert planner.run_id == user.run_id == run_id
+        assert planner.tag == user.tag == "cf:rvdbg:7f3a"
+        planner.cleanup()
+        user.cleanup()
+
+    def test_workflow_persists_camflow_name_metadata(self, tmp_path):
+        from runner.runtime import Workflow, _summarize_status
+        proj = self._make_proj_with_skill(tmp_path)
+        rd = proj / ".camflow" / "run"
+        spec = {
+            "workflow": "demo", "version": "1.1",
+            "nodes": [{"id": "x", "goal": "g", "steps": ["s"],
+                       "run": {"skill": "ok_skill"},
+                       "verify": {"command": "true"}}],
+        }
+        wf = Workflow(spec, rd, camflow_name="rvdbg", agent_phase="run")
+        meta = json.loads((rd / "run.json").read_text())
+        assert meta["camflow_name"] == "rvdbg"
+        status = _summarize_status(rd)
+        assert status["camflow_name"] == "rvdbg"
+        assert status["run_id"] == wf.run_id
+        wf.cleanup()

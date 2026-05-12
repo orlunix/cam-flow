@@ -13,8 +13,8 @@ You run deterministic local commands or project scripts named in the node's
 steps, then write `agent_output.json`.
 
 Use this skill when a workflow needs a script-style audit or build step during
-the normal node run phase. CamFlow nodes do not use `run.tool`; command
-execution belongs inside a skill or inside `verify.command`.
+the normal node run phase. CamFlow nodes use skills as the run executor;
+command execution belongs inside a skill or inside `verify.command`.
 
 ## Rules
 
