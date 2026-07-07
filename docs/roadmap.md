@@ -1,6 +1,9 @@
-# cam-flow Strategic Roadmap
+# cam-flow Strategic Roadmap — v1.1 historical roadmap
 
-This is the definitive document for where cam-flow is going and why.
+> **Superseded for new design work.** This roadmap records the v1.1 CAM-phase implementation and proposed extensions. The v1.2 design rejects mandatory planning, mutable state, dynamic control flow, and autonomous replanning. Use [`strategy.md`](strategy.md) and [`design-v1.2.md`](design-v1.2.md) for the current direction.
+
+
+This is the historical record of the v1.1 direction and its rationale; it is not authoritative for v1.2 design work.
 It reflects the CLI and CAM phase work already shipped, the critical
 gaps identified against real workflow demands (calculator demo, RTL
 hardware verification), a deep investigation of Hermes Agent (Nous

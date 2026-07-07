@@ -1,5 +1,8 @@
 # Next-Phase CamFlow Design — Steward + Smooth Mode + Trust Model
 
+> **Historical v1.1 proposal.** Smooth mode, a persistent Steward, and mandatory/default Planner orchestration are outside the v1.2 runner design. This document remains for rationale only; see [`design-v1.2.md`](design-v1.2.md) for the current specification.
+
+
 **Status**: Phase 1 design spec — final revision before implementation.
 **Author**: camflow-dev (claude opus 4.7)
 **Date**: 2026-04-25, last revised 2026-04-26

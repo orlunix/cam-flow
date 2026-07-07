@@ -1,4 +1,7 @@
-# cam-flow Architecture Reference
+# cam-flow Architecture Reference — v1.1 implementation
+
+> **Historical implementation reference.** This document maps the current v1.1 codebase. It is not the design authority for new work; see [`strategy.md`](strategy.md) and [`design-v1.2.md`](design-v1.2.md). Its stateful graph and transition details are migration context, not v1.2 API.
+
 
 > **For strategy — how cam-flow works, and why — read
 > [`strategy.md`](strategy.md) first.** This document is the

@@ -1,5 +1,8 @@
 # cam-flow
 
+> **v1.2 design draft:** CamFlow is being redesigned as a small prompt-call-verify-trace runner for checked-in static DAG workflows. See [`docs/strategy.md`](docs/strategy.md) and [`docs/design-v1.2.md`](docs/design-v1.2.md). The implementation details below describe the existing v1.1 runtime and remain migration reference until v1.2 lands.
+
+
 Lightweight stateful workflow engine for agent execution.
 
 Designed for workflows that are **not** well modeled as pure DAGs:
