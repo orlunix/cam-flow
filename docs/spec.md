@@ -1,4 +1,7 @@
-# camflow spec v1.1
+# camflow spec v1.1 — historical implementation specification
+
+> **Superseded for new design work.** The v1.2 prompt-call-verify-trace runner design is defined in [`design-v1.2.md`](design-v1.2.md). This document records the current v1.1 implementation and is retained for migration reference until the v1.2 implementation lands.
+
 
 A self-hosting, prompt-driven workflow runner for multi-agent DAGs.
 **One verb. Two classes. Strict contracts. Same interface as `camc`.**
