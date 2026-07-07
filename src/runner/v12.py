@@ -6,6 +6,7 @@ import glob
 import json
 import re
 import sys
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -73,7 +74,7 @@ def validate_workflow(spec: Any, root: Path) -> list[str]:
         run = node.get("run")
         if not isinstance(run, dict) or set(run) != {"skill"}: errors.append(f"{p}.run: must contain exactly skill")
         elif not isinstance(run["skill"], str) or not run["skill"].strip(): errors.append(f"{p}.run.skill: required string")
-        elif not _resolve_skill_path(run["skill"], root): errors.append(f"{p}.run.skill: {run['skill']!r} not found")
+        elif not (root / "skills" / run["skill"] / "SKILL.md").is_file(): errors.append(f"{p}.run.skill: {run['skill']!r} not found in local skills/")
         output = node.get("output_schema", {})
         if not isinstance(output, dict): errors.append(f"{p}.output_schema: must be an object")
         else:
@@ -192,7 +193,98 @@ def cmd_batch(argv: list[str]) -> int:
     return code
 
 
+
 def cmd_plan(argv: list[str]) -> int:
-    p = argparse.ArgumentParser(prog="camflow plan"); p.add_argument("prompt"); p.add_argument("--out", required=True); p.parse_args(argv)
-    print("ERROR: no v1.2 Planner adapter is configured; write workflow.yaml directly.", file=sys.stderr)
-    return 1
+    parser = argparse.ArgumentParser(prog="camflow plan")
+    parser.add_argument("prompt")
+    parser.add_argument("--out", required=True)
+    args = parser.parse_args(argv)
+    fields = {
+        key: value.strip('"')
+        for key, value in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)", args.prompt)
+    }
+    required = ["case_id", "sim_log", "trace_log"]
+    missing = [key for key in required if not fields.get(key)]
+    if missing:
+        print("ERROR: cannot generate real input.json.\nMissing required fields:\n" + "\n".join(f"  - {key}" for key in missing), file=sys.stderr)
+        return 1
+    out = Path(args.out).resolve()
+    if out.exists() and any(out.iterdir()):
+        print(f"ERROR: plan output directory is not empty: {out}", file=sys.stderr)
+        return 1
+    out.mkdir(parents=True, exist_ok=True)
+    input_schema = {key: "string" for key in fields}
+    workflow = {
+        "workflow": "generated_debug_plan", "version": "1.2", "goal": args.prompt,
+        "input_schema": input_schema,
+        "nodes": [{"id": "investigate", "goal": "Inspect the supplied case and produce evidence-backed findings.", "steps": ["Read Workflow Input.", "Inspect referenced logs.", "Record concrete evidence and next actions."], "run": {"skill": "investigator"}, "output_schema": {"evidence": "array"}, "retry": 1}],
+    }
+    (out / "workflow.yaml").write_text(yaml.safe_dump(workflow, sort_keys=False))
+    (out / "input.json").write_text(json.dumps(fields, indent=2) + "\n")
+    (out / "input.template.json").write_text(json.dumps(input_schema, indent=2) + "\n")
+    skill = out / "skills" / "investigator"
+    skill.mkdir(parents=True, exist_ok=True)
+    (skill / "SKILL.md").write_text("# Investigator\n\nInspect the workflow input and report only evidence-backed findings.\n")
+    (out / "README.md").write_text("# Generated CamFlow plan\n\nEdit workflow.yaml, input.json, skills/, and validators/ before running.\n")
+    manifest = {"generated_by": "camflow plan", "runnable": True, "input_fields": sorted(fields), "workflow": "workflow.yaml"}
+    (out / "plan_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    return 0
+
+def cmd_pack(argv: list[str]) -> int:
+    """Create a reusable directory bundle; never archive, install, or lock it."""
+    parser = argparse.ArgumentParser(prog="camflow pack")
+    parser.add_argument("source_dir")
+    parser.add_argument("--out", required=True)
+    args = parser.parse_args(argv)
+    source = Path(args.source_dir).resolve()
+    target = Path(args.out).resolve()
+    if target.exists() and any(target.iterdir()):
+        print(f"ERROR: output directory is not empty: {target}", file=sys.stderr)
+        return 1
+    workflow = source / "workflow.yaml"
+    template = source / "input.template.json"
+    if not workflow.is_file():
+        print("ERROR: missing workflow.yaml", file=sys.stderr)
+        return 1
+    if not template.is_file():
+        print("ERROR: missing input.template.json", file=sys.stderr)
+        return 1
+    try:
+        spec, _root = load_spec(workflow)
+        template_data = json.loads(template.read_text())
+        if not isinstance(template_data, dict):
+            raise ValueError("input.template.json: top level must be an object")
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    target.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(workflow, target / "workflow.yaml")
+    shutil.copy2(template, target / "input.template.json")
+    if (source / "README.md").is_file():
+        shutil.copy2(source / "README.md", target / "README.md")
+    skill_names = []
+    for node in spec["nodes"]:
+        name = node["run"]["skill"]
+        if name not in skill_names:
+            skill_names.append(name)
+    for name in skill_names:
+        src = source / "skills" / name / "SKILL.md"
+        if not src.is_file():
+            shutil.rmtree(target, ignore_errors=True)
+            print(f"ERROR: missing skill file: skills/{name}/SKILL.md", file=sys.stderr)
+            return 1
+        dst = target / "skills" / name
+        dst.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst / "SKILL.md")
+    if (source / "validators").is_dir():
+        shutil.copytree(source / "validators", target / "validators", dirs_exist_ok=True)
+    manifest = {
+        "package_schema": "simple-v1",
+        "name": target.name,
+        "created_by": "camflow pack",
+        "entry": "workflow.yaml",
+        "input_template": "input.template.json",
+        "skills_dir": "skills",
+    }
+    (target / "package_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    return 0

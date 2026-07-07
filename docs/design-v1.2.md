@@ -1158,3 +1158,40 @@ nodes:
 ```bash
 camflow run workflows/core_hang.yaml --input cases/rv_rand_001.json
 ```
+
+---
+
+## Appendix: Simple plan / pack / run interface
+
+CamFlow v1.2 uses three narrow user-facing actions:
+
+```text
+plan = generate editable artifacts
+pack = clean-copy reusable authoring artifacts
+run  = execute a workflow with a real input
+```
+
+`camflow plan "<intent>" --out DIR` creates ordinary editable files. When it
+has the required case data it writes `workflow.yaml`, a real `input.json`, an
+`input.template.json`, local `skills/`, `README.md`, and `plan_manifest.json`.
+When required input is unavailable it fails explicitly; placeholders belong
+only in `input.template.json`.
+
+`camflow pack SOURCE_DIR --out PACKAGE_DIR` creates a simple reusable
+directory bundle. It copies only `workflow.yaml`, `input.template.json`, local
+referenced `skills/*/SKILL.md`, optional `validators/`, optional `README.md`,
+and `package_manifest.json`. It excludes per-run input and outputs, including
+`input.json`, trace files, node attempts, reports, logs, waveforms, virtual
+environments, and build directories. It is not an archive format, registry,
+installer, lockfile, or package-specific runtime.
+
+```bash
+camflow plan "debug hang case_id=bug_001 sim_log=/runs/sim.log trace_log=/runs/trace.log" --out .camflow/plan/core_hang
+camflow pack .camflow/plan/core_hang --out packages/core_hang
+camflow run packages/core_hang/workflow.yaml --input cases/bug_001.json --out runs/bug_001
+camflow batch packages/core_hang/workflow.yaml --inputs "cases/*.json" --out runs/core_hang_batch
+```
+
+`run` and `batch` execute exactly the supplied workflow and real inputs. They
+never implicitly plan, pack, install, generate missing skills, or fall back to
+unrelated host skills.

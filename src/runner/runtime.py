@@ -4192,6 +4192,9 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "plan":
         from . import v12
         return v12.cmd_plan(argv[1:])
+    if cmd == "pack":
+        from . import v12
+        return v12.cmd_pack(argv[1:])
     if cmd == "resume":
         return _cmd_resume(argv[1:])
     if cmd == "status":

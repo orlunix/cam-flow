@@ -60,3 +60,32 @@ def test_v12_rerun_mode_does_not_expose_dag_revision(tmp_path, monkeypatch):
     monkeypatch.setattr(rt.camc, "run_and_collect", fake)
     assert rt._do_rerun(run, "n", "", None) == 0
     assert "dag_revision" not in seen[0]
+
+
+def test_pack_copies_only_reusable_artifacts(tmp_path):
+    source = tmp_path / "plan"
+    skill = source / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# demo\n")
+    (source / "workflow.yaml").write_text("workflow: demo\nversion: '1.2'\nnodes:\n  - id: n\n    goal: g\n    steps: [s]\n    run: {skill: demo}\n")
+    (source / "input.template.json").write_text('{"case_id": "string"}')
+    (source / "input.json").write_text('{"case_id": "real"}')
+    (source / "trace.jsonl").write_text('{}\n')
+    output = tmp_path / "bundle"
+    assert v12.cmd_pack([str(source), "--out", str(output)]) == 0
+    assert (output / "workflow.yaml").is_file()
+    assert (output / "skills" / "demo" / "SKILL.md").is_file()
+    assert (output / "package_manifest.json").is_file()
+    assert not (output / "input.json").exists()
+    assert not (output / "trace.jsonl").exists()
+
+
+def test_plan_generates_editable_artifacts_or_fails_for_missing_input(tmp_path, capsys):
+    assert v12.cmd_plan(["debug hang case_id=bug_1 sim_log=/x/sim.log trace_log=/x/trace.log", "--out", str(tmp_path / "plan")]) == 0
+    plan = tmp_path / "plan"
+    assert (plan / "workflow.yaml").is_file()
+    assert (plan / "input.json").is_file()
+    assert (plan / "input.template.json").is_file()
+    assert (plan / "skills" / "investigator" / "SKILL.md").is_file()
+    assert v12.cmd_plan(["debug hang case_id=bug_1", "--out", str(tmp_path / "bad")]) == 1
+    assert "Missing required fields" in capsys.readouterr().err
