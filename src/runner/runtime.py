@@ -48,7 +48,7 @@ from .assets import (
 # ═══════════════════════════════════════════════════════════════════════
 
 VALID_STATUSES = frozenset({"success", "fail"})
-VALID_TYPES = frozenset({"string", "integer", "number", "boolean", "array"})
+VALID_TYPES = frozenset({"string", "integer", "number", "boolean", "array", "object"})
 
 OUTPUT_FILENAME = "agent_output.json"
 
@@ -1119,6 +1119,9 @@ def build_run_prompt(node: "Node", input_dict: dict,
         parts.append(f"# Workflow Goal\n{workflow_goal.strip()}")
     if workflow_context and workflow_context.strip():
         parts.append(f"# Workflow Context\n{workflow_context.strip()}")
+    run_input = input_dict.get("run_input")
+    if run_input is not None:
+        parts.append("# Workflow Input\n```json\n" + json.dumps(run_input, indent=2, ensure_ascii=False) + "\n```")
     parts.append(f"# Goal\n{node.goal}")
     parts.append(
         "# Steps (you MUST do these, in order)\n"
@@ -1636,6 +1639,14 @@ class Node:
             if up is not None and up.output is not None:
                 upstream[dep_id] = up.output
         rendered: dict = {}
+        run_input = getattr(workflow, "run_input", None)
+        if run_input is None and (workflow.run_dir / "input.json").is_file():
+            try:
+                run_input = json.loads((workflow.run_dir / "input.json").read_text())
+            except json.JSONDecodeError:
+                pass
+        if run_input is not None:
+            rendered["run_input"] = run_input
         if upstream:
             rendered["upstream"] = upstream
         if attempt_n > 1 and self.history:
@@ -4130,6 +4141,9 @@ def _cmd_status(argv: list[str]) -> int:
 def main(argv: list[str] | None = None) -> int:
     argv = list(argv) if argv is not None else sys.argv[1:]
     if not argv or argv[0] in ("-h", "--help"):
+        print("camflow — prompt-call-verify-trace runner\n\nUsage:\n  camflow run <workflow.yaml> [--input input.json] [--run-dir DIR] [--steps N]\n  camflow run --from NODE --run-dir DIR [--feedback TEXT]\n  camflow batch <workflow.yaml> --inputs GLOB --out DIR [--continue-on-fail]\n  camflow resume <run_dir> [--feedback TEXT] [--steps N]\n  camflow plan <prompt> --out workflow.yaml\n  camflow status [--run-dir DIR]", file=sys.stderr)
+        return 0 if argv else 1
+    if not argv or argv[0] in ("-h", "--help"):
         print(
             "camflow — prompt-driven, multi-agent workflow runner\n"
             "\n"
@@ -4167,17 +4181,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if argv else 1
     cmd = argv[0]
     if cmd == "run":
-        return _cmd_run(argv[1:])
+        from . import v12
+        return v12.cmd_run(argv[1:])
+    if cmd == "batch":
+        from . import v12
+        return v12.cmd_batch(argv[1:])
+    if cmd == "plan":
+        from . import v12
+        return v12.cmd_plan(argv[1:])
     if cmd == "resume":
         return _cmd_resume(argv[1:])
-    if cmd == "replan":
-        return _cmd_replan(argv[1:])
-    if cmd == "package":
-        return _cmd_package(argv[1:])
     if cmd == "status":
         return _cmd_status(argv[1:])
-    if cmd == "_validate-compiled-workflow":
-        return _cmd_validate_compiled_workflow(argv[1:])
     print(f"ERROR: unknown subcommand '{cmd}'. "
           f"Try `camflow --help`.", file=sys.stderr)
     return 1
