@@ -37,3 +37,26 @@ def test_prompt_contains_workflow_input():
 def test_case_slug_and_collision_safe_name(tmp_path):
     assert v12.case_slug("raw/path:1", "fallback") == "raw_path_1"
     assert v12.case_slug("../", "fallback") == "case"
+
+
+def test_v12_rerun_mode_does_not_expose_dag_revision(tmp_path, monkeypatch):
+    from runner import runtime as rt
+    root = tmp_path
+    skill = root / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# demo\n")
+    run = root / "run"
+    spec = {"workflow": "x", "version": "1.2", "nodes": [{"id": "n", "goal": "g", "steps": ["s"], "run": {"skill": "demo"}, "verify": {"command": "true"}}]}
+    (run / "nodes" / "n" / "attempt-1").mkdir(parents=True)
+    (run / "workflow.yaml").write_text(json.dumps(spec))
+    (run / "input.json").write_text(json.dumps({"case_id": "c"}))
+    (run / "nodes" / "n" / "attempt-1" / "output.json").write_text(json.dumps({"status": "success", "data": {}, "error": None, "feedback": None, "request_human": False}))
+    seen = []
+    def fake(**kw):
+        seen.append(json.loads((Path(kw["workspace"]) / "input.json").read_text()))
+        env = {"status": "success", "data": {}, "error": None, "feedback": None, "request_human": False}
+        (Path(kw["workspace"]) / kw["output_file"]).write_text(json.dumps(env))
+        return "agent", env
+    monkeypatch.setattr(rt.camc, "run_and_collect", fake)
+    assert rt._do_rerun(run, "n", "", None) == 0
+    assert "dag_revision" not in seen[0]

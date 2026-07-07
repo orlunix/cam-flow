@@ -2336,6 +2336,7 @@ def _cmd_resume(argv: list[str]) -> int:
     workflow = yaml.safe_load((rd / "workflow.yaml").read_text())
 
     wf = Workflow(workflow, rd, resume=True)
+    wf.v12_mode = workflow.get("version") == "1.2"
     # Replay history.
     summary = _summarize_run(rd)
     for nrec in summary["nodes"]:
@@ -2474,6 +2475,7 @@ def _do_rerun(rd: Path, node_id: str, feedback: str,
     workflow = yaml.safe_load(wf_path.read_text())
 
     wf = Workflow(workflow, rd, resume=True, camflow_name=camflow_name)
+    wf.v12_mode = workflow.get("version") == "1.2"
 
     # Replay history (same as resume).
     summary = _summarize_run(rd)
