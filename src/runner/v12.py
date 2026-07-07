@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -114,7 +115,10 @@ def load_spec(path: Path) -> tuple[dict, Path]:
 
 
 def load_input(path: str | None, schema: Any) -> tuple[dict | None, str | None]:
-    if path is None: return None, None
+    if path is None:
+        if schema:
+            raise ValueError("workflow declares input_schema; --input is required")
+        return None, None
     try: text = Path(path).read_text(); data = json.loads(text)
     except (OSError, json.JSONDecodeError) as exc: raise ValueError(f"cannot load input.json: {exc}") from exc
     if not isinstance(data, dict): raise ValueError("input.json: top level must be an object")
@@ -128,6 +132,7 @@ def execute(spec: dict, run_dir: Path, root: Path, run_input: dict | None, input
     run_dir.mkdir(parents=True, exist_ok=True)
     if input_text is not None: (run_dir / "input.json").write_text(input_text)
     workflow = rt.Workflow(spec, run_dir, project_root=root)
+    workflow.v12_mode = True
     workflow.run_input = run_input
     workflow.trace("workflow_started", run_id=workflow.run_id, camflow_name=workflow.camflow_name, workflow_source={"type": "checked_in", "planner_invoked": False})
     try: return workflow.execute_dag(max_attempts=steps)
@@ -150,6 +155,11 @@ def cmd_run(argv: list[str]) -> int:
     return rt._result_to_exit(execute(spec, run_dir, root, data, text, a.steps))
 
 
+def case_slug(case_id: str, fallback: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", case_id or fallback).strip("._-")
+    return slug or "case"
+
+
 def cmd_batch(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="camflow batch"); p.add_argument("workflow"); p.add_argument("--inputs", required=True); p.add_argument("--out", required=True); p.add_argument("--continue-on-fail", action="store_true")
     a = p.parse_args(argv)
@@ -166,8 +176,17 @@ def cmd_batch(argv: list[str]) -> int:
             summary.append({"case_id": path.stem, "status": "error", "exit_code": 1, "error": str(exc)}); code = 1
             if not a.continue_on_fail: break
             continue
-        case_id = str((data or {}).get("case_id") or path.stem); result = execute(spec, runs / case_id, root, data, text, None); exit_code = rt._result_to_exit(result)
-        summary.append({"case_id": case_id, "status": result, "exit_code": exit_code, "run_dir": str(runs / case_id)}); code = code or exit_code
+        raw_case_id = str((data or {}).get("case_id") or path.stem)
+        run_name = case_slug(raw_case_id, path.stem)
+        candidate = run_name
+        suffix = 2
+        while (runs / candidate).exists():
+            candidate = f"{run_name}-{suffix}"
+            suffix += 1
+        result = execute(spec, runs / candidate, root, data, text, None)
+        exit_code = rt._result_to_exit(result)
+        summary.append({"case_id": raw_case_id, "run_name": candidate, "status": result, "exit_code": exit_code, "run_dir": str(runs / candidate)})
+        code = code or exit_code
         if exit_code and not a.continue_on_fail: break
     meta["completed_at"] = rt.utcnow_iso(); (batch / "batch.json").write_text(json.dumps(meta, indent=2) + "\n"); (batch / "summary.json").write_text(json.dumps(summary, indent=2) + "\n"); (batch / "summary.md").write_text("# CamFlow batch summary\n\n" + "\n".join(f"- {x['case_id']}: {x['status']} ({x['exit_code']})" for x in summary) + "\n")
     return code

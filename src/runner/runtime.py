@@ -1364,6 +1364,7 @@ def auto_schema_check(envelope: dict, schema: dict) -> tuple[bool, str]:
         "number":  lambda v: isinstance(v, bool) is False and isinstance(v, (int, float)),
         "boolean": lambda v: isinstance(v, bool),
         "array":   lambda v: isinstance(v, list),
+        "object":  lambda v: isinstance(v, dict),
     }
     for key, ftype in schema.items():
         if key not in data:
@@ -1652,9 +1653,9 @@ class Node:
         if attempt_n > 1 and self.history:
             rendered["previous"] = self.history[-1]
         # Tools that talk to external systems (e.g. an oracle that
-        # tracks dag_revisions) need to know which DAG revision is
-        # active. Skill agents reading input.json get the same signal.
-        rendered["dag_revision"] = workflow.dag_revision
+        # v1.2 has a static DAG and intentionally does not expose revisions.
+        if not getattr(workflow, "v12_mode", False):
+            rendered["dag_revision"] = workflow.dag_revision
         (att_dir / "input.json").write_text(
             json.dumps(rendered, indent=2, ensure_ascii=False)
         )

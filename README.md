@@ -1,23 +1,19 @@
 # camflow
 
-> **v1.2 design draft:** CamFlow is being redesigned as a small prompt-call-verify-trace runner for checked-in static DAG workflows. The normative draft is [`docs/design-v1.2.md`](docs/design-v1.2.md). The implementation details below describe the current v1.1 runtime and remain migration reference until v1.2 lands.
+A thin prompt-call-verify-trace runner for checked-in, static v1.2 workflows.
 
+## Run
 
-> Self-hosting, prompt-driven multi-agent workflow runner.
-
+```bash
+camflow run workflow.yaml --input input.json
+camflow batch workflow.yaml --inputs "cases/*.json" --out runs/batch-001
+camflow run --from analyze_lsu --run-dir runs/case-001
+camflow resume runs/case-001 --feedback "check the timeout window"
 ```
-camc    run "<prompt>"  →  one agent runs alone, hopes for the best
-camflow run "<prompt>"  →  a builtin Planner workflow compiles the
-                           prompt into a DAG of high-quality, verified
-                           nodes — then a Runtime executes that DAG
-```
 
-camflow's user surface is the same shape as `camc run`: one mandatory
-prompt, no flags to learn. The difference is what happens after — a
-builtin Planner workflow turns the prompt into a `workflow.yaml` that
-the runtime executes node-by-node, with retry + verify on every step.
+`workflow.yaml` is the canonical input. `input.json` is read-only per-run context; when a workflow declares `input_schema`, `--input` is required. Planner support is optional and no v1.2 Planner adapter is currently configured.
 
-The workflow.yaml is a compiler output, not something you author.
+See [`docs/design-v1.2.md`](docs/design-v1.2.md) for the specification.
 
 ## Install
 
