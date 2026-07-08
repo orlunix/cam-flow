@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import time
 
+from camflow_pkg import _EMBEDDED_ASSETS, _EMBEDDED_SKILLS
 from camflow_pkg.contracts import validate_envelope
 
 

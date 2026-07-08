@@ -89,6 +89,28 @@ def _literal_assignments(variable, values):
     return lines
 
 
+
+
+def asset_module_source():
+    """Return the installable Python 3.6 builtin-asset module."""
+    parts = [
+        '"""Generated builtin CamFlow assets. Do not edit directly."""',
+        "from __future__ import print_function",
+        "",
+        "_EMBEDDED_SKILLS = {}",
+        "_EMBEDDED_ASSETS = {}",
+        "",
+        "def _embedded_text(lines, trailing_newline):",
+        "    text = \"\\n\".join(lines)",
+        "    return text + (\"\\n\" if trailing_newline else \"\")",
+        "",
+        "EMBEDDED_SKILLS = {}",
+        "EMBEDDED_ASSETS = {}",
+        "",
+    ]
+    parts.extend(_literal_assignments("EMBEDDED_SKILLS", _embedded_skills()))
+    parts.extend(_literal_assignments("EMBEDDED_ASSETS", _embedded_assets()))
+    return "\n".join(parts) + "\n"
 def _build_stamp():
     try:
         sha = subprocess.check_output(
@@ -112,6 +134,9 @@ def build():
         "Edit src/camflow_pkg/ and rebuild.",
         '\"\"\"',
         "",
+        "_EMBEDDED_SKILLS = {}",
+        "_EMBEDDED_ASSETS = {}",
+        "",
         "def _embedded_text(lines, trailing_newline):",
         "    text = \"\\n\".join(lines)",
         "    return text + (\"\\n\" if trailing_newline else \"\")",
@@ -131,7 +156,12 @@ def build():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", "-o", default=os.path.join(DIST, "camflow"))
+    parser.add_argument("--write-assets", action="store_true", help="write src/camflow_pkg/embedded_assets.py")
     args = parser.parse_args()
+    if args.write_assets:
+        with open(os.path.join(PKG, "embedded_assets.py"), "w") as handle:
+            handle.write(asset_module_source())
+        print("Wrote %s" % os.path.join(PKG, "embedded_assets.py"))
     output = build()
     parent = os.path.dirname(os.path.abspath(args.output))
     if not os.path.isdir(parent):

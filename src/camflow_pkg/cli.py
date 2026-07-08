@@ -9,6 +9,7 @@ import re
 import shutil
 import sys
 
+from camflow_pkg import __build__, __version__
 from camflow_pkg.contracts import validate_input, validate_workflow
 from camflow_pkg.engine import _ensure_embedded_assets, _ensure_embedded_skills, _trace, execute, recover
 from camflow_pkg.yaml_lite import YamlError, dumps, loads

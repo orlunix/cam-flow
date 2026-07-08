@@ -4,23 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "camflow"
-version = "1.1.0"
-description = "Self-hosting, prompt-driven multi-agent workflow runner — Planner compiles a prompt into a verified DAG"
+version = "1.2.0"
+description = "Thin prompt-call-verify-trace runner for static v1.2 workflows"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.6"
 license = { file = "LICENSE" }
-dependencies = [
-    "pyyaml>=6.0",
-]
+dependencies = []
 
 [project.optional-dependencies]
-test = ["pytest>=8.0"]
+test = ["pytest>=6.0"]
 
 [project.scripts]
-camflow = "runner.runtime:main"
+camflow = "camflow_pkg.cli:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["camflow_pkg*"]
