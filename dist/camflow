@@ -19,7 +19,7 @@ def _embedded_text(lines, trailing_newline):
 # __init__
 # ========================================================================
 __version__ = "1.2.0"
-__build__ = "1d217bf 2026-07-08 10:12 UTC"
+__build__ = "e613b46 2026-07-08 10:15 UTC"
 
 # Installed Python packages use the generated readable asset module.  The
 # standalone builder runs with no package and replaces the empty mappings.
@@ -696,6 +696,9 @@ def _snapshot_run(spec, source_root, workflow_path, run_dir, input_path):
         name = node["run"]["skill"]
         if name not in names:
             names.append(name)
+        verify = node.get("verify") or {}
+        if not os.environ.get("CAMFLOW_EXECUTOR") and (not verify or "criterion" in verify) and "evaluator" not in names:
+            names.append("evaluator")
     for name in names:
         source = os.path.join(source_root, "skills", name)
         if not os.path.isdir(source):

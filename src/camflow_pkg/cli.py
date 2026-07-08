@@ -77,6 +77,9 @@ def _snapshot_run(spec, source_root, workflow_path, run_dir, input_path):
         name = node["run"]["skill"]
         if name not in names:
             names.append(name)
+        verify = node.get("verify") or {}
+        if not os.environ.get("CAMFLOW_EXECUTOR") and (not verify or "criterion" in verify) and "evaluator" not in names:
+            names.append("evaluator")
     for name in names:
         source = os.path.join(source_root, "skills", name)
         if not os.path.isdir(source):
