@@ -29,13 +29,34 @@ def validate_input(data, schema):
     return errors
 
 
+def _validate_verify(value, prefix, errors):
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        errors.append(prefix + ".verify: must be object")
+        return
+    forms = [key for key in ("criterion", "command", "human") if key in value]
+    if len(forms) != 1 or set(value) - set(["criterion", "command", "human", "timeout"]):
+        errors.append(prefix + ".verify: must specify exactly one of criterion, command, human")
+        return
+    form = forms[0]
+    if not isinstance(value[form], str) or not value[form].strip():
+        errors.append(prefix + ".verify.%s: required non-empty string" % form)
+    if "timeout" in value:
+        timeout = value["timeout"]
+        if form != "command" or not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:
+            errors.append(prefix + ".verify.timeout: requires command and positive integer")
+
+
 def validate_workflow(spec, root):
     errors = []
     if not isinstance(spec, dict): return ["workflow is not an object"]
     unknown = set(spec) - TOP_KEYS
     if unknown: errors.append("workflow: unknown keys %s" % sorted(unknown))
-    if not isinstance(spec.get("workflow"), str): errors.append("workflow.workflow: required string")
+    if not isinstance(spec.get("workflow"), str) or not spec.get("workflow", "").strip(): errors.append("workflow.workflow: required string")
     if spec.get("version") != "1.2": errors.append('workflow.version: must be "1.2"')
+    for key in ("goal", "context"):
+        if key in spec and not isinstance(spec[key], str): errors.append("workflow.%s: must be string" % key)
     schema = spec.get("input_schema", {})
     if not isinstance(schema, dict): errors.append("workflow.input_schema: must be object"); schema = {}
     for key, kind in schema.items():
@@ -63,8 +84,12 @@ def validate_workflow(spec, root):
         elif not os.path.isfile(os.path.join(root, "skills", run["skill"], "SKILL.md")): errors.append(prefix + ".run.skill: local SKILL.md missing")
         retry = node.get("retry", 1)
         if not isinstance(retry, int) or isinstance(retry, bool) or retry < 0: errors.append(prefix + ".retry: non-negative integer")
-        for key, kind in (node.get("output_schema") or {}).items():
-            if not isinstance(key, str) or kind not in TYPES: errors.append(prefix + ".output_schema: invalid field")
+        output = node.get("output_schema", {})
+        if not isinstance(output, dict): errors.append(prefix + ".output_schema: must be object")
+        else:
+            for key, kind in output.items():
+                if not isinstance(key, str) or not key or kind not in TYPES: errors.append(prefix + ".output_schema: invalid field")
+        _validate_verify(node.get("verify"), prefix, errors)
     if len(ids) != len(set(ids)): errors.append("workflow.nodes: duplicate ids")
     known = set(ids)
     for node_id, needs in graph.items():
@@ -86,9 +111,11 @@ def validate_envelope(envelope, schema):
     if not isinstance(envelope, dict): return "envelope must be object"
     if envelope.get("status") not in ("success", "fail"): return "invalid envelope status"
     if not isinstance(envelope.get("data", {}), dict): return "envelope.data must be object"
+    if "request_human" in envelope and not isinstance(envelope["request_human"], bool): return "envelope.request_human must be boolean"
+    if "feedback" in envelope and envelope["feedback"] is not None and not isinstance(envelope["feedback"], str): return "envelope.feedback must be string or null"
     if envelope["status"] == "fail":
         error = envelope.get("error")
-        if not isinstance(error, dict) or not error.get("code") or not error.get("message"): return "fail envelope needs error.code and error.message"
+        if not isinstance(error, dict) or not isinstance(error.get("code"), str) or not error["code"] or not isinstance(error.get("message"), str) or not error["message"]: return "fail envelope needs error.code and error.message"
     for key, kind in (schema or {}).items():
         if key not in envelope.get("data", {}): return "schema missing field %s" % key
         if not type_matches(envelope["data"][key], kind): return "schema wrong type for %s" % key
