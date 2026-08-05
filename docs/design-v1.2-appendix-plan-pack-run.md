@@ -266,7 +266,8 @@ input_schema mismatch        -> ERROR
 skill missing                -> ERROR
 SKILL.md missing             -> ERROR
 unknown workflow key         -> ERROR
-next/goto/route/when present -> ERROR
+next/goto/routes present      -> ERROR
+invalid restricted when      -> ERROR
 ```
 
 `run` must not silently call `plan`.

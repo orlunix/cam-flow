@@ -24,7 +24,7 @@ MODULE_ORDER = ["__init__", "yaml_lite", "contracts", "engine", "cli"]
 
 
 def _read(name):
-    with open(os.path.join(PKG, name + ".py"), "r") as handle:
+    with open(os.path.join(PKG, name + ".py"), "r", encoding="utf-8") as handle:
         return handle.read()
 
 
@@ -58,7 +58,7 @@ def _embedded_skills():
         for name in sorted(os.listdir(root)):
             path = os.path.join(root, name, "SKILL.md")
             if os.path.isfile(path) and name not in found:
-                with open(path, "r") as handle:
+                with open(path, "r", encoding="utf-8") as handle:
                     found[name] = handle.read()
     return found
 
@@ -73,7 +73,7 @@ def _embedded_assets():
         for name in sorted(names):
             path = os.path.join(parent, name)
             relative = os.path.relpath(path, ROOT).replace(os.sep, "/")
-            with open(path, "r") as handle:
+            with open(path, "r", encoding="utf-8") as handle:
                 found[relative] = handle.read()
     return found
 
@@ -159,14 +159,14 @@ def main():
     parser.add_argument("--write-assets", action="store_true", help="write src/camflow_pkg/embedded_assets.py")
     args = parser.parse_args()
     if args.write_assets:
-        with open(os.path.join(PKG, "embedded_assets.py"), "w") as handle:
+        with open(os.path.join(PKG, "embedded_assets.py"), "w", encoding="utf-8", newline="\n") as handle:
             handle.write(asset_module_source())
         print("Wrote %s" % os.path.join(PKG, "embedded_assets.py"))
     output = build()
     parent = os.path.dirname(os.path.abspath(args.output))
     if not os.path.isdir(parent):
         os.makedirs(parent)
-    with open(args.output, "w") as handle:
+    with open(args.output, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(output)
     os.chmod(args.output, os.stat(args.output).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     print("Built %s (%d lines, %s)" % (args.output, output.count("\n"), _build_stamp()))

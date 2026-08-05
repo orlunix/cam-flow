@@ -5,9 +5,10 @@ import os
 import re
 
 TOP_KEYS = set(["workflow", "version", "goal", "context", "input_schema", "nodes"])
-NODE_KEYS = set(["id", "goal", "steps", "needs", "run", "output_schema", "verify", "retry"])
+NODE_KEYS = set(["id", "goal", "steps", "needs", "run", "output_schema", "verify", "retry", "when"])
 TYPES = set(["string", "integer", "number", "boolean", "array", "object"])
 ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+WHEN_PATH_RE = re.compile(r"^data\.([A-Za-z0-9_-]+)$")
 
 
 def type_matches(value, kind):
@@ -48,6 +49,20 @@ def _validate_verify(value, prefix, errors):
             errors.append(prefix + ".verify.timeout: requires command and positive integer")
 
 
+def _validate_when(value, prefix, errors):
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != set(["node", "path", "equals"]):
+        errors.append(prefix + ".when: must contain exactly node, path, equals")
+        return
+    for key in ("node", "path", "equals"):
+        if not isinstance(value.get(key), str) or not value[key].strip():
+            errors.append(prefix + ".when.%s: required non-empty string" % key)
+    path = value.get("path")
+    if isinstance(path, str) and path.strip() and not WHEN_PATH_RE.match(path):
+        errors.append(prefix + ".when.path: must be data.<field>")
+
+
 def validate_workflow(spec, root):
     errors = []
     if not isinstance(spec, dict): return ["workflow is not an object"]
@@ -65,6 +80,7 @@ def validate_workflow(spec, root):
     if not isinstance(nodes, list) or not nodes: return errors + ["workflow.nodes: required non-empty list"]
     ids = []
     graph = {}
+    node_by_id = {}
     for index, node in enumerate(nodes):
         prefix = "nodes[%d]" % index
         if not isinstance(node, dict): errors.append(prefix + ": must be object"); continue
@@ -72,7 +88,10 @@ def validate_workflow(spec, root):
         if extra: errors.append(prefix + ": unknown keys %s" % sorted(extra))
         node_id = node.get("id")
         if not isinstance(node_id, str) or not ID_RE.match(node_id): errors.append(prefix + ".id: invalid")
-        else: ids.append(node_id); graph[node_id] = node.get("needs", [])
+        else:
+            ids.append(node_id)
+            graph[node_id] = node.get("needs", [])
+            node_by_id[node_id] = node
         if not isinstance(node.get("goal"), str) or not node.get("goal", "").strip(): errors.append(prefix + ".goal: required string")
         steps = node.get("steps")
         if not isinstance(steps, list) or not steps or any(not isinstance(x, str) or not x.strip() for x in steps): errors.append(prefix + ".steps: required string list")
@@ -90,11 +109,41 @@ def validate_workflow(spec, root):
             for key, kind in output.items():
                 if not isinstance(key, str) or not key or kind not in TYPES: errors.append(prefix + ".output_schema: invalid field")
         _validate_verify(node.get("verify"), prefix, errors)
+        _validate_when(node.get("when"), prefix, errors)
     if len(ids) != len(set(ids)): errors.append("workflow.nodes: duplicate ids")
     known = set(ids)
     for node_id, needs in graph.items():
         for dep in needs:
             if dep not in known: errors.append("%s.needs: unknown node %r" % (node_id, dep))
+    route_targets = {}
+    for index, node in enumerate(nodes):
+        if not isinstance(node, dict) or not isinstance(node.get("when"), dict):
+            continue
+        prefix = "nodes[%d]" % index
+        condition = node["when"]
+        if set(condition) != set(["node", "path", "equals"]):
+            continue
+        source_id = condition.get("node")
+        path = condition.get("path")
+        expected = condition.get("equals")
+        if source_id not in known:
+            errors.append(prefix + ".when.node: unknown node %r" % source_id)
+            continue
+        needs = node.get("needs", [])
+        if isinstance(needs, list) and source_id not in needs:
+            errors.append(prefix + ".when.node: must also appear in needs")
+        match = WHEN_PATH_RE.match(path) if isinstance(path, str) else None
+        if match:
+            field = match.group(1)
+            source_schema = node_by_id[source_id].get("output_schema", {})
+            if not isinstance(source_schema, dict) or source_schema.get(field) != "string":
+                errors.append(prefix + ".when.path: source output_schema must declare %s: string" % field)
+        if isinstance(path, str) and isinstance(expected, str):
+            key = (source_id, path, expected)
+            if key in route_targets:
+                errors.append(prefix + ".when: duplicate route value %r also used by %s" % (expected, route_targets[key]))
+            else:
+                route_targets[key] = node.get("id", prefix)
     visiting = set(); visited = set()
     def visit(node_id):
         if node_id in visiting: errors.append("workflow.nodes: cycle through %r" % node_id); return

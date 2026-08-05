@@ -18,8 +18,8 @@ def _embedded_text(lines, trailing_newline):
 # ========================================================================
 # __init__
 # ========================================================================
-__version__ = "1.2.0"
-__build__ = "e613b46 2026-07-08 10:15 UTC"
+__version__ = "1.2.1"
+__build__ = "587c19a 2026-08-05 11:30 UTC"
 
 # Installed Python packages use the generated readable asset module.  The
 # standalone builder runs with no package and replaces the empty mappings.
@@ -236,9 +236,10 @@ import os
 import re
 
 TOP_KEYS = set(["workflow", "version", "goal", "context", "input_schema", "nodes"])
-NODE_KEYS = set(["id", "goal", "steps", "needs", "run", "output_schema", "verify", "retry"])
+NODE_KEYS = set(["id", "goal", "steps", "needs", "run", "output_schema", "verify", "retry", "when"])
 TYPES = set(["string", "integer", "number", "boolean", "array", "object"])
 ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+WHEN_PATH_RE = re.compile(r"^data\.([A-Za-z0-9_-]+)$")
 
 
 def type_matches(value, kind):
@@ -279,6 +280,20 @@ def _validate_verify(value, prefix, errors):
             errors.append(prefix + ".verify.timeout: requires command and positive integer")
 
 
+def _validate_when(value, prefix, errors):
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != set(["node", "path", "equals"]):
+        errors.append(prefix + ".when: must contain exactly node, path, equals")
+        return
+    for key in ("node", "path", "equals"):
+        if not isinstance(value.get(key), str) or not value[key].strip():
+            errors.append(prefix + ".when.%s: required non-empty string" % key)
+    path = value.get("path")
+    if isinstance(path, str) and path.strip() and not WHEN_PATH_RE.match(path):
+        errors.append(prefix + ".when.path: must be data.<field>")
+
+
 def validate_workflow(spec, root):
     errors = []
     if not isinstance(spec, dict): return ["workflow is not an object"]
@@ -296,6 +311,7 @@ def validate_workflow(spec, root):
     if not isinstance(nodes, list) or not nodes: return errors + ["workflow.nodes: required non-empty list"]
     ids = []
     graph = {}
+    node_by_id = {}
     for index, node in enumerate(nodes):
         prefix = "nodes[%d]" % index
         if not isinstance(node, dict): errors.append(prefix + ": must be object"); continue
@@ -303,7 +319,10 @@ def validate_workflow(spec, root):
         if extra: errors.append(prefix + ": unknown keys %s" % sorted(extra))
         node_id = node.get("id")
         if not isinstance(node_id, str) or not ID_RE.match(node_id): errors.append(prefix + ".id: invalid")
-        else: ids.append(node_id); graph[node_id] = node.get("needs", [])
+        else:
+            ids.append(node_id)
+            graph[node_id] = node.get("needs", [])
+            node_by_id[node_id] = node
         if not isinstance(node.get("goal"), str) or not node.get("goal", "").strip(): errors.append(prefix + ".goal: required string")
         steps = node.get("steps")
         if not isinstance(steps, list) or not steps or any(not isinstance(x, str) or not x.strip() for x in steps): errors.append(prefix + ".steps: required string list")
@@ -321,11 +340,41 @@ def validate_workflow(spec, root):
             for key, kind in output.items():
                 if not isinstance(key, str) or not key or kind not in TYPES: errors.append(prefix + ".output_schema: invalid field")
         _validate_verify(node.get("verify"), prefix, errors)
+        _validate_when(node.get("when"), prefix, errors)
     if len(ids) != len(set(ids)): errors.append("workflow.nodes: duplicate ids")
     known = set(ids)
     for node_id, needs in graph.items():
         for dep in needs:
             if dep not in known: errors.append("%s.needs: unknown node %r" % (node_id, dep))
+    route_targets = {}
+    for index, node in enumerate(nodes):
+        if not isinstance(node, dict) or not isinstance(node.get("when"), dict):
+            continue
+        prefix = "nodes[%d]" % index
+        condition = node["when"]
+        if set(condition) != set(["node", "path", "equals"]):
+            continue
+        source_id = condition.get("node")
+        path = condition.get("path")
+        expected = condition.get("equals")
+        if source_id not in known:
+            errors.append(prefix + ".when.node: unknown node %r" % source_id)
+            continue
+        needs = node.get("needs", [])
+        if isinstance(needs, list) and source_id not in needs:
+            errors.append(prefix + ".when.node: must also appear in needs")
+        match = WHEN_PATH_RE.match(path) if isinstance(path, str) else None
+        if match:
+            field = match.group(1)
+            source_schema = node_by_id[source_id].get("output_schema", {})
+            if not isinstance(source_schema, dict) or source_schema.get(field) != "string":
+                errors.append(prefix + ".when.path: source output_schema must declare %s: string" % field)
+        if isinstance(path, str) and isinstance(expected, str):
+            key = (source_id, path, expected)
+            if key in route_targets:
+                errors.append(prefix + ".when: duplicate route value %r also used by %s" % (expected, route_targets[key]))
+            else:
+                route_targets[key] = node.get("id", prefix)
     visiting = set(); visited = set()
     def visit(node_id):
         if node_id in visiting: errors.append("workflow.nodes: cycle through %r" % node_id); return
@@ -357,7 +406,9 @@ def validate_envelope(envelope, schema):
 # ========================================================================
 
 import json
+import hashlib
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -371,7 +422,7 @@ def _write(path, value):
     temporary = path + ".tmp"
     with open(temporary, "w") as handle:
         handle.write(value)
-    os.rename(temporary, path)
+    os.replace(temporary, path)
 
 
 def _ensure_embedded_skills(root):
@@ -430,6 +481,87 @@ def _read_output(output_path):
         return {"status": "fail", "data": {}, "error": {"code": "BAD_OUTPUT", "message": str(exc)}, "feedback": None, "request_human": False}
 
 
+def _failure(code, message, request_human=False):
+    return {
+        "status": "fail",
+        "data": {},
+        "error": {"code": code, "message": message},
+        "feedback": None,
+        "request_human": request_human,
+    }
+
+
+def _camc_call(command, cwd, timeout):
+    """Run one bounded camc command and retain enough evidence for audit."""
+    try:
+        process = subprocess.run(
+            command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, timeout=timeout,
+        )
+        return {
+            "returncode": process.returncode,
+            "stdout": process.stdout or "",
+            "stderr": process.stderr or "",
+        }
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        error = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        return {"returncode": None, "stdout": output, "stderr": error, "error": "timed out"}
+    except OSError as exc:
+        return {"returncode": None, "stdout": "", "stderr": "", "error": str(exc)}
+
+
+def _camc_agent_id(result):
+    text = (result.get("stdout") or "") + "\n" + (result.get("stderr") or "")
+    match = re.search(r"\bStarting\s+\S+\s+agent\s+([A-Za-z0-9_-]+)", text)
+    return match.group(1) if match else None
+
+
+def _camc_finalize(camc, agent_id, attempt_dir):
+    """Durably archive a camc agent, then stop and remove its live record."""
+    archive_dir = os.path.join(attempt_dir, "camc-archive")
+    archive = _camc_call(
+        [camc, "archive", agent_id, "--output", archive_dir],
+        attempt_dir, 45,
+    )
+    lifecycle = {"agent_id": agent_id, "archive": archive}
+    try:
+        archive_files = sorted(
+            name for name in os.listdir(archive_dir) if name.endswith(".tar.gz")
+        )
+    except OSError:
+        archive_files = []
+    lifecycle["archive_files"] = archive_files
+    if archive.get("returncode") != 0 or not archive_files:
+        status = _camc_call([camc, "--json", "status", agent_id], attempt_dir, 10)
+        lifecycle["status"] = status
+        _write(os.path.join(attempt_dir, "camc-lifecycle.json"), json.dumps(lifecycle, indent=2, sort_keys=True))
+        return "CAMC_ARCHIVE_FAILED", "camc archive failed; agent was kept for inspection: %s" % (
+            archive.get("stderr") or archive.get("error") or "archive file was not created"
+        )
+
+    status = _camc_call([camc, "--json", "status", agent_id], attempt_dir, 10)
+    lifecycle["status"] = status
+    if status.get("returncode") == 0:
+        try:
+            agent = json.loads(status.get("stdout") or "")
+            if isinstance(agent, dict):
+                _write(os.path.join(attempt_dir, "agent.json"), json.dumps(agent, indent=2, sort_keys=True))
+        except ValueError:
+            pass
+
+    stop = _camc_call([camc, "stop", agent_id], attempt_dir, 15)
+    remove = _camc_call([camc, "rm", agent_id], attempt_dir, 15)
+    lifecycle["stop"] = stop
+    lifecycle["rm"] = remove
+    _write(os.path.join(attempt_dir, "camc-lifecycle.json"), json.dumps(lifecycle, indent=2, sort_keys=True))
+    if remove.get("returncode") != 0:
+        return "CAMC_CLEANUP_FAILED", "camc rm failed after archive: %s" % (
+            remove.get("stderr") or remove.get("error") or "unknown error"
+        )
+    return None
+
+
 def _invoke(root, attempt_dir, node, prompt):
     output_path = os.path.join(attempt_dir, "agent_output.json")
     command = os.environ.get("CAMFLOW_EXECUTOR")
@@ -442,13 +574,27 @@ def _invoke(root, attempt_dir, node, prompt):
             return result
     else:
         camc = os.environ.get("CAMC_BIN", "camc")
-        name = "camflow-%s-%d" % (node["id"], int(time.time() * 1000))
+        token = hashlib.sha256(os.path.abspath(attempt_dir).encode("utf-8")).hexdigest()[:8]
+        name = "camflow-%s-%s" % (node["id"], token)
+        command = [camc, "run"]
+        tool = os.environ.get("CAMFLOW_AGENT_TOOL")
+        if tool:
+            command.extend(["--tool", tool])
+        command.extend(["--name", name, "--path", root, prompt])
         try:
-            code = subprocess.call([camc, "run", "--auto-exit", "--name", name, "--path", root, prompt], cwd=root)
-        except OSError as exc:
-            return {"status": "fail", "data": {}, "error": {"code": "EXECUTOR_UNAVAILABLE", "message": str(exc)}, "feedback": None, "request_human": False}
-        if code:
-            return {"status": "fail", "data": {}, "error": {"code": "EXECUTOR_FAILED", "message": "camc exited %d" % code}, "feedback": None, "request_human": False}
+            launch_timeout = max(1, int(os.environ.get("CAMFLOW_CAMC_RUN_TIMEOUT", "180")))
+        except ValueError:
+            launch_timeout = 180
+        launch = _camc_call(command, root, launch_timeout)
+        agent_id = _camc_agent_id(launch)
+        if launch.get("returncode") != 0:
+            return _failure(
+                "EXECUTOR_FAILED",
+                launch.get("stderr") or launch.get("error") or "camc run failed",
+            )
+        if not agent_id:
+            return _failure("EXECUTOR_FAILED", "camc run did not report an agent id")
+        _write(os.path.join(attempt_dir, "agent.id"), agent_id + "\n")
         try:
             timeout = max(1, int(os.environ.get("CAMFLOW_AGENT_TIMEOUT", "600")))
         except ValueError:
@@ -457,8 +603,14 @@ def _invoke(root, attempt_dir, node, prompt):
         while time.time() < deadline:
             result = _read_output(output_path)
             if result is not None:
+                cleanup_problem = _camc_finalize(camc, agent_id, attempt_dir)
+                if cleanup_problem:
+                    return _failure(cleanup_problem[0], cleanup_problem[1], request_human=True)
                 return result
             time.sleep(1)
+        cleanup_problem = _camc_finalize(camc, agent_id, attempt_dir)
+        if cleanup_problem:
+            return _failure(cleanup_problem[0], cleanup_problem[1], request_human=True)
     return {"status": "fail", "data": {}, "error": {"code": "MISSING_OUTPUT", "message": "agent_output.json was not written"}, "feedback": None, "request_human": False}
 
 
@@ -508,8 +660,50 @@ def _verify(root, node, envelope, attempt_dir):
     return _agent_verify(root, node, envelope, attempt_dir, verify.get("criterion") or "Check every workflow step is satisfied with concrete evidence.")
 
 
+def _dependency_done(result):
+    return result.get("status") in ("success", "skipped")
+
+
+def _condition_value(state, condition):
+    value = state.get(condition["node"], {})
+    for part in condition["path"].split("."):
+        if not isinstance(value, dict) or part not in value:
+            return None
+        value = value[part]
+    return value
+
+
+def _condition_matches(state, condition):
+    return _condition_value(state, condition) == condition["equals"]
+
+
+def _route_problem(nodes, state):
+    groups = {}
+    for node in nodes:
+        condition = node.get("when")
+        if not condition:
+            continue
+        key = (condition["node"], condition["path"])
+        groups.setdefault(key, []).append((node["id"], condition["equals"]))
+    for key, branches in groups.items():
+        source_id, path = key
+        source = state.get(source_id, {})
+        if source.get("status") != "success":
+            continue
+        actual = _condition_value(state, {"node": source_id, "path": path})
+        matches = [node_id for node_id, expected in branches if expected == actual]
+        if len(matches) != 1:
+            return {
+                "node": source_id,
+                "path": path,
+                "actual": actual,
+                "expected": sorted(set(expected for _node_id, expected in branches)),
+            }
+    return None
+
+
 def recover(spec, run_dir):
-    """Rebuild successful-node state and complete attempt history from disk."""
+    """Rebuild completed-node state and attempt history from disk."""
     state = {}
     histories = {}
     for node in spec["nodes"]:
@@ -530,6 +724,16 @@ def recover(spec, run_dir):
         histories[node_id] = history
         if history and history[-1].get("status") == "success":
             state[node_id] = history[-1]
+        else:
+            skip_path = os.path.join(base, "skip.json")
+            if os.path.isfile(skip_path):
+                try:
+                    with open(skip_path, "r") as handle:
+                        skipped = json.load(handle)
+                    if skipped.get("status") == "skipped":
+                        state[node_id] = skipped
+                except (IOError, ValueError):
+                    pass
     return state, histories
 
 
@@ -539,8 +743,9 @@ def execute(spec, root, run_dir, run_input, max_steps=None, state=None, historie
     if not os.path.isdir(run_dir):
         os.makedirs(run_dir)
     _write(os.path.join(run_dir, "workflow.json"), json.dumps(spec, indent=2, sort_keys=True))
-    if run_input is not None:
-        _write(os.path.join(run_dir, "input.json"), json.dumps(run_input, indent=2, sort_keys=True))
+    input_snapshot = os.path.join(run_dir, "input.json")
+    if run_input is not None and not os.path.isfile(input_snapshot):
+        _write(input_snapshot, json.dumps(run_input, indent=2, sort_keys=True))
     state = dict(state or {})
     histories = dict(histories or {})
     previous = previous or {}
@@ -548,12 +753,18 @@ def execute(spec, root, run_dir, run_input, max_steps=None, state=None, historie
     nodes = spec["nodes"]
     attempts = 0
     while True:
+        route_problem = _route_problem(nodes, state)
+        if route_problem:
+            halt = {"reason": "unmatched_route", "route": route_problem}
+            _write(os.path.join(run_dir, "halt.json"), json.dumps(halt, indent=2, sort_keys=True))
+            _trace(run_dir, "workflow_halted", reason="unmatched_route", route=route_problem)
+            return "halted"
         ready = []
         for node in nodes:
             node_id = node["id"]
             if node_id in state:
                 continue
-            if all(state.get(dep, {}).get("status") == "success" for dep in node.get("needs", [])):
+            if all(_dependency_done(state.get(dep, {})) for dep in node.get("needs", [])):
                 ready.append(node)
         if not ready:
             if len(state) == len(nodes):
@@ -564,6 +775,31 @@ def execute(spec, root, run_dir, run_input, max_steps=None, state=None, historie
             return "halted"
         node = ready[0]
         node_id = node["id"]
+        condition = node.get("when")
+        if condition and not _condition_matches(state, condition):
+            skipped = {
+                "status": "skipped",
+                "data": {},
+                "skip": {
+                    "node": condition["node"],
+                    "path": condition["path"],
+                    "actual": _condition_value(state, condition),
+                    "expected": condition["equals"],
+                },
+            }
+            state[node_id] = skipped
+            _write(os.path.join(run_dir, "nodes", node_id, "skip.json"), json.dumps(skipped, indent=2, sort_keys=True))
+            _trace(run_dir, "node_skipped", node=node_id, route=skipped["skip"])
+            continue
+        if condition:
+            _trace(
+                run_dir,
+                "route_selected",
+                node=condition["node"],
+                path=condition["path"],
+                value=_condition_value(state, condition),
+                target=node_id,
+            )
         history = list(histories.get(node_id, []))
         allowed = node.get("retry", 1) + 1 - len(history)
         if node_id == resume_node:
@@ -577,7 +813,7 @@ def execute(spec, root, run_dir, run_input, max_steps=None, state=None, historie
             attempt_dir = os.path.join(run_dir, "nodes", node_id, "attempt-%d" % attempt)
             if not os.path.isdir(attempt_dir):
                 os.makedirs(attempt_dir)
-            upstream = dict((dep, state[dep]) for dep in node.get("needs", []))
+            upstream = dict((dep, state[dep]) for dep in node.get("needs", []) if state[dep].get("status") == "success")
             attempt_input = {}
             if run_input is not None:
                 attempt_input["run_input"] = run_input
@@ -626,6 +862,7 @@ def execute(spec, root, run_dir, run_input, max_steps=None, state=None, historie
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -684,6 +921,17 @@ def _copy_tree(source, target):
         shutil.copytree(source, target)
 
 
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(65536)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _snapshot_run(spec, source_root, workflow_path, run_dir, input_path):
     """Copy supplied runnable artifacts so resume never needs the source package."""
     if not os.path.isdir(run_dir):
@@ -705,6 +953,16 @@ def _snapshot_run(spec, source_root, workflow_path, run_dir, input_path):
             raise ValueError("missing skill directory: skills/%s" % name)
         _copy_tree(source, os.path.join(run_dir, "skills", name))
     _copy_tree(os.path.join(source_root, "validators"), os.path.join(run_dir, "validators"))
+    workflow_snapshot = os.path.join(run_dir, "workflow.yaml")
+    input_snapshot = os.path.join(run_dir, "input.json")
+    manifest = {
+        "schema": "camflow-run/1",
+        "workflow_sha256": _sha256(workflow_snapshot),
+        "input_sha256": _sha256(input_snapshot) if os.path.isfile(input_snapshot) else None,
+    }
+    with open(os.path.join(run_dir, "run.json"), "w") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+        handle.write("\n")
 
 
 def _validate_input(data, spec):
@@ -715,6 +973,8 @@ def _validate_input(data, spec):
 
 def _fresh_run(workflow_path, input_path, run_dir, steps):
     try:
+        if os.path.exists(run_dir) and (not os.path.isdir(run_dir) or os.listdir(run_dir)):
+            raise ValueError("run directory is not empty; use resume or run --from: %s" % run_dir)
         spec, root = _load_workflow(workflow_path)
         schema = spec.get("input_schema") or {}
         if schema and not input_path:
@@ -743,6 +1003,21 @@ def _load_run(run_dir):
     data = _read_json(input_path) if os.path.isfile(input_path) else None
     if data is not None:
         _validate_input(data, spec)
+    manifest_path = os.path.join(run_dir, "run.json")
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, "r") as handle:
+                manifest = json.load(handle)
+        except (IOError, ValueError) as exc:
+            raise ValueError("invalid run.json: %s" % exc)
+        if manifest.get("schema") != "camflow-run/1":
+            raise ValueError("unsupported run.json schema")
+        if manifest.get("workflow_sha256") != _sha256(workflow):
+            raise ValueError("workflow.yaml differs from the recorded run snapshot")
+        expected_input = manifest.get("input_sha256")
+        actual_input = _sha256(input_path) if os.path.isfile(input_path) else None
+        if expected_input != actual_input:
+            raise ValueError("input.json differs from the recorded run snapshot")
     return spec, root, data
 
 

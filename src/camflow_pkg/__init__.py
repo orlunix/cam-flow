@@ -1,6 +1,6 @@
 """Python 3.6-compatible CamFlow runtime metadata."""
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 __build__ = ""
 
 # Installed Python packages use the generated readable asset module.  The

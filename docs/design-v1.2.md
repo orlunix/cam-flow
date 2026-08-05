@@ -2,7 +2,7 @@
 
 A tiny prompt-call-verify-trace runner for agent/tool workflows.
 
-> Status: draft
+> Status: implemented source of truth
 > Replaces the v1.1 assumption that every fresh run must start from a prompt and mandatory Planner compilation.
 > Preserves the v1.1 `Workflow` / `Node` execution model, binary envelope, strict skill registry, retry, resume, `run --from`, trace, and per-attempt artifacts.
 
@@ -107,13 +107,22 @@ camflow batch workflows/core_hang.yaml --inputs cases/*.json --out runs/batch_00
 
 Each input file creates one independent camflow run.
 
-### 1.5 No `next`, no `goto`, no `route` in v1.2
+### 1.5 Restricted `when` routing
 
-v1.2 keeps the existing `needs` DAG model.
+v1.2 keeps the static `needs` DAG and adds one deliberately small branch
+primitive:
 
-No control-flow fields are added in this version.
+```yaml
+when:
+  node: test_or_dut
+  path: data.route
+  equals: lsu_debug
+```
 
-Future versions may add a restricted `when:` field if fixed DAGs prove insufficient, but v1.2 intentionally does not add conditional branching.
+`when` may inspect one declared string field from one direct dependency. It
+cannot evaluate expressions, mutate the graph, jump, loop, or read mutable
+global state. Route groups are exhaustive at runtime: exactly one target must
+match, otherwise the workflow halts with `unmatched_route`.
 
 ---
 
@@ -177,9 +186,10 @@ Behavior:
 2. Validate workflow schema.
 3. Load input.json.
 4. Validate input.json against workflow.input_schema if present.
-5. Create run directory.
-6. Copy workflow.yaml and input.json into run directory.
-7. Execute the workflow.
+5. Require a new or empty run directory.
+6. Copy workflow.yaml, input.json, skills, and validators into it.
+7. Record workflow/input SHA-256 in run.json.
+8. Execute the workflow.
 ```
 
 Exit codes:
@@ -265,9 +275,10 @@ Behavior:
 
 ```text
 1. Reuse the existing workflow.yaml and input.json in run_dir.
-2. Preserve upstream successful nodes.
-3. Reset the target node and all downstream descendants.
-4. Re-execute from target.
+2. Verify both files against run.json before replay.
+3. Preserve upstream successful/skipped nodes.
+4. Reset the target node and all downstream descendants.
+5. Re-execute from target.
 ```
 
 `run --from` does not modify the workflow graph.
@@ -369,6 +380,11 @@ No nested JSON Schema support in v1.2.
     human: <prompt>
 
   retry: <int>
+
+  when:
+    node: <direct dependency id>
+    path: data.<declared string field>
+    equals: <literal string>
 ```
 
 Allowed node keys:
@@ -382,6 +398,7 @@ run
 output_schema
 verify
 retry
+when
 ```
 
 Unknown node keys are validation errors.
@@ -393,7 +410,6 @@ next: foo
 goto: foo
 route: foo
 routes: {}
-when: ...
 on_success: foo
 on_fail: foo
 ```
@@ -411,6 +427,7 @@ on_fail: foo
 | `output_schema` |       no | `{}`                 |
 | `verify`        |       no | default agent verify |
 | `retry`         |       no | `1`                  |
+| `when`          |       no | always run           |
 
 ---
 
@@ -542,7 +559,7 @@ camflow v1.2 keeps the existing static `needs` DAG.
 A node is ready when:
 
 ```text
-all nodes in needs are done+success
+all nodes in needs are completed as success or skipped
 ```
 
 Execution is serial and deterministic:
@@ -556,6 +573,9 @@ while workflow is running:
         else:
             workflow halted due to deadlock
     pick first ready node by YAML declaration order
+    if when does not match:
+        persist skip.json and node_skipped
+        continue
     execute one attempt
     if success:
         mark node done+success
@@ -569,7 +589,7 @@ while workflow is running:
 
 No parallelism in v1.2.
 
-No conditional branching in v1.2.
+Restricted, deterministic `when` routing is supported.
 
 No `next`.
 
@@ -581,7 +601,8 @@ No runtime graph mutation.
 
 ## 7. `needs` semantics
 
-`needs` means dependency, not control flow.
+`needs` is the directed edge relation. It establishes both scheduling order
+and the only node-output data flow.
 
 Example:
 
@@ -603,11 +624,12 @@ nodes:
     ...
 ```
 
-After `extract_signature` succeeds, both `analyze_lsu` and `analyze_ifu` become ready.
+Without `when`, after `extract_signature` succeeds both `analyze_lsu` and
+`analyze_ifu` become ready.
 
 Because v1.2 is serial, the runtime runs them one at a time in YAML declaration order.
 
-`needs` does not mean:
+`needs` alone does not mean:
 
 ```text
 exclusive branch
@@ -617,9 +639,25 @@ next step override
 skip other ready nodes
 ```
 
-If a workflow needs exclusive branching, model the first version as a fixed DAG and let unnecessary nodes produce cheap no-op/inconclusive outputs.
+Exclusive branches add one `when` object to each candidate node. Example:
 
-A future v1.3 may add restricted `when:` if this becomes too expensive.
+```yaml
+- id: test_or_dut
+  output_schema:
+    route: string
+
+- id: lsu_debug
+  needs: [test_or_dut]
+  when: {node: test_or_dut, path: data.route, equals: lsu_debug}
+
+- id: ifu_debug
+  needs: [test_or_dut]
+  when: {node: test_or_dut, path: data.route, equals: ifu_debug}
+```
+
+The non-selected node is persisted as `skipped`. A downstream join may depend
+on both candidates; skipped dependencies count as complete, while only
+successful dependencies are included in its `upstream` input.
 
 ---
 
@@ -645,6 +683,9 @@ fail
 ```
 
 No third status.
+
+`skipped` is a scheduler-owned branch state in `skip.json`; agents cannot emit
+it as an envelope status.
 
 Invalid statuses are runtime errors.
 
@@ -717,6 +758,17 @@ executor writes raw artifacts into attempt_dir
 ```
 
 This keeps camflow independent of any one agent system.
+
+The camc adapter does not use auto-exit. Once an attempt output exists, it
+performs and records this durability sequence:
+
+```text
+camc archive -> camc --json status -> camc stop -> camc rm
+```
+
+The attempt directory retains `agent.id`, `agent.json`,
+`camc-archive/*.tar.gz`, and `camc-lifecycle.json`. If archive fails, the
+workflow halts and the camc record remains available for inspection/retry.
 
 ---
 
@@ -842,22 +894,27 @@ Each run writes:
 ```text
 <run_dir>/
 ├── workflow.yaml
-├── input.json
-├── run.json
+├── workflow.json
+├── input.json                         # only when supplied
+├── run.json                           # workflow/input SHA-256
 ├── trace.jsonl
-├── runner.pid
 ├── halt.json
+├── skills/                            # required skill snapshot
+├── validators/                        # optional validator snapshot
 ├── nodes/
 │   └── <node_id>/
+│       ├── skip.json                  # only for an unselected branch
 │       └── attempt-<n>/
 │           ├── input.json
 │           ├── prompt.txt
 │           ├── agent_output.json
 │           ├── output.json
-│           └── verify/
-│               ├── prompt.txt
-│               ├── agent_output.json
-│               └── output.json
+│           ├── verify.json
+│           ├── agent.id
+│           ├── agent.json
+│           ├── camc-lifecycle.json
+│           ├── camc-archive/*.tar.gz
+│           └── verify/                # default agent verifier artifacts
 ├── evidence.json
 ├── symptoms.json
 ├── hypotheses.json
@@ -866,6 +923,9 @@ Each run writes:
 ```
 
 The workflow does not have to produce every summary artifact, but RTL/debug workflows should.
+
+`agent.id`, `agent.json`, `camc-lifecycle.json`, and `camc-archive/` are
+present for real camc-backed attempts; mock executor tests do not create them.
 
 `trace.jsonl` remains the authoritative event stream.
 
@@ -976,7 +1036,6 @@ max_replans
 goto
 next
 routes
-when
 run.input
 state:
 inputs:
@@ -990,32 +1049,39 @@ Some of these may appear in old archives or experiments, but they are not part o
 
 ---
 
-## 17. Future consideration: restricted `when`
+## 17. Restricted `when`
 
-If fixed DAGs become too expensive, v1.3 may add a restricted `when:` field.
-
-Possible future shape:
+Current shape:
 
 ```yaml
 - id: debug_hang
   needs: [classify_failure]
-  when: nodes.classify_failure.output.data.failure_class == "hang"
+  when:
+    node: classify_failure
+    path: data.failure_class
+    equals: hang
   run:
     skill: hang_debugger
 ```
 
-Hard constraints if added later:
+Hard constraints:
 
 ```text
-when can only reference upstream node outputs
-when must evaluate to boolean
+when can only reference a direct dependency listed in needs
+path is exactly data.<field>
+the source output_schema must declare that field as string
+equals is a non-empty literal string
+duplicate values in one route group are validation errors
+exactly one target in a route group must match
 when cannot mutate graph
 when cannot loop
 false means node_skipped trace event
 skipped nodes must have precise resume/run-from semantics
 ```
 
-v1.2 intentionally does not include this.
+The persisted source envelope, `route_selected`/`node_skipped` trace event,
+and `skip.json` are sufficient to replay and audit the decision without
+asking an agent to route again.
 
 ---
 

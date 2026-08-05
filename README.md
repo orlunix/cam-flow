@@ -31,6 +31,56 @@ or workflow files.
 `input_schema`, `--input` is required. `run` rejects missing local skills and
 never silently plans, packs, or generates them.
 
+## Minimal graph model
+
+- A node is one prompt-call-verify attempt with a typed output envelope.
+- `needs` declares directed edges. A node sees successful outputs only from
+  those direct dependencies; there is no mutable global data store.
+- Top-level `input.json` is global only in the read-only sense: the same
+  snapshot is injected into every node.
+- `when` is the only router. It compares one direct dependency's declared
+  string output with one literal value. Exactly one branch in a route group
+  must match; otherwise the workflow halts instead of guessing.
+
+The basic `test_or_dut` branch is:
+
+```yaml
+- id: test_or_dut
+  output_schema:
+    route: string
+  # goal, steps, and run omitted here
+
+- id: lsu_debug
+  needs: [test_or_dut]
+  when: {node: test_or_dut, path: data.route, equals: lsu_debug}
+
+- id: ifu_debug
+  needs: [test_or_dut]
+  when: {node: test_or_dut, path: data.route, equals: ifu_debug}
+```
+
+The selected branch runs; the other branch gets a durable `skip.json`.
+Downstream joins may depend on both branches: skipped dependencies count as
+complete, but only the selected branch is injected into `upstream`.
+
+## Replay and agent durability
+
+Every run snapshots `workflow.yaml`, `input.json`, required skills, and their
+workflow/input hashes in `run.json`. `resume` and `run --from` reuse that
+snapshot and reject changed workflow/input files, making route decisions
+replayable from the persisted node outputs and `trace.jsonl`.
+
+For real camc agents, every attempt persists `agent.id`, `agent.json`, the
+validated camc archive, and `camc-lifecycle.json`. Camflow does not use
+auto-exit. Cleanup is strictly:
+
+```text
+archive -> status snapshot -> stop -> rm
+```
+
+If archive fails, Camflow halts and keeps the camc agent record instead of
+removing the only deterministic session binding.
+
 ## Test
 
 ```bash

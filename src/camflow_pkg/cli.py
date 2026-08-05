@@ -3,6 +3,7 @@ from __future__ import print_function
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -65,6 +66,17 @@ def _copy_tree(source, target):
         shutil.copytree(source, target)
 
 
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(65536)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _snapshot_run(spec, source_root, workflow_path, run_dir, input_path):
     """Copy supplied runnable artifacts so resume never needs the source package."""
     if not os.path.isdir(run_dir):
@@ -86,6 +98,16 @@ def _snapshot_run(spec, source_root, workflow_path, run_dir, input_path):
             raise ValueError("missing skill directory: skills/%s" % name)
         _copy_tree(source, os.path.join(run_dir, "skills", name))
     _copy_tree(os.path.join(source_root, "validators"), os.path.join(run_dir, "validators"))
+    workflow_snapshot = os.path.join(run_dir, "workflow.yaml")
+    input_snapshot = os.path.join(run_dir, "input.json")
+    manifest = {
+        "schema": "camflow-run/1",
+        "workflow_sha256": _sha256(workflow_snapshot),
+        "input_sha256": _sha256(input_snapshot) if os.path.isfile(input_snapshot) else None,
+    }
+    with open(os.path.join(run_dir, "run.json"), "w") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+        handle.write("\n")
 
 
 def _validate_input(data, spec):
@@ -96,6 +118,8 @@ def _validate_input(data, spec):
 
 def _fresh_run(workflow_path, input_path, run_dir, steps):
     try:
+        if os.path.exists(run_dir) and (not os.path.isdir(run_dir) or os.listdir(run_dir)):
+            raise ValueError("run directory is not empty; use resume or run --from: %s" % run_dir)
         spec, root = _load_workflow(workflow_path)
         schema = spec.get("input_schema") or {}
         if schema and not input_path:
@@ -124,6 +148,21 @@ def _load_run(run_dir):
     data = _read_json(input_path) if os.path.isfile(input_path) else None
     if data is not None:
         _validate_input(data, spec)
+    manifest_path = os.path.join(run_dir, "run.json")
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, "r") as handle:
+                manifest = json.load(handle)
+        except (IOError, ValueError) as exc:
+            raise ValueError("invalid run.json: %s" % exc)
+        if manifest.get("schema") != "camflow-run/1":
+            raise ValueError("unsupported run.json schema")
+        if manifest.get("workflow_sha256") != _sha256(workflow):
+            raise ValueError("workflow.yaml differs from the recorded run snapshot")
+        expected_input = manifest.get("input_sha256")
+        actual_input = _sha256(input_path) if os.path.isfile(input_path) else None
+        if expected_input != actual_input:
+            raise ValueError("input.json differs from the recorded run snapshot")
     return spec, root, data
 
 

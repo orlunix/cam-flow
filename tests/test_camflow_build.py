@@ -54,6 +54,20 @@ class ReadableArtifactTest(unittest.TestCase):
             if os.path.exists(output):
                 os.unlink(output)
 
+    def test_windows_build_keeps_linux_compatible_lf_endings(self):
+        handle, output = tempfile.mkstemp(prefix="camflow-lf-")
+        os.close(handle)
+        os.unlink(output)
+        try:
+            subprocess.check_call([sys.executable, "build_camflow.py", "--output", output], cwd=ROOT)
+            with open(output, "rb") as generated:
+                data = generated.read()
+            self.assertNotIn(b"\r\n", data)
+            self.assertTrue(data.startswith(b"#!/bin/sh\n"))
+        finally:
+            if os.path.exists(output):
+                os.unlink(output)
+
 class PackageBoundaryTest(unittest.TestCase):
     def test_run_rejects_workflow_with_missing_local_skill(self):
         directory = tempfile.mkdtemp(prefix="camflow-missing-skill-")
