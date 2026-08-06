@@ -72,11 +72,20 @@ class CamcLifecycleTest(unittest.TestCase):
                 result = engine._invoke(
                     self.directory, self.attempt,
                     {"id": "debug", "run": {"skill": "local"}}, "prompt",
+                    flow={"id": "a1b2c3d4", "name": "rvdbg", "label": "rvdbg"},
                 )
 
         self.assertEqual("success", result["status"])
         self.assertNotIn("--auto-exit", calls[0])
         self.assertEqual(["--tool", "codex"], calls[0][2:4])
+        self.assertRegex(
+            calls[0][calls[0].index("--name") + 1],
+            r"^cf-rvdbg-debug-[0-9a-f]{8}$",
+        )
+        self.assertEqual(
+            ["cf-rvdbg", "cf-a1b2c3d4"],
+            [calls[0][index + 1] for index, value in enumerate(calls[0]) if value == "--tag"],
+        )
         self.assertEqual(
             ["archive", "--json", "stop", "rm"],
             [calls[1][1], calls[2][1], calls[3][1], calls[4][1]],
@@ -155,6 +164,38 @@ class CamcLifecycleTest(unittest.TestCase):
         self.assertEqual("CAMC_CLEANUP_FAILED", result["error"]["code"])
         self.assertTrue(result["request_human"])
 
+    def test_verifier_inherits_the_same_flow_identity(self):
+        evaluator = os.path.join(self.directory, "skills", "evaluator")
+        os.makedirs(evaluator)
+        with open(os.path.join(evaluator, "SKILL.md"), "w") as handle:
+            handle.write("# evaluator\n")
+        flow = {"id": "a1b2c3d4", "name": "rvdbg", "label": "rvdbg"}
+        captured = []
+
+        def fake_invoke(_root, _attempt, node, _prompt, flow=None):
+            captured.append((node["id"], flow))
+            return {
+                "status": "success",
+                "data": {"approved": True, "reasoning": "ok"},
+                "error": None,
+                "feedback": None,
+                "request_human": False,
+            }
+
+        with mock.patch.object(engine, "_invoke", side_effect=fake_invoke):
+            passed, reason = engine._agent_verify(
+                self.directory,
+                {"id": "debug"},
+                dict(SUCCESS),
+                self.attempt,
+                "approve",
+                flow=flow,
+            )
+
+        self.assertTrue(passed)
+        self.assertEqual("agent verifier approved", reason)
+        self.assertEqual([("debug-verify", flow)], captured)
+
 
 class RunSnapshotTest(unittest.TestCase):
     def setUp(self):
@@ -182,6 +223,15 @@ class RunSnapshotTest(unittest.TestCase):
         run_dir = os.path.join(self.directory, "run")
         spec, root = cli._load_workflow(self.workflow)
         cli._snapshot_run(spec, root, self.workflow, run_dir, self.input_path)
+        with open(os.path.join(run_dir, "run.json"), "r") as handle:
+            flow = json.load(handle)["flow"]
+        self.assertEqual("snapshot", flow["name"])
+        self.assertEqual("snapshot", flow["label"])
+        self.assertRegex(flow["id"], r"^[0-9a-f]{8}$")
+        self.assertEqual(
+            ["cf-snapshot", "cf-" + flow["id"]],
+            flow["tags"],
+        )
         input_snapshot = os.path.join(run_dir, "input.json")
         with open(input_snapshot, "rb") as handle:
             original_input = handle.read()
@@ -203,6 +253,24 @@ class RunSnapshotTest(unittest.TestCase):
             handle.write("# changed\n")
         with self.assertRaisesRegex(ValueError, "differs from the recorded run snapshot"):
             cli._load_run(run_dir)
+
+    def test_long_flow_and_node_names_stay_short_and_collision_resistant(self):
+        identity = engine._flow_identity(
+            {"workflow": "very_long_riscv_debug_workflow_name"},
+            self.directory,
+            {"id": "1234abcd", "name": "very_long_riscv_debug_workflow_name"},
+        )
+        self.assertLessEqual(len(identity["label"]), 12)
+        name = engine._camc_agent_name(
+            identity,
+            "investigate_an_extremely_long_pipeline_component_name",
+            self.attempt_path("long"),
+        )
+        self.assertLessEqual(len(name), 43)
+        self.assertRegex(name, r"^cf-[a-z0-9-]+-[a-z0-9-]+-[0-9a-f]{8}$")
+
+    def attempt_path(self, name):
+        return os.path.join(self.directory, "nodes", name, "attempt-1")
 
     def test_fresh_run_refuses_nonempty_run_directory(self):
         run_dir = os.path.join(self.directory, "run")

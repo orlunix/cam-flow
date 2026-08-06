@@ -12,7 +12,7 @@ import sys
 
 from camflow_pkg import __build__, __version__
 from camflow_pkg.contracts import validate_input, validate_workflow
-from camflow_pkg.engine import _ensure_embedded_assets, _ensure_embedded_skills, _trace, execute, recover
+from camflow_pkg.engine import _ensure_embedded_assets, _ensure_embedded_skills, _flow_identity, _trace, execute, recover
 from camflow_pkg.yaml_lite import YamlError, dumps, loads
 
 
@@ -102,6 +102,7 @@ def _snapshot_run(spec, source_root, workflow_path, run_dir, input_path):
     input_snapshot = os.path.join(run_dir, "input.json")
     manifest = {
         "schema": "camflow-run/1",
+        "flow": _flow_identity(spec, run_dir),
         "workflow_sha256": _sha256(workflow_snapshot),
         "input_sha256": _sha256(input_snapshot) if os.path.isfile(input_snapshot) else None,
     }

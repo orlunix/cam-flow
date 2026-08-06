@@ -770,6 +770,20 @@ The attempt directory retains `agent.id`, `agent.json`,
 `camc-archive/*.tar.gz`, and `camc-lifecycle.json`. If archive fails, the
 workflow halts and the camc record remains available for inspection/retry.
 
+The supervisor, runtime, and CAMC have separate ownership boundaries:
+
+```text
+supervisor skill  chooses workflow/input and handles done or halted
+camflow runtime   schedules nodes and enforces child lifecycle
+camc              owns agent processes, sessions, tags, and archives
+```
+
+The supervisor may choose a short top-level `workflow` name, but it does not
+manually spawn individual node agents. Camflow persists a run-level flow ID in
+`run.json`, names agents `cf-<flow-label>-<node-label>-<attempt-hash>`, and
+passes both `cf-<flow-label>` and `cf-<flow-id>` as CAMC tags. The same rule
+applies to retry attempts and evaluator agents.
+
 ---
 
 ## 11. Verify phase

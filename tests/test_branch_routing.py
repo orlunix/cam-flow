@@ -79,7 +79,7 @@ class BranchRoutingTest(unittest.TestCase):
         calls = []
         run_dir = os.path.join(self.directory, name)
 
-        def invoke(_root, attempt_dir, node, _prompt):
+        def invoke(_root, attempt_dir, node, _prompt, flow=None):
             node_id = node["id"]
             calls.append(node_id)
             if node_id == "test_or_dut":

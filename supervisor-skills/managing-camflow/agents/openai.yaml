@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manage Camflow"
+  short_description: "Design, run, monitor, and recover Camflow graphs"
+  default_prompt: "Use $managing-camflow to design, tune, run, and supervise this Camflow workflow to completion."

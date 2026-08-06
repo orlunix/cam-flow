@@ -13,6 +13,53 @@ from camflow_pkg import _EMBEDDED_ASSETS, _EMBEDDED_SKILLS
 from camflow_pkg.contracts import validate_envelope
 
 
+def _compact_slug(value, limit, fallback):
+    """Return a short CAMC-safe label, retaining a hash when truncated."""
+    text = str(value or "")
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-").lower()
+    if not slug:
+        return fallback
+    if len(slug) <= limit:
+        return slug
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:4]
+    head = slug[:max(1, limit - len(digest) - 1)].rstrip("-")
+    return head + "-" + digest
+
+
+def _flow_identity(spec, run_dir, supplied=None):
+    """Build or restore the short identity shared by every agent in a run."""
+    stored = supplied if isinstance(supplied, dict) else None
+    if stored is None:
+        try:
+            with open(os.path.join(run_dir, "run.json"), "r") as handle:
+                candidate = json.load(handle).get("flow")
+            if isinstance(candidate, dict):
+                stored = candidate
+        except (IOError, OSError, ValueError):
+            stored = None
+    fallback_id = hashlib.sha256(
+        os.path.abspath(run_dir).encode("utf-8")
+    ).hexdigest()[:8]
+    flow_id = str((stored or {}).get("id") or "").lower()
+    if not re.match(r"^[0-9a-f]{8}$", flow_id):
+        flow_id = fallback_id
+    name = str((stored or {}).get("name") or spec.get("workflow") or "flow")
+    label = _compact_slug((stored or {}).get("label") or name, 12, flow_id)
+    tags = ["cf-" + label]
+    id_tag = "cf-" + flow_id
+    if id_tag not in tags:
+        tags.append(id_tag)
+    return {"id": flow_id, "name": name, "label": label, "tags": tags}
+
+
+def _camc_agent_name(flow, node_id, attempt_dir):
+    node_label = _compact_slug(node_id, 18, "node")
+    token = hashlib.sha256(
+        os.path.abspath(attempt_dir).encode("utf-8")
+    ).hexdigest()[:8]
+    return "cf-%s-%s-%s" % (flow["label"], node_label, token)
+
+
 def _write(path, value):
     parent = os.path.dirname(path)
     if not os.path.isdir(parent):
@@ -160,7 +207,7 @@ def _camc_finalize(camc, agent_id, attempt_dir):
     return None
 
 
-def _invoke(root, attempt_dir, node, prompt):
+def _invoke(root, attempt_dir, node, prompt, flow=None):
     output_path = os.path.join(attempt_dir, "agent_output.json")
     command = os.environ.get("CAMFLOW_EXECUTOR")
     if command:
@@ -172,13 +219,16 @@ def _invoke(root, attempt_dir, node, prompt):
             return result
     else:
         camc = os.environ.get("CAMC_BIN", "camc")
-        token = hashlib.sha256(os.path.abspath(attempt_dir).encode("utf-8")).hexdigest()[:8]
-        name = "camflow-%s-%s" % (node["id"], token)
+        flow = _flow_identity({"workflow": "flow"}, attempt_dir, flow)
+        name = _camc_agent_name(flow, node["id"], attempt_dir)
         command = [camc, "run"]
         tool = os.environ.get("CAMFLOW_AGENT_TOOL")
         if tool:
             command.extend(["--tool", tool])
-        command.extend(["--name", name, "--path", root, prompt])
+        command.extend(["--name", name])
+        for tag in flow["tags"]:
+            command.extend(["--tag", tag])
+        command.extend(["--path", root, prompt])
         try:
             launch_timeout = max(1, int(os.environ.get("CAMFLOW_CAMC_RUN_TIMEOUT", "180")))
         except ValueError:
@@ -212,7 +262,7 @@ def _invoke(root, attempt_dir, node, prompt):
     return {"status": "fail", "data": {}, "error": {"code": "MISSING_OUTPUT", "message": "agent_output.json was not written"}, "feedback": None, "request_human": False}
 
 
-def _agent_verify(root, node, envelope, attempt_dir, criterion):
+def _agent_verify(root, node, envelope, attempt_dir, criterion, flow=None):
     skill_path = os.path.join(root, "skills", "evaluator", "SKILL.md")
     if not os.path.isfile(skill_path):
         return False, "default evaluator skill is missing: skills/evaluator/SKILL.md"
@@ -224,7 +274,10 @@ def _agent_verify(root, node, envelope, attempt_dir, criterion):
         skill = handle.read().strip()
     output_path = os.path.abspath(os.path.join(verify_dir, "agent_output.json"))
     prompt = skill + "\n\n# Envelope produced by run\n```json\n" + json.dumps(envelope, indent=2) + "\n```\n\n# Criterion\n" + criterion + "\n\n# Output\nWrite a success envelope to " + output_path + " with data.approved as a boolean and data.reasoning as a string."
-    verifier = _invoke(root, verify_dir, {"id": node["id"] + "-verify"}, prompt)
+    verifier = _invoke(
+        root, verify_dir, {"id": node["id"] + "-verify"}, prompt,
+        flow=flow,
+    )
     if verifier.get("status") != "success":
         return False, "agent verifier failed: " + str(verifier.get("error"))
     data = verifier.get("data")
@@ -235,7 +288,7 @@ def _agent_verify(root, node, envelope, attempt_dir, criterion):
     return True, "agent verifier approved"
 
 
-def _verify(root, node, envelope, attempt_dir):
+def _verify(root, node, envelope, attempt_dir, flow=None):
     problem = validate_envelope(envelope, node.get("output_schema") or {})
     if problem:
         return False, problem
@@ -255,7 +308,11 @@ def _verify(root, node, envelope, attempt_dir):
         return False, "human verification requested: " + verify["human"]
     if os.environ.get("CAMFLOW_EXECUTOR"):
         return True, "mock executor contract check"
-    return _agent_verify(root, node, envelope, attempt_dir, verify.get("criterion") or "Check every workflow step is satisfied with concrete evidence.")
+    return _agent_verify(
+        root, node, envelope, attempt_dir,
+        verify.get("criterion") or "Check every workflow step is satisfied with concrete evidence.",
+        flow=flow,
+    )
 
 
 def _dependency_done(result):
@@ -335,7 +392,7 @@ def recover(spec, run_dir):
     return state, histories
 
 
-def execute(spec, root, run_dir, run_input, max_steps=None, state=None, histories=None, resume_node=None, previous=None):
+def execute(spec, root, run_dir, run_input, max_steps=None, state=None, histories=None, resume_node=None, previous=None, flow=None):
     spec = dict(spec)
     spec["_root"] = root
     if not os.path.isdir(run_dir):
@@ -345,6 +402,7 @@ def execute(spec, root, run_dir, run_input, max_steps=None, state=None, historie
     if run_input is not None and not os.path.isfile(input_snapshot):
         _write(input_snapshot, json.dumps(run_input, indent=2, sort_keys=True))
     state = dict(state or {})
+    flow = _flow_identity(spec, run_dir, flow)
     histories = dict(histories or {})
     previous = previous or {}
     _trace(run_dir, "workflow_started", workflow=spec["workflow"])
@@ -426,8 +484,8 @@ def execute(spec, root, run_dir, run_input, max_steps=None, state=None, historie
             prompt = _prompt(spec, node, attempt_input, output_path)
             _write(os.path.join(attempt_dir, "prompt.txt"), prompt)
             _trace(run_dir, "node_started", node=node_id, attempt=attempt)
-            envelope = _invoke(root, attempt_dir, node, prompt)
-            good, reason = _verify(root, node, envelope, attempt_dir)
+            envelope = _invoke(root, attempt_dir, node, prompt, flow=flow)
+            good, reason = _verify(root, node, envelope, attempt_dir, flow=flow)
             _write(os.path.join(attempt_dir, "verify.json"), json.dumps({"passed": good, "reason": reason}, indent=2, sort_keys=True))
             if not good:
                 envelope["status"] = "fail"

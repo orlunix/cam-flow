@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "camflow"
-version = "1.2.1"
+version = "1.2.2"
 description = "Thin prompt-call-verify-trace runner for static v1.2 workflows"
 readme = "README.md"
 requires-python = ">=3.6"
